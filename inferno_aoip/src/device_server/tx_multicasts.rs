@@ -188,7 +188,11 @@ impl TransmitMulticasts {
                 break;
               }
               if ok {
-                info!("no multicast conflict detected, activating transmitter");
+                if !flows_tx.activate_multicast_flow(flow_index.try_into().unwrap()) {
+                  warn!("multicast flow id {} was deleted during its grace period", flow_index + 1);
+                  break;
+                }
+                info!("no multicast conflict detected, activated transmitter");
                 dst_addr_arc.store(dst_addr.to_bits(), std::sync::atomic::Ordering::SeqCst);
                 {
                   let mut mcasts = multicasts_by_channel.write().unwrap();
@@ -212,7 +216,6 @@ impl TransmitMulticasts {
                   dst_addr,
                   dst_port,
                 );
-                flows_tx.activate_multicast_flow(flow_index.try_into().unwrap());
 
                 // refresh channels so that multicast will be advertised
                 for index_opt in &channel_indices {
