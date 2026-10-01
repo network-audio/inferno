@@ -32,9 +32,23 @@ use std::{
 };
 use tokio::{sync::mpsc, time::sleep, time::timeout};
 
-use super::flows_rx::{FlowInfo, FlowsReceiver};
+use super::flows_rx::{FlowInfo, FlowsReceiver, MAX_FLOWS as MAX_RX_FLOWS};
 
 const REORDER_WAIT_SAMPLES: usize = 4800;
+
+/// A free slot in the receive flows table, growing it up to the receiver's fixed
+/// MAX_FLOWS (flows_rx indexes its own tables with this index). None when full:
+/// how many flows exist is decided by subscribe requests from the network.
+fn free_flow_slot<T>(flows: &mut Vec<Option<T>>) -> Option<usize> {
+  if let Some(i) = flows.iter().position(|o| o.is_none()) {
+    return Some(i);
+  }
+  if flows.len() >= MAX_RX_FLOWS {
+    return None;
+  }
+  flows.push(None);
+  Some(flows.len() - 1)
+}
 
 enum Command {
   Shutdown,
@@ -791,11 +805,11 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
             continue;
           }
         };
-        let flow_index = match flows_locked.iter().position(|o| o.is_none()) {
+        let flow_index = match free_flow_slot(&mut flows_locked) {
           Some(i) => i,
           None => {
-            flows_locked.push(None);
-            flows_locked.len() - 1
+            error!("out of receive flows ({MAX_RX_FLOWS}), not receiving multicast {bundle_full_name}");
+            continue;
           }
         };
         let flow_id = flow_index + 1;
@@ -822,6 +836,16 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
         let updates = Some(
           needed_channels
             .iter()
+            .filter(|(_, advch)| {
+              let in_range = advch
+                .multicast
+                .as_ref()
+                .is_some_and(|m| m.channel_in_bundle < advbundle.tx_channels_per_flow);
+              if !in_range {
+                error!("channel {} is outside multicast bundle {bundle_full_name}", advch.tx_channel_id);
+              }
+              in_range
+            })
             .map(|(lci, advch)| ChannelSourceUpdate {
               local_channel_indices: channel_index_aliases[lci].clone(),
               remote: ChannelOtherEnd {
@@ -862,11 +886,11 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
           .min(8 /*TODO make it configurable*/);
         for chunk in &channels.iter().chunks(num_channels_in_flow) {
           let chunk = chunk.collect_vec();
-          let flow_index = match flows_locked.iter().position(|o| o.is_none()) {
+          let flow_index = match free_flow_slot(&mut flows_locked) {
             Some(i) => i,
             None => {
-              flows_locked.push(None);
-              flows_locked.len() - 1
+              error!("out of receive flows ({MAX_RX_FLOWS}), not requesting a flow from {server_addr}");
+              continue;
             }
           };
           let tx_channels = chunk.iter().map(|(_, chadv)| chadv.tx_channel_id);
@@ -953,7 +977,6 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
                 return None;
               }
             };
-            assert_eq!(first.bits_per_sample % 8, 0);
             flows_recv
               .add_socket(
                 flow_index,
@@ -1320,5 +1343,24 @@ mod unsubscribe_readback_tests {
     subscriber.unsubscribe(0).await;
     assert!(subscriber.subscriptions_info.read().unwrap()[0].is_none());
     assert!(matches!(rx.try_recv().unwrap(), Command::Unsubscribe { local_channel_index: 0 }));
+  }
+}
+
+#[cfg(test)]
+mod flow_slot_tests {
+  use super::*;
+
+  #[test]
+  fn free_flow_slot_reuses_then_grows_up_to_the_receiver_limit() {
+    let mut flows: Vec<Option<u8>> = vec![Some(1), None, Some(3)];
+    assert_eq!(free_flow_slot(&mut flows), Some(1));
+    flows[1] = Some(2);
+    for expected in 3..MAX_RX_FLOWS {
+      assert_eq!(free_flow_slot(&mut flows), Some(expected));
+      flows[expected] = Some(0);
+    }
+    assert_eq!(flows.len(), MAX_RX_FLOWS);
+    assert_eq!(free_flow_slot(&mut flows), None);
+    assert_eq!(flows.len(), MAX_RX_FLOWS);
   }
 }
