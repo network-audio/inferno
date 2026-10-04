@@ -139,6 +139,14 @@ impl ChannelsSubscriber {
       .log_and_forget();
   }
   pub async fn unsubscribe(&self, local_channel_index: usize) {
+    // Same reason as subscribe: a controller reads the rx subscriptions list
+    // right after the response. The flow teardown happens later on the
+    // subscriber task; clearing the entry only there made netaudio's
+    // readback after a remove still list the channel and report the remove
+    // as failed. (The task clears it again; that is a no-op.)
+    if let Some(slot) = self.subscriptions_info.write().unwrap().get_mut(local_channel_index) {
+      *slot = None;
+    }
     self.commands_sender.send(Command::Unsubscribe { local_channel_index }).await.log_and_forget();
   }
   pub async fn save_state(&self) {
