@@ -509,6 +509,17 @@ pub async fn run_server(
           conn.respond_with_code(0x30, &[]).await;
         }
 
+        0x2204 => {
+          // TX flow labels, asked for by controllers next to the TX flow
+          // query (content 0001 0001 0000: first page). It went unanswered
+          // ("received unknown opcode1 0x2204") so the controller kept
+          // waiting for it. This device keeps no flow labels: an empty page
+          // in the same form as the other paged replies (02 = page size
+          // marker, 00 = no records), as netaudio's own virtual device
+          // answers it.
+          conn.respond_with_code(1, &[0x02, 0x00]).await;
+        }
+
         query_rx_flows::OPCODE => {
           // query RX flows
           let content = request.content();
