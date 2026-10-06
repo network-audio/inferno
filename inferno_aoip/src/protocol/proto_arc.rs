@@ -400,7 +400,16 @@ where
   bytes.write_bytes(&vec![0u8; reserved * OutItem::SERIALIZED_SIZE]);
 
   let mut items = Vec::with_capacity(reserved);
+  // End of the data the emitted entries own. The transform writes an
+  // entry's strings and descriptors before the size check, so an entry
+  // that crosses the limit has already appended its data: the page is cut
+  // where that data began, or it would carry bytes no entry points to
+  // (and run past the soft limit by up to one entry's data). Safe because
+  // the rejected entry is never the first, so data it shares with earlier
+  // entries (the common descriptor) was written before it.
+  let mut heap_end = bytes.get_wpos();
   for in_item in source {
+    let entry_start = bytes.get_wpos();
     let out_item = match transform(in_item, &mut bytes) {
       Some(item) => item,
       None => continue,
@@ -408,9 +417,11 @@ where
     // as in serialize_items, the entry that crosses the limit goes on the next page
     if bytes.get_wpos() >= PACKET_SIZE_SOFT_LIMIT && !items.is_empty() {
       have_more = true;
+      heap_end = entry_start;
       break;
     }
     items.push(out_item);
+    heap_end = bytes.get_wpos();
   }
 
   let gap = (reserved - items.len()) * OutItem::SERIALIZED_SIZE;
@@ -429,7 +440,7 @@ where
     item.binary_serialize(&mut tmp_buffer, binary_serde::Endianness::Big);
     out.extend_from_slice(&tmp_buffer);
   }
-  out.extend_from_slice(&raw[table_end..]);
+  out.extend_from_slice(&raw[table_end..heap_end]);
   (have_more, out)
 }
 
@@ -844,6 +855,31 @@ mod page_tests {
     let table_end = HEADER_LENGTH + 2 + count * 6;
     let first_name = u16::from_be_bytes([body[6], body[7]]) as usize;
     assert_eq!(first_name, table_end);
+    assert!(body.len() + HEADER_LENGTH < PACKET_SIZE_SOFT_LIMIT + 64);
+  }
+
+  #[test]
+  fn soft_limit_cut_page_has_no_orphaned_bytes() {
+    use crate::byte_utils::write_0term_str_to_bytebuffer;
+    // The entry that crosses PACKET_SIZE_SOFT_LIMIT goes on the next page;
+    // the name it already wrote must not stay behind in this one.
+    let names: Vec<String> = (1..=32).map(|i| format!("{i:02}{}", "x".repeat(40))).collect();
+    let (more, body) = serialize_page(32, names.iter().enumerate(), |(index, name), bytes| {
+      Some(get_transmit_channels_friendly_names::ChannelDescriptor {
+        channel_id_1: (index + 1).try_into().unwrap(),
+        channel_id_2: (index + 1).try_into().unwrap(),
+        friendly_name_offset: write_0term_str_to_bytebuffer(bytes, name),
+      })
+    });
+    assert!(more);
+    let count = body[1] as usize;
+    // every byte after the table belongs to an emitted entry's name: the
+    // packet ends with the last emitted name's terminator
+    let last = 2 + (count - 1) * 6;
+    let last_name = u16::from_be_bytes([body[last + 4], body[last + 5]]) as usize - HEADER_LENGTH;
+    let end = last_name + names[count - 1].len() + 1;
+    assert_eq!(body.len(), end, "bytes after the last emitted entry's data");
+    assert_eq!(&body[last_name..end - 1], names[count - 1].as_bytes());
     assert!(body.len() + HEADER_LENGTH < PACKET_SIZE_SOFT_LIMIT + 64);
   }
 
