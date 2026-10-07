@@ -38,9 +38,20 @@ impl StateStorage {
     let content = toml::to_string(&value)?;
     let tmp_path = self.full_path(&format!("tmp.{name}"));
     let mut file = File::create(&tmp_path)?;
-    file.write(content.as_bytes())?;
+    // write_all: a bare write() may store only part of the buffer and
+    // report success. sync_all before the rename, or after a power cut the
+    // rename can be on disk while the content is not (an empty file).
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
     drop(file);
-    std::fs::rename(tmp_path, self.full_path(name))?;
+    let final_path = self.full_path(name);
+    std::fs::rename(tmp_path, &final_path)?;
+    // and the directory, so the rename itself survives; best effort
+    if let Some(dir) = std::path::Path::new(&final_path).parent() {
+      if let Ok(d) = File::open(if dir.as_os_str().is_empty() { std::path::Path::new(".") } else { dir }) {
+        let _ = d.sync_all();
+      }
+    }
     Ok(())
   }
   pub fn load<T: for<'a> Deserialize<'a>>(&self, name: &str) -> Result<T, Box<dyn Error>> {
