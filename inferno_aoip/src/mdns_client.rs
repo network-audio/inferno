@@ -132,7 +132,8 @@ impl MdnsClient {
             return Ok(true);
           }
         }
-        Ok(true)
+        // a response that answers some other name is not this record
+        Ok(false)
       }
       Err(_e) => Ok(false), // TODO: sometimes error may be other than timeout, handle that
     }
