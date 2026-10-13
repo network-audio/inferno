@@ -198,32 +198,7 @@ impl<'s> Multicaster<'s> {
       ]); // network statistics */
 
       let (rx_peaks, tx_peaks) = (self.get_peaks)();
-      let total_peaks = rx_peaks.len() + tx_peaks.len();
-      if total_peaks > 0 {
-        let mut total_len = 24 + total_peaks;
-        while (total_len % 4) != 0 {
-          total_len += 1;
-        }
-        let end_pos = bytes.get_wpos() + total_len;
-        bytes.write_u16((24 + total_peaks).try_into().unwrap());
-        bytes.write_u16(0x8002);
-        bytes.write_u16(4);
-        bytes.write_u16((12 + total_peaks).try_into().unwrap());
-        bytes.write_u16(ctr);
-        bytes.write_u16(0);
-        bytes.write_u16(tx_peaks.len().try_into().unwrap());
-        bytes.write_u16(0);
-        bytes.write_u16(rx_peaks.len().try_into().unwrap());
-        bytes.write_u16(0);
-        bytes.write_u16(24);
-        bytes.write_u16(0);
-        for peak in tx_peaks.into_iter().chain(rx_peaks.into_iter()) {
-          bytes.write_u8(peak);
-        }
-        while bytes.get_wpos() < end_pos {
-          bytes.write_u8(0);
-        }
-      }
+      write_peaks_record(&mut bytes, ctr, &tx_peaks, &rx_peaks);
 
       // rx latency:
       if let Some(chsub) = self.channels_subscriber.as_ref() {
@@ -376,6 +351,38 @@ impl<'s> Multicaster<'s> {
   }
 }
 
+/// Heartbeat record 0x8002 with metering peaks, padded to a multiple of 4 bytes. Nothing if there are no peaks.
+fn write_peaks_record(bytes: &mut ByteBuffer, ctr: u16, tx_peaks: &[u8], rx_peaks: &[u8]) {
+  let total_peaks = rx_peaks.len() + tx_peaks.len();
+  if total_peaks == 0 {
+    return;
+  }
+  let mut total_len = 24 + total_peaks;
+  while (total_len % 4) != 0 {
+    total_len += 1;
+  }
+  let end_pos = bytes.get_wpos() + total_len;
+  // the padding is part of the record
+  bytes.write_u16(total_len.try_into().unwrap());
+  bytes.write_u16(0x8002);
+  bytes.write_u16(4);
+  bytes.write_u16((total_len - 12).try_into().unwrap()); // content length
+  bytes.write_u16(ctr);
+  bytes.write_u16(0);
+  bytes.write_u16(tx_peaks.len().try_into().unwrap());
+  bytes.write_u16(0);
+  bytes.write_u16(rx_peaks.len().try_into().unwrap());
+  bytes.write_u16(0);
+  bytes.write_u16(24);
+  bytes.write_u16(0);
+  for &peak in tx_peaks.iter().chain(rx_peaks.iter()) {
+    bytes.write_u8(peak);
+  }
+  while bytes.get_wpos() < end_pos {
+    bytes.write_u8(0);
+  }
+}
+
 pub async fn run_server(
   self_info: Arc<DeviceInfo>,
   mut rx: mpsc::Receiver<MulticastMessage>,
@@ -445,5 +452,28 @@ pub async fn run_server(
       }
       // TODO receive shutdown properly, currently Ctrl-C doesn't work if there is error binding to socket
     };
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Records' declared lengths must cover their padding: receivers (e.g. netaudio) walk records by their
+  /// length and reject lengths that aren't multiples of 4.
+  #[test]
+  fn peaks_record_length_includes_padding() {
+    for (tx, rx) in [(2usize, 0usize), (1, 2), (2, 2), (5, 3)] {
+      let mut bytes = ByteBuffer::new();
+      bytes.set_endian(bytebuffer::Endian::BigEndian);
+      write_peaks_record(&mut bytes, 7, &vec![0x11; tx], &vec![0x22; rx]);
+      let data = bytes.as_bytes();
+      let declared_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+      let content_len = u16::from_be_bytes([data[6], data[7]]) as usize;
+      assert_eq!(declared_len, data.len(), "{tx} TX + {rx} RX peaks: declared length vs bytes written");
+      assert_eq!(declared_len % 4, 0, "{tx} TX + {rx} RX peaks");
+      assert_eq!(content_len, declared_len - 12, "{tx} TX + {rx} RX peaks: content length");
+      assert_eq!(&data[24..24 + tx + rx], [vec![0x11; tx], vec![0x22; rx]].concat().as_slice());
+    }
   }
 }
