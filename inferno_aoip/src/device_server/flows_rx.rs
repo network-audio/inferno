@@ -122,8 +122,9 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
           // TODO: optimize, fetching the hardware clock so often is suboptimal
           // fetch it every n packets or use timestamped_socket and kernel-level timestamps instead
 
-          // can be wrapping because used only for latency calculation
-          if let Some(now) = clock.wrapping_now_in_timebase(sample_rate.into()) {
+          // can be wrapping because used only for relative calculations
+          let now_opt = clock.wrapping_now_in_timebase(sample_rate.into());
+          if let Some(now) = now_opt {
             let latency = wrapped_diff(now, timestamp).clamp(0, i32::MAX as _);
             sd.actual_latency_samples.fetch_max(latency as _, Ordering::Relaxed);
           }
@@ -141,6 +142,13 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
             //info!("first byte = {}, assuming {} samples in {} channels", buf[0], samples_count, num_channels);
             for (i, ch) in sd.channels.iter_mut().enumerate() {
               if let Some(ch) = ch {
+                // Too late, the reader is already past it. Writing it would only risk landing (modulo the
+                // ring buffer) on positions about to be read, e.g. packets queued while we were stalled.
+                if now_opt
+                  .is_some_and(|now| packet_is_late(now, timestamp, ch.latency_samples, samples_count))
+                {
+                  continue;
+                }
                 let ts = timestamp.wrapping_add_signed(ch.timestamp_shift);
                 ch.sinks.iter_mut().for_each(|sink| {
                   let reader = SamplesReader {
@@ -665,5 +673,33 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
       .await
       .log_and_forget();
     self.waker.wake().log_and_forget();
+  }
+}
+
+/// Whether a packet of `samples_count` samples with `timestamp` has been completely read already at media
+/// time `now`: its samples are read `latency_samples` after their timestamps.
+fn packet_is_late(now: Clock, timestamp: Clock, latency_samples: usize, samples_count: usize) -> bool {
+  wrapped_diff(timestamp.wrapping_add(latency_samples).wrapping_add(samples_count), now) <= 0
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn packet_read_before_it_arrives_is_late() {
+    // a 32-sample packet, played out (read) 480 samples after its timestamp
+    assert!(!packet_is_late(1000, 1000, 480, 32), "just arrived");
+    assert!(!packet_is_late(1500, 1000, 480, 32), "partly read: the rest is still useful");
+    assert!(packet_is_late(1512, 1000, 480, 32), "completely read already");
+    // queued during a stall of the receiver, seconds old
+    assert!(packet_is_late(1000 + 48000 * 3, 1000, 480, 32));
+  }
+
+  #[test]
+  fn lateness_across_the_clock_wrap() {
+    let ts = usize::MAX - 100;
+    assert!(!packet_is_late(ts.wrapping_add(200), ts, 480, 32));
+    assert!(packet_is_late(ts.wrapping_add(600), ts, 480, 32));
   }
 }
