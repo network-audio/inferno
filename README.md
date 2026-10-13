@@ -238,6 +238,7 @@ All settings have default values. In a simple setup you should be able to start 
 * `TX_CHANNELS` - number of transmit channels, defaults to 2, will be overwritten by the application if it supports changing channels count.
 * `RX_LATENCY_NS` - receive latency in nanoseconds, i.e. how much time to wait for media packets, relatively to PTP media clock. Equivalent to latency setting in Dante Controller. Defaults to 10ms. May be removed in future versions when it becomes settable from DC and so stored in a configuration file.
 * `TX_LATENCY_NS` - transmit latency in nanoseconds, i.e. receive latency that this device will demand from devices receiving from us. Equivalent to latency setting in Dante Virtual Soundcard. Defaults to 10ms.
+* `TX_SOURCE_BIT_DEPTH` - bit depth of the audio applications transmit (16, 24 or 32, default 32). When it's higher than the bit depth sent over the network (24 bits), the transmitted audio is dithered. Set it to 24 for bit-exact transmission of 24-bit audio.
 * `CLOCK_PATH` - path to either [usrvclock](https://gitlab.com/lumifaza/usrvclock) socket, or PTP device. If the latter, make sure [you are allowed](https://gitlab.freedesktop.org/pipewire/pipewire/-/blob/78642cc53bd84c2ad529f2175cc50a658d1e52c0/src/daemon/90-pipewire-aes67-ptp.rules) to read it. Also, write permissions are required if you want to see actual frequency offset in DC. (the clock is never adjusted from within Inferno, but the syscall to read the frequency requires write access)
 
 
@@ -294,7 +295,7 @@ If you want to contribute but can't code or don't know where to start because th
 * `snd_pcm_delay` includes the network latency, for latency compensation in DAWs
 * capture: buffers too small for the receive latency are refused, overwritten samples are reported as xruns instead of being returned
 * playback: samples are no longer overwritten before they're transmitted, and silence (not the stale buffer) is transmitted when the application falls behind or stops
-* receiving: no audio from the previous buffer cycle while a transmitter stalls, nor misplaced audio right after restarts
+* receiving: no audio from the previous buffer cycle while a transmitter stalls, late packets (e.g. queued while the receiver was stalled) are dropped instead of landing on positions about to be read
 * answers controllers' clock status, settings status (AES67, sample rate, encoding, pull-up, codec, lock) and interface statistics queries, so that e.g. netaudio doesn't wait for them to time out; fixed heartbeat record length
 * RX channels are listed even without a running receiver (playback-only devices weren't usable from netaudio 0.4)
 * warning when realtime priority can't be set for the audio threads

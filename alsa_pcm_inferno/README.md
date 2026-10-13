@@ -21,7 +21,7 @@ If you don't want to change anything outside your `$HOME`, you can set ALSA envi
 
 This plugin is entirely user-space and contained in a library. It means that the Dante device is emulated only while the ALSA device is open in an application and certainly can't outlive the process.
 
-Stopping and restarting a stream (transport stop/start, xrun recovery: `snd_pcm_drop`/`snd_pcm_prepare`/`snd_pcm_start`) keeps the Dante device, its flows and subscriptions running: audio resumes within about the network latency. While the stream is stopped, silence is transmitted. Only closing the device (or changing its buffer configuration) tears it down: next time it is opened, audio flows have to be established again, which takes a few seconds during which silence is played or recorded.
+Stopping and restarting a stream (transport stop/start, xrun recovery: `snd_pcm_drop`/`snd_pcm_prepare`/`snd_pcm_start`) keeps the Dante device, its flows and subscriptions running: captured audio resumes within about the receive latency, transmitted audio as soon as the application has refilled its buffer. While the stream is stopped, silence is transmitted. Only closing the device (or changing its buffer configuration) tears it down: next time it is opened, audio flows have to be established again, which takes a few seconds during which silence is played or recorded.
 
 So the Inferno ALSA PCM is best kept open. The easiest way of ensuring this is using an audio server, for example [JACK](https://jackaudio.org/) or [PipeWire](https://www.pipewire.org/) (see script [`start_pipewire_sink`](start_pipewire_sink)), making sure that automatic suspending of audio device is disabled (or, to save energy, set to a timeout long enough that it won't be annoying). DAWs (e.g. [Ardour](https://ardour.org/), see [below](#daws), [BespokeSynth](https://www.bespokesynth.com/), NOT Audacity) also keep the audio interface open while running.
 
@@ -50,14 +50,14 @@ If a capturing application reads so late that received audio overwrites samples 
 
 ## DAWs
 
-Tested with [Ardour](https://ardour.org/) 8.12 (ALSA backend; tests ran headless): recording and playback are bit-exact (24-bit), transport stop/start doesn't restart the device, and xruns recover in place without losing Dante subscriptions.
+Tested with [Ardour](https://ardour.org/) 8.12 (ALSA backend; tests ran headless): recording and playback of 24-bit audio are bit-exact (with `TX_SOURCE_BIT_DEPTH` = 24, apart from Ardour's declick fades), transport stop/start doesn't restart the device, and xruns recover in place without losing Dante subscriptions.
 
 * Ardour's ALSA backend lists only hardware cards. Start Ardour with `ARDOUR_ALSA_DEVICE=inferno` (the name of the `pcm` device in your `.asoundrc`).
-* Choose a buffer big enough for the receive latency (see [Buffer sizes](#buffer-sizes)): periods × period size must be at least `RX_LATENCY_NS` (in samples) + period size, and one more period leaves comfortable slack. Settings that worked at 48 kHz:
-  * `RX_LATENCY_NS` = 40 ms: 1024 samples × 3 periods, 2048 × 2. Ardour's default 1024 × 2 is refused: Ardour shows `AlsaAudioBackend: failed to allocate parameters` / `Cannot start Audio/MIDI engine`.
-  * `RX_LATENCY_NS` = 10 ms: 256 × 2, 512 × 3, 1024 × 2 (512 × 2 starts but has too little slack).
-* Ardour doesn't use `snd_pcm_delay`, so enter the network latency as systemic latency in Audio/MIDI Setup: input = receive latency in samples minus 24 (e.g. 1896 at 40 ms, 456 at 10 ms), output = receive latency of the device(s) receiving Ardour's output.
-* For bit-exact output set `TX_SOURCE_BIT_DEPTH` to 24: by default (32) Inferno dithers when transmitting 24-bit audio.
+* Choose a buffer big enough for the receive latency (see [Buffer sizes](#buffer-sizes)): periods × period size must be at least `RX_LATENCY_NS` (in samples) + period size; for xrun-free operation, aim for `RX_LATENCY_NS` + 2 × period size. The number of periods is rounded up to a power of two (Ardour's 3 periods run as 4). Settings that worked at 48 kHz:
+  * `RX_LATENCY_NS` = 40 ms: 1024 samples × 3 periods, 2048 × 3. 2048 × 2 starts but has too little slack (occasional xruns). Ardour's default 1024 × 2 is refused: Ardour shows `AlsaAudioBackend: failed to allocate parameters` / `Cannot start Audio/MIDI engine`, and Inferno's explanation (`capture buffer of ... frames is too small ...`) is printed to Ardour's standard error, i.e. visible when Ardour is started from a terminal.
+  * `RX_LATENCY_NS` = 10 ms: 256 × 2, 512 × 3, 1024 × 2. 512 × 2 starts but has too little slack.
+* Ardour doesn't use `snd_pcm_delay`, so enter the network latency as systemic latency in Audio/MIDI Setup: input = receive latency in samples minus 24 (e.g. 1896 at 40 ms, 456 at 10 ms), output = receive latency of the device(s) receiving Ardour's output. These values are derived from the measured network delay and Ardour's own port latencies; Ardour's resulting compensation wasn't verified.
+* For bit-exact output set `TX_SOURCE_BIT_DEPTH` to 24 (`TX_SOURCE_BIT_DEPTH "24"` in the `pcm` block of your `.asoundrc`, or `INFERNO_TX_SOURCE_BIT_DEPTH=24` in the environment): by default (32) Inferno dithers when transmitting 24-bit audio.
 
 
 # Quirks
