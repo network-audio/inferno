@@ -339,6 +339,62 @@ impl<'s> Multicaster<'s> {
   }
 }
 
+/// Status of a fixed, not configurable u32 setting (sample rate, encoding): current = requested = the only choice.
+fn fixed_u32_status(value: u32) -> Vec<u8> {
+  let mut bytes = ByteBuffer::new();
+  bytes.set_endian(bytebuffer::Endian::BigEndian);
+  bytes.write_u16(0x18); // offset of the choices, relative to the opcode field
+  bytes.write_u16(1); // number of choices
+  bytes.write_u32(value); // current
+  bytes.write_u32(value); // requested
+  bytes.write_u16(0); // update mode: fixed
+  bytes.write_u16(0);
+  bytes.write_u32(value);
+  bytes.into_vec()
+}
+
+/// Status of the sample rate pull-up: none, fixed. Since record revision 0x070f a flags word precedes the choices.
+fn no_pullup_status() -> Vec<u8> {
+  let mut bytes = ByteBuffer::new();
+  bytes.set_endian(bytebuffer::Endian::BigEndian);
+  bytes.write_u16(0x20); // offset of the choices, relative to the opcode field
+  bytes.write_u16(1); // number of choices
+  bytes.write_u32(0); // current: no pull-up
+  bytes.write_u32(0); // requested
+  bytes.write_u16(0); // update mode: fixed
+  bytes.write_u16(0);
+  bytes.write_u32(0);
+  bytes.write_u32(0); // flags
+  bytes.write_u32(0); // the only choice: no pull-up
+  bytes.into_vec()
+}
+
+/// Reply (opcode, content) to a settings status request, reporting what Inferno actually supports.
+/// None for requests answered elsewhere or not at all.
+fn settings_status_reply(
+  request_opcode: u16,
+  sample_rate: u32,
+  bits_per_sample: u8,
+) -> Option<(u16, Vec<u8>)> {
+  Some(match request_opcode {
+    // AES67: currently disabled, not configured
+    0x1006 => (0x1007, vec![0, 0, 0, 0]),
+    0x0081 => (0x0080, fixed_u32_status(sample_rate)),
+    0x0083 => (0x0082, fixed_u32_status(bits_per_sample.into())),
+    0x0085 => (0x0084, no_pullup_status()),
+    // codec: no parameters (descriptor width 8, descriptors at 0x10)
+    0x100a => (0x100b, vec![0, 0, 0, 0, 0, 8, 0, 0x10]),
+    // device lock: unlocked, no lock holder identifiers (identifier width 8)
+    0x1008 => (0x1009, vec![0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0]),
+    _ => return None,
+  })
+}
+
+/// Whether a settings request asks to change the setting (non-zero mode/flags word after the opcode field).
+fn is_settings_write(request: &[u8]) -> bool {
+  request.get(32..36).is_some_and(|word| word != [0, 0, 0, 0])
+}
+
 /// Content of the clock status (0x0020) reply to a clock status query (0x0021).
 ///
 /// Always answered, also without PTP daemon information: controllers wait for the reply. When the PTP daemon's
@@ -462,6 +518,23 @@ pub async fn run_server(
               &[0, 0, 0, 3, 0, 0, 0, 0]
             ).await;
           }
+          [0x07, _, hi, lo, _, _, _, _] => {
+            let request_opcode = u16::from_be_bytes([*hi, *lo]);
+            let self_info = &mcaster.self_info;
+            if let Some((reply_opcode, content)) =
+              settings_status_reply(request_opcode, self_info.sample_rate, self_info.bits_per_sample)
+            {
+              if is_settings_write(request_buf) {
+                // nothing here is configurable at runtime: answer with the unchanged status
+                warn!("ignoring request to change setting {request_opcode:#06x}: not supported");
+              }
+              let [rh, rl] = reply_opcode.to_be_bytes();
+              mcaster.send(mcaster.device_info_destination, 0xffff, [0x07, 0x2a, rh, rl, 0, 0, 0, 0], &content).await;
+            } else {
+              warn!("unknown request to multicast port: opcode: {}", hex::encode(opcode));
+              warn!("raw udp payload: {}", hex::encode(request_buf));
+            }
+          }
           _ => {
             warn!("unknown request to multicast port: opcode: {}", hex::encode(opcode));
             warn!("raw udp payload: {}", hex::encode(request_buf));
@@ -512,6 +585,43 @@ mod tests {
       master_uuid: c[20..28].to_vec(),
       grandmaster_uuid: c[28..36].to_vec(),
     }
+  }
+
+  /// Settings status replies; expected bytes are the content after the opcode field of replies netaudio
+  /// parses as: AES67 off, sample rate 48 kHz fixed, encoding 24-bit fixed, no pull-up (fixed), no codec
+  /// parameters, unlocked without identifiers.
+  #[test]
+  fn settings_status_replies() {
+    let expected: [(u16, u16, &str); 6] = [
+      (0x1006, 0x1007, "00000000"),
+      (0x0081, 0x0080, "001800010000bb800000bb80000000000000bb80"),
+      (0x0083, 0x0082, "0018000100000018000000180000000000000018"),
+      (0x0085, 0x0084, "00200001000000000000000000000000000000000000000000000000"),
+      (0x100a, 0x100b, "0000000000080010"),
+      (0x1008, 0x1009, "00000000000000080000000000000000"),
+    ];
+    for (request, reply, content) in expected {
+      let (reply_opcode, bytes) =
+        settings_status_reply(request, 48000, 24).expect("request should be answered");
+      assert_eq!(reply_opcode, reply, "reply opcode for {request:#06x}");
+      assert_eq!(hex::encode(bytes), content, "reply content for {request:#06x}");
+    }
+    let (_, rate) = settings_status_reply(0x0081, 96000, 24).unwrap();
+    assert_eq!(&rate[4..8], 96000u32.to_be_bytes());
+    assert!(settings_status_reply(0x0021, 48000, 24).is_none(), "clock status has its own reply");
+  }
+
+  #[test]
+  fn settings_write_requests_are_recognized() {
+    let mut query = vec![0u8; 40];
+    query[24..32].copy_from_slice(&[0x07, 0x3a, 0x00, 0x81, 0, 0, 0, 0x64]);
+    assert!(!is_settings_write(&query));
+    let mut write = query.clone();
+    write[24..26].copy_from_slice(&[0x07, 0x27]);
+    write[32..36].copy_from_slice(&1u32.to_be_bytes());
+    write[36..40].copy_from_slice(&96000u32.to_be_bytes());
+    assert!(is_settings_write(&write));
+    assert!(!is_settings_write(&query[..32]), "lock status query has no body");
   }
 
   #[test]
