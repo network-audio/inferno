@@ -275,11 +275,7 @@ impl<'s> Multicaster<'s> {
   }
 
   async fn send_clock_stats(&mut self) {
-    let freq_offset = if let Some(f) = self.get_freq_offset_ppb() {
-      f
-    } else {
-      return;
-    };
+    let freq_offset = self.get_freq_offset_ppb();
     let required_prefix = format!("clock-stats.{}0000", hex::encode(self.self_info.mac_address.octets()));
     let mut master_clock = None;
     if let Ok(readdir) = std::fs::read_dir("/tmp") {
@@ -299,29 +295,21 @@ impl<'s> Multicaster<'s> {
         }
       }
     }
-    if let Some(mc) = master_clock {
-      assert_eq!(mc.len(), 8);
-      let mut bytes = ByteBuffer::new();
-      bytes.set_endian(bytebuffer::Endian::BigEndian);
-      bytes.write_bytes(&[
-        0x00, 0x03, 0x00, 0x03, /* 0x01 = PLL not locked */
-        0x00, 0x00, 0x00, 0x9f, /* was 0xff */
-      ]);
-      bytes.write_i32(freq_offset);
-      bytes.write_bytes(&self.self_info.mac_address.octets());
-      bytes.write_u16(0);
-      bytes.write_bytes(&mc);
-      bytes.write_bytes(&mc);
-      bytes.write_bytes(&[0u8; 76]);
-      self
-        .send(
-          self.device_info_destination,
-          0xffff,
-          [0x07, 0x2a, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00],
-          bytes.as_bytes(),
-        )
-        .await;
-    }
+    let has_clock = self.clock.read().unwrap().get_overlay().is_some();
+    let content = clock_status_content(
+      &self.self_info.mac_address.octets(),
+      has_clock,
+      freq_offset,
+      master_clock.as_deref(),
+    );
+    self
+      .send(
+        self.device_info_destination,
+        0xffff,
+        [0x07, 0x2a, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00],
+        &content,
+      )
+      .await;
   }
 
   async fn send_network_info(&mut self) {
@@ -349,6 +337,50 @@ impl<'s> Multicaster<'s> {
       )
       .await;
   }
+}
+
+/// Content of the clock status (0x0020) reply to a clock status query (0x0021).
+///
+/// Always answered, also without PTP daemon information: controllers wait for the reply. When the PTP daemon's
+/// leader isn't known, the clock state is "undisciplined" (or "none" without any clock), the servo state "unknown"
+/// and the device reports itself as master, like leaderless Dante devices do. The frequency offset field has no
+/// "unknown" value, it's 0 when not available.
+fn clock_status_content(
+  mac: &[u8; 6],
+  has_clock: bool,
+  freq_offset: Option<i32>,
+  master_clock: Option<&[u8]>,
+) -> Vec<u8> {
+  let mut own_id = [0u8; 8];
+  own_id[..6].copy_from_slice(mac);
+  let (clock_state, servo_state, master) = match (freq_offset, master_clock) {
+    (Some(_), Some(master)) => (3u16 /* disciplined */, 3u16 /* synchronized */, master),
+    _ => (
+      if has_clock {
+        2 /* undisciplined */
+      } else {
+        0 /* none */
+      },
+      4, /* unknown */
+      &own_id[..],
+    ),
+  };
+  let mut bytes = ByteBuffer::new();
+  bytes.set_endian(bytebuffer::Endian::BigEndian);
+  bytes.write_u16(clock_state);
+  bytes.write_u16(servo_state);
+  bytes.write_bytes(&[
+    0x00, 0x00, /* clock source: internal */
+    0x00, /* not preferred leader */
+    0x9f, /* stratum, was 0xff */
+  ]);
+  bytes.write_i32(freq_offset.unwrap_or(0));
+  bytes.write_bytes(mac);
+  bytes.write_u16(0);
+  bytes.write_bytes(master);
+  bytes.write_bytes(master);
+  bytes.write_bytes(&[0u8; 76]);
+  bytes.into_vec()
 }
 
 /// Heartbeat record 0x8002 with metering peaks, padded to a multiple of 4 bytes. Nothing if there are no peaks.
@@ -458,6 +490,62 @@ pub async fn run_server(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  const MAC: [u8; 6] = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+
+  /// Fields of a clock status reply, as controllers read them (offsets relative to the content).
+  struct ClockStatus {
+    clock_state: u16,
+    servo_state: u16,
+    freq_offset: i32,
+    device_uuid: Vec<u8>,
+    master_uuid: Vec<u8>,
+    grandmaster_uuid: Vec<u8>,
+  }
+  fn parse_clock_status(c: &[u8]) -> ClockStatus {
+    assert!(c.len() >= 40, "too short for controllers: {} bytes", c.len());
+    ClockStatus {
+      clock_state: u16::from_be_bytes([c[0], c[1]]),
+      servo_state: u16::from_be_bytes([c[2], c[3]]),
+      freq_offset: i32::from_be_bytes(c[8..12].try_into().unwrap()),
+      device_uuid: c[12..20].to_vec(),
+      master_uuid: c[20..28].to_vec(),
+      grandmaster_uuid: c[28..36].to_vec(),
+    }
+  }
+
+  #[test]
+  fn clock_status_with_ptp_leader_reports_synchronized() {
+    let leader = [0x00, 0x1d, 0xc1, 0x08, 0x12, 0x58, 0x00, 0x00];
+    let c = clock_status_content(&MAC, true, Some(-1234), Some(&leader));
+    let st = parse_clock_status(&c);
+    assert_eq!((st.clock_state, st.servo_state), (3, 3));
+    assert_eq!(st.freq_offset, -1234);
+    assert_eq!(st.device_uuid, [&MAC[..], &[0, 0]].concat());
+    assert_eq!((st.master_uuid, st.grandmaster_uuid), (leader.to_vec(), leader.to_vec()));
+    assert_eq!(c.len(), 112);
+  }
+
+  /// Without the PTP daemon's leader information the query must still be answered (controllers time out
+  /// otherwise), without claiming synchronization.
+  #[test]
+  fn clock_status_without_ptp_leader_is_answered_honestly() {
+    let own = [&MAC[..], &[0, 0]].concat();
+    for (has_clock, freq_offset, clock_state) in [(true, Some(56), 2), (true, None, 2), (false, None, 0)]
+    {
+      let st = parse_clock_status(&clock_status_content(&MAC, has_clock, freq_offset, None));
+      assert_eq!(
+        (st.clock_state, st.servo_state),
+        (clock_state, 4),
+        "clock {has_clock}, offset {freq_offset:?}"
+      );
+      assert_eq!(st.freq_offset, freq_offset.unwrap_or(0));
+      assert_eq!((st.master_uuid, st.grandmaster_uuid), (own.clone(), own.clone()));
+    }
+    // a leader without a frequency offset isn't trusted either
+    let st = parse_clock_status(&clock_status_content(&MAC, true, None, Some(&[1, 2, 3, 4, 5, 6, 0, 0])));
+    assert_eq!((st.clock_state, st.servo_state), (2, 4));
+  }
 
   /// Records' declared lengths must cover their padding: receivers (e.g. netaudio) walk records by their
   /// length and reject lengths that aren't multiples of 4.
