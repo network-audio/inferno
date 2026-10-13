@@ -123,16 +123,14 @@ pub async fn run_server(
 
         get_receive_channels::OPCODE => {
           // Dante Receivers names and subscriptions:
+          // Channels are listed even when no receiver is running (e.g. a playback-only process),
+          // controllers expect as many as reported by channels_and_flows_count.
 
           let mut common_descriptor_offset: u16 = 0;
           paginate_respond(
             &mut conn,
             request.content(),
-            if subscriber.is_some() {
-              self_info.rx_channels.len().min(32).try_into().unwrap()
-            } else {
-              0
-            },
+            self_info.rx_channels.len().min(32).try_into().unwrap(),
             self_info.rx_channels.iter().enumerate(),
             |(channel_index, ch), bytes| {
               if common_descriptor_offset == 0 {
@@ -141,7 +139,7 @@ pub async fn run_server(
                 bytes
                   .write_bytes(descr.binary_serialize_to_array(binary_serde::Endianness::Big).as_slice());
               }
-              let status = subscriber.as_ref().unwrap().channel_status(channel_index);
+              let status = subscriber.as_ref().and_then(|s| s.channel_status(channel_index));
               let (tx_channel_name_offset, tx_hostname_offset) = match &status {
                 None => (0, 0),
                 Some(status) => (
