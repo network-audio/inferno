@@ -30,12 +30,17 @@ services:
     env_file: inferno.env
     environment:
       - INFERNO_NAME=jack1
+      - INFERNO_RX_LATENCY_NS=${INFERNO_TEST_LATENCY_NS:-40000000}
+      - INFERNO_TX_LATENCY_NS=${INFERNO_TEST_LATENCY_NS:-40000000}
+    cap_add:
+      - SYS_NICE # realtime priority
     networks:
       - audio_net
     volumes:
       - shared:/shared
     ulimits:
       memlock: 200000000
+      rtprio: 99 # Inferno's flows threads run with realtime priority
     shm_size: 200m
     depends_on:
       init:
@@ -45,16 +50,21 @@ services:
 
   jack2:
     build: debian_jack
-    platform: linux/386
+    platform: ${DEBIAN_PLATFORM:-}
     env_file: inferno.env
     environment:
       - INFERNO_NAME=jack2
+      - INFERNO_RX_LATENCY_NS=${INFERNO_TEST_LATENCY_NS:-40000000}
+      - INFERNO_TX_LATENCY_NS=${INFERNO_TEST_LATENCY_NS:-40000000}
+    cap_add:
+      - SYS_NICE # realtime priority
     networks:
       - audio_net
     volumes:
       - shared:/shared
     ulimits:
       memlock: 200000000
+      rtprio: 99 # Inferno's flows threads run with realtime priority
     shm_size: 200m
     depends_on:
       init:
@@ -67,12 +77,20 @@ services:
     env_file: inferno.env
     environment:
       - INFERNO_NAME=aplayrec1
+      - INFERNO_RX_LATENCY_NS=${INFERNO_TEST_LATENCY_NS:-40000000}
+      - INFERNO_TX_LATENCY_NS=${INFERNO_TEST_LATENCY_NS:-40000000}
+      # second address for the capture device, outside audio_net's dynamic ip_range
+      - CAPTURE_IP=${AUDIO_NET_PREFIX:-10.213.77}.201/24
+    cap_add:
+      - NET_ADMIN # to add CAPTURE_IP
+      - SYS_NICE # realtime priority
     networks:
       - audio_net
     volumes:
       - shared:/shared
     ulimits:
       memlock: 200000000
+      rtprio: 99 # Inferno's flows threads run with realtime priority
     shm_size: 200m
     depends_on:
       init:
@@ -85,12 +103,47 @@ services:
     env_file: inferno.env
     environment:
       - INFERNO_NAME=aplayrec2
+      - INFERNO_RX_LATENCY_NS=${INFERNO_TEST_LATENCY_NS:-40000000}
+      - INFERNO_TX_LATENCY_NS=${INFERNO_TEST_LATENCY_NS:-40000000}
+      # second address for the capture device, outside audio_net's dynamic ip_range
+      - CAPTURE_IP=${AUDIO_NET_PREFIX:-10.213.77}.202/24
+    cap_add:
+      - NET_ADMIN # to add CAPTURE_IP
+      - SYS_NICE # realtime priority
     networks:
       - audio_net
     volumes:
       - shared:/shared
     ulimits:
       memlock: 200000000
+      rtprio: 99 # Inferno's flows threads run with realtime priority
+    shm_size: 200m
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      clock_source:
+        condition: service_started
+
+  # PENDING: two Inferno devices sharing one IP (aplayrec3p and aplayrec3c, no CAPTURE_IP).
+  # netaudio 0.4 keys devices by IP (see README), so this only runs with INFERNO_TEST_SAME_HOST_DEVICES=1
+  # (run_test.sh then enables the same_host profile).
+  aplayrec3:
+    build: alpine_aplay_arecord
+    profiles: [same_host]
+    env_file: inferno.env
+    environment:
+      - INFERNO_NAME=aplayrec3
+      - INFERNO_RX_LATENCY_NS=${INFERNO_TEST_LATENCY_NS:-40000000}
+      - INFERNO_TX_LATENCY_NS=${INFERNO_TEST_LATENCY_NS:-40000000}
+    cap_add:
+      - SYS_NICE # realtime priority
+    networks:
+      - audio_net
+    volumes:
+      - shared:/shared
+    ulimits:
+      memlock: 200000000
+      rtprio: 99 # Inferno's flows threads run with realtime priority
     shm_size: 200m
     depends_on:
       init:
@@ -103,12 +156,17 @@ services:
     env_file: inferno.env
     environment:
       - INFERNO_NAME=pipewire1
+      - INFERNO_RX_LATENCY_NS=${INFERNO_TEST_LATENCY_NS:-40000000}
+      - INFERNO_TX_LATENCY_NS=${INFERNO_TEST_LATENCY_NS:-40000000}
+    cap_add:
+      - SYS_NICE # realtime priority
     networks:
       - audio_net
     volumes:
       - shared:/shared
     ulimits:
       memlock: 200000000
+      rtprio: 99 # Inferno's flows threads run with realtime priority
     shm_size: 200m
     depends_on:
       init:
@@ -121,10 +179,16 @@ services:
     env_file: inferno.env
     environment:
       - INFERNO_NAME=i2pipe1
+      - INFERNO_RX_LATENCY_NS=${INFERNO_TEST_LATENCY_NS:-40000000}
+      - INFERNO_TX_LATENCY_NS=${INFERNO_TEST_LATENCY_NS:-40000000}
     networks:
       - audio_net
     volumes:
       - shared:/shared
+    cap_add:
+      - SYS_NICE # realtime priority
+    ulimits:
+      rtprio: 99 # Inferno's flows threads run with realtime priority
     depends_on:
       init:
         condition: service_completed_successfully
@@ -134,16 +198,31 @@ services:
   control_and_test:
     build: control_and_test
     env_file: inferno.env
+    environment:
+      - INFERNO_TEST_SAME_HOST_DEVICES=${INFERNO_TEST_SAME_HOST_DEVICES:-0}
     networks:
       - audio_net
     volumes:
       - shared:/shared
     depends_on:
-      - jack1
-      - jack2
-      - aplayrec1
-      - aplayrec2
+      jack1:
+        condition: service_started
+      jack2:
+        condition: service_started
+      aplayrec1:
+        condition: service_started
+      aplayrec2:
+        condition: service_started
+      aplayrec3:
+        condition: service_started
+        required: false # only in the same_host profile
 
 networks:
   audio_net:
     driver: bridge
+    ipam:
+      config:
+        # fixed subnet so aplayrec containers can add a second address (CAPTURE_IP) that Docker never
+        # hands out: dynamic addresses come from the lower half only. Override the prefix if it clashes.
+        - subnet: ${AUDIO_NET_PREFIX:-10.213.77}.0/24
+          ip_range: ${AUDIO_NET_PREFIX:-10.213.77}.0/25

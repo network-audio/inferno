@@ -2,62 +2,95 @@
 
 cd /shared
 
-while ! netaudio device list > devlist && \
+# the devices start together with this controller and run for $DURATION seconds from now
+start=$(date +%s)
+
+# Two Inferno devices on one IP (aplayrec3p + aplayrec3c in one container) need netaudio support for
+# multiple devices per host: netaudio 0.4 lists and subscribes them, but reports their control address as
+# ambiguous and skips their status probes. Enable with INFERNO_TEST_SAME_HOST_DEVICES=1.
+routes="jack2:jack1 jack1:jack2 pipewire1:aplayrec1c aplayrec1p:aplayrec2c aplayrec1p:pipewire1 jack1:i2pipe1"
+aplayrec_devices=4
+aplayrec_sub_lines=6
+subscribed=12
+recorders="jack1 jack2 aplayrec1 aplayrec2 pipewire1 i2pipe1"
+if test "$INFERNO_TEST_SAME_HOST_DEVICES" = 1; then
+    echo '▶ same-host test enabled: two devices on one IP (aplayrec3p -> aplayrec3c)'
+    routes="$routes aplayrec3p:aplayrec3c"
+    aplayrec_devices=6
+    aplayrec_sub_lines=$((aplayrec_sub_lines+2))
+    subscribed=$((subscribed+2))
+    recorders="$recorders aplayrec3"
+else
+    echo '⏸ PENDING: two devices on one IP (needs netaudio multi-device-per-host support)'
+fi
+
+# wait until all devices are discovered (one netaudio 0.4 pass takes ~15-20 s)
+discovery_deadline=$((start+DURATION/2))
+until netaudio device list > devlist && \
     test `grep jack < devlist | wc -l` -eq 2 && \
-    test `grep aplayrec < devlist | wc -l` -eq 4 && \
+    test `grep aplayrec < devlist | wc -l` -eq $aplayrec_devices && \
     test `grep pipewire < devlist | wc -l` -eq 1 && \
     test `grep i2pipe < devlist | wc -l` -eq 1
-do sleep 1; done
+do
+    if test `date +%s` -ge $discovery_deadline; then
+        cat devlist
+        echo '❌ not all devices discovered in time'
+        exit 1
+    fi
+    sleep 1
+done
 
 
-echo '✅ device list test passed'
+echo "✅ device list test passed ($((`date +%s`-start)) s after start)"
 
 substart=$(date +%s)
 
-netaudio subscription add --rx-device-name jack1 --rx-channel-name 'RX 1' --tx-device-name jack2 --tx-channel-name 'TX 1' &
-netaudio subscription add --rx-device-name jack2 --rx-channel-name 'RX 1' --tx-device-name jack1 --tx-channel-name 'TX 1' &
-netaudio subscription add --rx-device-name aplayrec1c --rx-channel-name 'RX 1' --tx-device-name pipewire1 --tx-channel-name 'TX 1' &
-netaudio subscription add --rx-device-name aplayrec2c --rx-channel-name 'RX 1' --tx-device-name aplayrec1p --tx-channel-name 'TX 1' &
-netaudio subscription add --rx-device-name pipewire1 --rx-channel-name 'RX 1' --tx-device-name aplayrec1p --tx-channel-name 'TX 1' &
-netaudio subscription add --rx-device-name i2pipe1 --rx-channel-name 'RX 1' --tx-device-name jack1 --tx-channel-name 'TX 1'
-
-netaudio subscription add --rx-device-name jack1 --rx-channel-name 'RX 2' --tx-device-name jack2 --tx-channel-name 'TX 2' &
-netaudio subscription add --rx-device-name jack2 --rx-channel-name 'RX 2' --tx-device-name jack1 --tx-channel-name 'TX 2' &
-netaudio subscription add --rx-device-name aplayrec1c --rx-channel-name 'RX 2' --tx-device-name pipewire1 --tx-channel-name 'TX 2' &
-netaudio subscription add --rx-device-name aplayrec2c --rx-channel-name 'RX 2' --tx-device-name aplayrec1p --tx-channel-name 'TX 2' &
-netaudio subscription add --rx-device-name pipewire1 --rx-channel-name 'RX 2' --tx-device-name aplayrec1p --tx-channel-name 'TX 2' &
-netaudio subscription add --rx-device-name i2pipe1 --rx-channel-name 'RX 2' --tx-device-name jack1 --tx-channel-name 'TX 2'
-
-wait
+# subscribe "TX n" -> "RX n" for all channels (netaudio bulk mode), in parallel
+pids=""
+for route in $routes; do
+    netaudio subscription add --tx ${route%:*} --rx ${route#*:} &
+    pids="$pids $!"
+done
+for pid in $pids; do
+    wait $pid || { echo '❌ subscription add failed'; exit 1; }
+done
 subend=$(date +%s)
 
-signal_min_seconds=$((DURATION-8-subend+substart))
+# audio can only be recorded after the subscriptions are made, so count discovery time too
+signal_min_seconds=$((DURATION-8-subend+start))
 if test $signal_min_seconds -lt $((DURATION/4)); then
     echo '❌ wasted too much time'
     exit 1
 fi
 
-echo '✅ after subscribe'
+echo "✅ after subscribe ($((subend-substart)) s, $((subend-start)) s after start)"
 
 netaudio subscription list > sublist
 test `grep jack sublist | wc -l` -eq 6
-test `grep aplayrec sublist | wc -l` -eq 6
+test `grep aplayrec sublist | wc -l` -eq $aplayrec_sub_lines
 test `grep pipewire sublist | wc -l` -eq 4
 test `grep i2pipe sublist | wc -l` -eq 2
+test `grep Subscribed sublist | wc -l` -eq $subscribed
 
 echo '✅ subscription test passed, waiting for recorded audio'
 
 
+# devices finish $DURATION seconds after they started, allow a generous margin
+wait_deadline=$((substart+DURATION+60))
 function wait_for {
     while test -n "$1"; do
         while ! test -e "done-$1"; do
+            if test `date +%s` -ge $wait_deadline; then
+                echo "❌ $1 didn't finish recording in time"
+                exit 1
+            fi
             sleep 1
         done
         shift
     done
 }
 
-wait_for jack1 jack2 aplayrec1 aplayrec2 pipewire1 i2pipe1
+wait_for $recorders
 
 samples_expected=$((DURATION*INFERNO_SAMPLE_RATE))
 tolerance=$INFERNO_SAMPLE_RATE
@@ -71,6 +104,12 @@ function test_recording {
     test $samples -ge $((signal_min_seconds*INFERNO_SAMPLE_RATE))
     test $samples -le $((samples_expected+tolerance))
     echo '  ✅ recording length test passed'
+
+    # a recording may outlast its source, and the silence after the source stopped can't match (jack-stdin
+    # never plays its last period): trim trailing silence, like the leading silence is trimmed below
+    sox rec-$1.wav rect-$1.wav reverse silence 1 0.1 1% reverse
+    infile=rect-$1.wav
+    samples=$((`stat -c %s $infile`/4))
 
     seconds_nonsilent="$(sox $infile recns-$1.wav silence 1 0.1 1% stat 2>&1 | sed -E 's/^Length \(seconds\):\s+([0-9]+).*$/\1/; t; d')"
     echo "  seconds non-silent: $seconds_nonsilent"
@@ -98,7 +137,7 @@ function test_recording {
     ! /diff_tools/wd -align$samples_expected -ll play-$2.wav recnsbc-$1.wav
     echo '  ✅ wd tool correctly detects damaged data'
 
-    echo "✅ $infile all OK"
+    echo "✅ rec-$1.wav all OK"
 }
 
 function raw_to_wav {
@@ -113,12 +152,22 @@ raw_to_wav rec-jack2
 sox --no-dither -t raw -e signed-integer -b 32 -c 2 -r $INFERNO_SAMPLE_RATE /shared/rec-i2pipe1.raw -b 16 /shared/rec-i2pipe1.wav
 rm /shared/rec-i2pipe1.raw
 
-test_recording aplayrec1 pipewire1
-test_recording aplayrec2 aplayrec1
-test_recording pipewire1 aplayrec1
-test_recording i2pipe1 jack1
-
-test_recording jack1 jack2
-test_recording jack2 jack1
+# recorder:source pairs; test them all, then fail if any failed
+pairs="aplayrec1:pipewire1 aplayrec2:aplayrec1 pipewire1:aplayrec1 i2pipe1:jack1 jack1:jack2 jack2:jack1"
+if test "$INFERNO_TEST_SAME_HOST_DEVICES" = 1; then
+    pairs="$pairs aplayrec3:aplayrec3"
+fi
+failed=""
+set +e
+for pair in $pairs; do
+    ( set -e; test_recording ${pair%:*} ${pair#*:} )
+    test $? -eq 0 || { echo "❌ rec-${pair%:*}.wav failed"; failed="$failed ${pair%:*}"; }
+done
+set -e
+if test -n "$failed"; then
+    echo "❌ recordings failed:$failed"
+    exit 1
+fi
+echo '✅ all recordings OK'
 
 rm -f /shared/rec* /shared/play*
