@@ -230,6 +230,10 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
       })
       .unwrap_or(CLOSING_SAMPLES_INTERVAL);
     let mut next_closing_samples = Instant::now() + closing_samples_interval;
+    // Readers may read up to the current time at any moment, so each closing pass must close beyond it,
+    // until (at least) the next pass. Two intervals leave slack for a late wakeup.
+    let closing_ahead_samples =
+      (2 * closing_samples_interval.as_nanos() * self.sample_rate as u128 / 1_000_000_000) as usize;
     let mut events = mio::Events::with_capacity(MAX_FLOWS + 1); // +1 because of waker, TODO: really necessary?
     let mut may_have_command = false;
     self.publish_latency();
@@ -405,11 +409,12 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
 
       if writing && now >= next_closing_samples {
         if let Some(now_ts) = self.clock.wrapping_now_in_timebase(self.sample_rate.into()) {
-          let ts = now_ts.wrapping_sub(self.start_timestamp.unwrap());
+          let ts = now_ts.wrapping_sub(self.start_timestamp.unwrap()).wrapping_add(closing_ahead_samples);
 
           // Normally this position will be already written because in self.receive we are writing into future
           // (write position is increased by latency_samples)
           // However, if the stream breaks, it will ensure that buffer is filled with zeros
+          // (packets arriving later still overwrite them)
           for sd in self.sockets.iter_mut().filter_map(|opt| opt.as_mut()) {
             for ch in sd.channels.iter_mut().filter_map(|opt| opt.as_mut()) {
               for sink in &mut ch.sinks {

@@ -1088,3 +1088,101 @@ fn capture_reading_late_reports_xrun_instead_of_overwritten_audio() {
     );
     assert!(xruns > 0, "late reads must be reported as xruns");
 }
+
+/// Non-silent captured samples that aren't fresh ramp samples of `epoch` (stale or misplaced audio).
+fn stale_samples(buf: &[Sample], epoch: usize) -> usize {
+    buf.iter()
+        .filter(|&&s| s != 0 && !is_fresh_ramp_sample(s, epoch))
+        .count()
+}
+
+/// T9: when the transmitter stops (crash, network loss), the capture must get silence, not the receive
+/// buffer's old contents for the missing packets.
+#[test]
+fn capture_after_transmitter_stops_is_silent() {
+    let ids = TestIds {
+        base_port: 30000,
+        base_pid: 30,
+        tag: "captxstop",
+        latency_ns: LONG_LATENCY_NS,
+    };
+    // like Ardour at 40 ms latency
+    let mut fx = CaptureFixture::with_pcm(&ids, |config| {
+        Pcm::open_with(config, SND_PCM_STREAM_CAPTURE, 1024, 4096).expect("1024x4 refused")
+    });
+    let mut buf = vec![0 as Sample; fx.pcm().period_size * CHANNELS];
+    // let the buffer fill with audio
+    let until = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < until {
+        let r = fx.pcm().read(&mut buf);
+        assert!(r >= 0, "snd_pcm_readi failed: {r}");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let tx = fx.tx_server.take().unwrap();
+    fx.rt.block_on(tx.shutdown());
+    let stopped = Instant::now();
+    let mut stale = 0;
+    let mut audio_after = 0;
+    while stopped.elapsed() < Duration::from_millis(1500) {
+        let r = fx.pcm().read(&mut buf);
+        if r == -(libc::EPIPE as i64) {
+            fx.pcm().prepare();
+            fx.pcm().start();
+            continue;
+        }
+        assert!(r >= 0, "snd_pcm_readi failed: {r}");
+        let data = &buf[..r as usize * CHANNELS];
+        // audio still in flight is fine during the latency; afterwards only silence
+        if stopped.elapsed() > Duration::from_millis(200) {
+            audio_after += data.iter().filter(|&&s| s != 0).count();
+        }
+        stale += stale_samples(data, 0);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(
+        stale, 0,
+        "{stale} stale samples captured after the transmitter stopped"
+    );
+    assert_eq!(
+        audio_after, 0,
+        "{audio_after} non-silent samples long after the transmitter stopped"
+    );
+}
+
+/// T10: right after restarts (as in xrun recovery), captured audio must be fresh audio of the new run,
+/// never misplaced samples written with the previous run's addressing.
+#[test]
+fn capture_restart_has_no_misplaced_samples() {
+    let ids = TestIds {
+        base_port: 31000,
+        base_pid: 31,
+        tag: "capmisplace",
+        latency_ns: LONG_LATENCY_NS,
+    };
+    // like Ardour at 40 ms latency
+    let mut fx = CaptureFixture::with_pcm(&ids, |config| {
+        Pcm::open_with(config, SND_PCM_STREAM_CAPTURE, 1024, 4096).expect("1024x4 refused")
+    });
+    let mut buf = vec![0 as Sample; fx.pcm().period_size * CHANNELS];
+    let mut stale = 0;
+    for _round in 0..40 {
+        fx.pcm().drop_stream();
+        fx.next_epoch();
+        fx.pcm().prepare();
+        fx.pcm().start();
+        let until = Instant::now() + Duration::from_millis(60);
+        while Instant::now() < until {
+            let r = fx.pcm().read(&mut buf);
+            if r == -(libc::EPIPE as i64) {
+                break;
+            }
+            assert!(r >= 0, "snd_pcm_readi failed: {r}");
+            stale += stale_samples(&buf[..r as usize * CHANNELS], fx.epoch);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(
+        stale, 0,
+        "{stale} stale or misplaced samples captured right after restarts"
+    );
+}
