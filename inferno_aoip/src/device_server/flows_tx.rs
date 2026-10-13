@@ -128,6 +128,7 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
         self.timestamp_shift = (0 as ClockDiff)
           .wrapping_sub_unsigned(start_time)
           .wrapping_sub_unsigned(self.send_latency_samples);
+        self.anchor.activate(start_time);
       }
       self.start_time = start_time;
     }

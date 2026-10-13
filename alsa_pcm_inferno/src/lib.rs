@@ -508,12 +508,11 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
         .store(boundary as usize, Ordering::Relaxed);
     this.stream_info.boundary_add.store(0, Ordering::Relaxed);
     this.start_time = None;
+    // Pausing marks the buffer invalid, waiting for any access in progress: a receiver thread which hasn't
+    // noticed the pause yet mustn't write to it, we're going to clear it, and the application may even
+    // free it (hw_params is allowed in the PREPARED state). It becomes valid again once the
+    // receiver/transmitter has applied the start time set in plugin_start.
     this.anchor.pause();
-    // The buffer becomes valid in plugin_start. Until then, a receiver thread which hasn't noticed
-    // the pause yet mustn't write to it: we're going to clear it, and the application may even
-    // free it (hw_params is allowed in the PREPARED state).
-    // Taking the write lock also waits for any write in progress.
-    *this.buffers_valid.write().unwrap() = false;
 
     let inferno_instance = get_or_create_instance(&this.settings);
     let running = is_running(&inferno_instance.lock().unwrap(), (*io).stream);
@@ -551,7 +550,7 @@ unsafe fn start_stream(
     channels_buffers: Vec<ExternalBufferParameters<Sample>>,
 ) -> c_int {
     let (clock_rx_tx, clock_rx_rx) = oneshot::channel::<RealTimeClockReceiver>();
-    this.anchor = StreamAnchor::new_paused();
+    this.anchor = StreamAnchor::new_paused_guarding(this.buffers_valid.clone());
     this.active_buffers = None;
     {
         let mut common = inferno_instance.lock().unwrap();
@@ -657,7 +656,7 @@ unsafe extern "C" fn plugin_start(io: *mut snd_pcm_ioplug_t) -> c_int {
     if now_samples_opt.is_some() && this.start_time.is_none() {
         let start_time = now_samples_opt.unwrap() as usize;
         this.start_time = Some(start_time);
-        *this.buffers_valid.write().unwrap() = true;
+        // the receiver/transmitter marks the buffer valid once it addresses it according to start_time
         this.anchor.start(start_time);
     } else {
         warn!(
@@ -681,9 +680,8 @@ unsafe extern "C" fn plugin_stop(io: *mut snd_pcm_ioplug_t) -> c_int {
     let this = get_private(io);
     // Only pause: the receiver/transmitter, its flows and subscriptions keep running,
     // so that the PCM can be restarted without a break in Dante connections.
-    // While paused, the receiver doesn't touch the buffer and the transmitter sends silence.
+    // While paused, the buffer is invalid: the receiver doesn't touch it and the transmitter sends silence.
     this.anchor.pause();
-    *this.buffers_valid.write().unwrap() = false;
 
     0
 }
@@ -756,7 +754,6 @@ unsafe extern "C" fn plugin_close(io: *mut snd_pcm_ioplug_t) -> c_int {
     debug!("plugin_close called");
     let this = get_private(io);
     this.anchor.pause();
-    *this.buffers_valid.write().unwrap() = false;
     {
         let mut instances_locked = global_instances.write().unwrap();
         // TODO blocking_send inside mutex, risk of deadlock?
@@ -847,6 +844,7 @@ unsafe extern "C" fn plugin_define(
         .map(|v| v == "1")
         .unwrap_or(false);
 
+    let buffers_valid = Arc::new(RwLock::new(false));
     let myio = Box::into_raw(Box::new(MyIOPlug {
         io: zeroed(),
         callbacks,
@@ -854,11 +852,11 @@ unsafe extern "C" fn plugin_define(
         ref_time: Instant::now(),
         use_flows_clock,
         stream_info: StreamInfo::new(std::ptr::null()), // set below, when io's address is known
-        buffers_valid: Arc::new(RwLock::new(false)),
+        anchor: StreamAnchor::new_paused_guarding(buffers_valid.clone()),
+        buffers_valid,
         media_clock: MediaClock::new(false /* TODO */),
         clock_receiver: None,
         start_time: None,
-        anchor: StreamAnchor::new_paused(),
         active_buffers: None,
         current_timestamp: Arc::new(AtomicUsize::new(usize::MAX)),
         on_transfer_eventfd: efd,

@@ -264,6 +264,9 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
         // if the clock isn't ready, stay paused and retry in the next iteration
         if anchored_start.map_or(true, |start_time| self.reanchor(start_time)) {
           self.start_timestamp = anchored_start;
+          if let Some(start_time) = anchored_start {
+            self.anchor.activate(start_time);
+          }
         }
       }
       let writing = self.start_timestamp.is_some();
