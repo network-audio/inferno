@@ -98,9 +98,7 @@ impl ChannelsSubscriber {
     mdns_client: Arc<MdnsClient>,
     mcast: mpsc::Sender<MulticastMessage>,
     channels_buffering: B,
-    tx_latency_ns: u32,
     state_storage: Arc<StateStorage>,
-    start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>,
     ref_instant: Instant,
   ) -> (Self, Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
     let (tx, rx) = mpsc::channel(100);
@@ -118,11 +116,10 @@ impl ChannelsSubscriber {
       r.subscriptions_info.clone(),
       mcast,
       channels_buffering,
-      tx_latency_ns,
       state_storage,
       ref_instant,
     );
-    return (r, async move { internal.run(start_time_rx).await }.boxed());
+    return (r, async move { internal.run().await }.boxed());
   }
   pub async fn subscribe(&self, local_channel_index: usize, tx_channel_name: &str, tx_hostname: &str) {
     // we must (TODO: really?) update subscriptions_info here because Dante Controller requests rx subscriptions list right after receiving a response to subscribe request
@@ -162,7 +159,6 @@ pub trait ChannelsBuffering<P: ProxyToSamplesBuffer> {
   fn connect_channel(
     &mut self,
     start_time: Clock,
-    start_time_shift: ClockDiff,
     rb_output: &mut Option<RBOutput<Sample, P>>,
     channel_index: usize,
     latency_samples: usize,
@@ -196,7 +192,6 @@ impl ChannelsBuffering<OwnedBuffer<Atomic<Sample>>> for OwnedBuffering {
   fn connect_channel(
     &mut self,
     start_time: Clock,
-    _start_time_shift: ClockDiff,
     rb_output: &mut Option<RBOutput<Sample, OwnedBuffer<Atomic<Sample>>>>,
     channel_index: usize,
     latency_samples: usize,
@@ -249,7 +244,6 @@ impl ChannelsBuffering<ExternalBuffer<Atomic<Sample>>> for ExternalBuffering {
   fn connect_channel(
     &mut self,
     start_time: Clock,
-    start_time_shift: ClockDiff,
     rb_output: &mut Option<RBOutput<Sample, ExternalBuffer<Atomic<Sample>>>>,
     channel_index: usize,
     _latency_samples: usize,
@@ -352,7 +346,6 @@ struct ChannelsSubscriberInternal<P: ProxyToSamplesBuffer, B: ChannelsBuffering<
   flows_recv: Arc<FlowsReceiver<P>>,
   //buffered_samples_per_channel: usize,
   min_latency_ns: usize,
-  ring_buffer_timestamp_shift: isize,
   control_client: Arc<FlowsControlClient>,
   mdns_client: Arc<MdnsClient>,
   subscriptions_info: Arc<RwLock<Vec<Option<SubscriptionInfo>>>>,
@@ -376,7 +369,6 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
     subscriptions_info: Arc<RwLock<Vec<Option<SubscriptionInfo>>>>,
     mcast: mpsc::Sender<MulticastMessage>,
     channels_buffering: B,
-    tx_latency_ns: u32,
     state_storage: Arc<StateStorage>,
     ref_instant: Instant,
   ) -> Self {
@@ -389,8 +381,7 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
       flows: Arc::new(Mutex::new(vec![])),
       flows_recv,
       //buffered_samples_per_channel: 524288,
-      min_latency_ns: tx_latency_ns.try_into().unwrap(),
-      ring_buffer_timestamp_shift: 0,
+      min_latency_ns: self_info.latency_ns,
       control_client: Arc::new(FlowsControlClient::new(self_info)),
       mdns_client,
       subscriptions_info,
@@ -1040,8 +1031,7 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
           }
           let latency_samples = flow.latency_samples;
           let sink_opt = self.channels_buffering.connect_channel(
-            now, /* FIXME shift */
-            self.ring_buffer_timestamp_shift,
+            now,
             &mut flow.channels_rb_outputs[remote.channel_in_flow],
             chi,
             latency_samples,
@@ -1217,15 +1207,8 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
     };
     return true;
   }
-  pub async fn run(&mut self, start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>) {
+  pub async fn run(&mut self) {
     self.load_state().await;
-    if let Some(rx) = start_time_rx {
-      if let Ok(start_time) = rx.await {
-        self.ring_buffer_timestamp_shift = 0isize.wrapping_sub_unsigned(start_time);
-      } else {
-        error!("unable to receive start time, ring_buffer addressing will be wrong!");
-      }
-    }
     let mut last_resolving = Instant::now();
     loop {
       // TODO make it more NOHZ

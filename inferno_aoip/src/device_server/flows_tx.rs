@@ -14,6 +14,7 @@ use tokio::sync::watch;
 use tokio::{select, sync::mpsc};
 
 use super::samples_utils::*;
+use super::stream_anchor::StreamAnchor;
 use super::tx_multicasts::MEDIA_PORT;
 use crate::device_server::TransferNotifier;
 use crate::media_clock::async_clock_receiver_to_realtime;
@@ -104,6 +105,9 @@ struct FlowsTransmitterInternal<P: ProxyToSamplesBuffer> {
   tx_source_bit_depth: u8,
   current_timestamp: Arc<AtomicUsize>,
   on_transfer: Option<TransferNotifier>,
+  anchor: StreamAnchor,
+  /// start time currently applied to `timestamp_shift`, `None` when paused (silence is sent)
+  start_time: Option<Clock>,
   //callback: SamplesRequestCallback,
 }
 
@@ -117,8 +121,22 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
     self.clock.now_in_timebase(self.sample_rate as u64)
   }
 
+  fn apply_anchor(&mut self) {
+    let start_time = self.anchor.start_time();
+    if start_time != self.start_time {
+      if let Some(start_time) = start_time {
+        self.timestamp_shift = (0 as ClockDiff)
+          .wrapping_sub_unsigned(start_time)
+          .wrapping_sub_unsigned(self.send_latency_samples);
+      }
+      self.start_time = start_time;
+    }
+  }
+
   #[inline(always)]
   fn transmit(&mut self, dither_rng: &mut SmallRng, now: LongClock, process_events: bool) {
+    self.apply_anchor();
+    let paused = self.start_time.is_none();
     let mut tmp_samples = [0 as Sample; FPP_MAX as usize];
     let mut pbuff = [0u8; MTU];
     let sample_rate = self.sample_rate;
@@ -126,8 +144,9 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
     let max_lag_samples = self.max_lag_samples;
     let mut iterations = 0;
     let mut max_missing_samples = 0;
-    let dither_16 = self.should_dither(16);
-    let dither_24 = self.should_dither(24);
+    // pause silence must stay digital silence
+    let dither_16 = !paused && self.should_dither(16);
+    let dither_24 = !paused && self.should_dither(24);
     for flow in &mut self.flows.iter_mut().filter_map(|opt| opt.as_mut()) {
       if flow.expired.load(Ordering::Relaxed) {
         continue;
@@ -156,20 +175,25 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
           if let Some(ch_index) = ch_opt {
             //(self.callback)(flow.next_ts, ch_index, &mut tmp_samples[0..flow.fpp]);
             // TODO remove not really necessary copy to tmp_samples, write_*_samples could read directly from ring buffer
-            let r =
-              self.channels_sources[ch_index].read_at(start_ts as usize, &mut tmp_samples[0..flow.fpp]);
-            if r.useful_start_index != 0 || r.useful_end_index != flow.fpp {
-              /* error!(
-                  "didn't have enough samples, transmitting silence. {} {}",
-                  r.useful_start_index,
-                  flow.fpp - r.useful_end_index
-              ); */
+            if paused {
+              // keep flows alive so that receivers neither mute nor drop the subscription
+              tmp_samples[0..flow.fpp].fill(0);
+            } else {
+              let r =
+                self.channels_sources[ch_index].read_at(start_ts as usize, &mut tmp_samples[0..flow.fpp]);
+              if r.useful_start_index != 0 || r.useful_end_index != flow.fpp {
+                /* error!(
+                    "didn't have enough samples, transmitting silence. {} {}",
+                    r.useful_start_index,
+                    flow.fpp - r.useful_end_index
+                ); */
 
-              tmp_samples[0..r.useful_start_index].fill(0);
-              tmp_samples[r.useful_end_index..].fill(0);
+                tmp_samples[0..r.useful_start_index].fill(0);
+                tmp_samples[r.useful_end_index..].fill(0);
 
-              let missing_samples = r.useful_start_index + flow.fpp - r.useful_end_index;
-              max_missing_samples = max_missing_samples.max(missing_samples);
+                let missing_samples = r.useful_start_index + flow.fpp - r.useful_end_index;
+                max_missing_samples = max_missing_samples.max(missing_samples);
+              }
             }
             let start = 9 + index_in_flow * flow.bytes_per_sample;
             let samples = &tmp_samples[0..flow.fpp];
@@ -228,24 +252,16 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
     }
   }
 
-  async fn run(&mut self, mut start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>) {
+  async fn run(&mut self) {
     let sample_rate = self.sample_rate;
     let process_events_interval = (sample_rate / 30) as Clock;
     let mut dither_rng = SmallRng::from_rng(rand::thread_rng()).unwrap();
 
-    if let Some(rx) = &mut start_time_rx {
-      match rx.await {
-        Ok(start_time) => {
-          self.timestamp_shift = (0 as ClockDiff)
-            .wrapping_sub_unsigned(start_time)
-            .wrapping_sub_unsigned(self.send_latency_samples.try_into().unwrap());
-        }
-        Err(e) => {
-          error!("unable to get start timestamp for ring buffer output: {e:?}");
-          return;
-        }
-      }
-    }
+    // a sample at buffer position p is sent at media time start_time+p+send_latency, stamped earlier
+    // by clock_offset; receivers play it out after (at least) the latency we advertise to them
+    self.anchor.set_network_latency_samples(
+      (self.max_lag_samples as LongClockDiff + self.clock_offset_samples).max(0) as usize,
+    );
 
     let now = loop {
       self.clock_recv.update();
@@ -272,7 +288,9 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
     let mut next_process_events = now as Clock;
     drop(now);
 
-    set_current_thread_realtime(81);
+    if let Err(e) = set_current_thread_realtime(81) {
+      warn!("unable to set realtime priority of flows TX thread ({e:?}), expect dropouts. See README: Audio stability tips");
+    }
     loop {
       let min_next_ts = self
         .flows
@@ -472,7 +490,7 @@ impl FlowsTransmitter {
     latency_ns: usize,
     max_lag_samples: usize,
     channels_outputs: Vec<RBOutput<Sample, P>>,
-    start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>,
+    anchor: StreamAnchor,
     current_timestamp: Arc<AtomicUsize>,
     on_transfer: Option<TransferNotifier>,
   ) {
@@ -493,8 +511,10 @@ impl FlowsTransmitter {
         .unwrap(),
       current_timestamp,
       on_transfer,
+      anchor,
+      start_time: None,
     };
-    internal.run(start_time_rx).await;
+    internal.run().await;
   }
   pub fn start<P: ProxyToSamplesBuffer + Send + Sync + 'static>(
     self_info: Arc<DeviceInfo>,
@@ -502,7 +522,7 @@ impl FlowsTransmitter {
     tx_source_bit_depth: u8,
     clock_recv: RealTimeBoxReceiver<Option<ClockOverlay>>,
     channels_outputs: Vec<RBOutput<Sample, P>>,
-    start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>,
+    anchor: StreamAnchor,
     current_timestamp: Arc<AtomicUsize>,
     on_transfer: Option<TransferNotifier>,
   ) -> (Self, JoinHandle<()>) {
@@ -520,7 +540,7 @@ impl FlowsTransmitter {
         // we set max_lag_samples to tx latency because it doesn't make sense to send samples older than that
         (tx_latency_ns as u64 * srate as u64 / 1_000_000_000u64).try_into().unwrap(),
         channels_outputs,
-        start_time_rx,
+        anchor,
         current_timestamp,
         on_transfer,
       )

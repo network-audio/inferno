@@ -6,7 +6,7 @@ use futures_util::FutureExt;
 use inferno_aoip::device_info::DeviceId;
 use inferno_aoip::device_server::{
     AtomicSample, Clock, DeviceServer, ExternalBufferParameters, MediaClock, RealTimeClockReceiver,
-    Sample, Settings, TransferNotifier,
+    Sample, Settings, StreamAnchor, TransferNotifier,
 };
 use inferno_aoip::utils::run_future_in_new_thread;
 use itertools::Itertools;
@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::mem::zeroed;
 use std::num::Wrapping;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -25,7 +25,7 @@ use tokio::sync::{mpsc, oneshot};
 
 struct StartArgs {
     channels: Vec<ExternalBufferParameters<Sample>>,
-    start_time_rx: oneshot::Receiver<Clock>,
+    anchor: StreamAnchor,
     clock_rx_tx: oneshot::Sender<RealTimeClockReceiver>,
     current_timestamp: Arc<AtomicUsize>,
     on_transfer: Option<TransferNotifier>,
@@ -80,16 +80,17 @@ fn get_or_create_instance(settings: &Settings) -> Arc<Mutex<InfernoInstance>> {
                             Some(command) => match command {
                                 Command::StartReceiver(StartArgs {
                                     channels,
-                                    start_time_rx,
+                                    anchor,
                                     clock_rx_tx,
                                     current_timestamp,
                                     on_transfer,
                                 }) => {
-                                    clock_rx_tx.send(device_server.get_realtime_clock_receiver());
+                                    let _ = clock_rx_tx
+                                        .send(device_server.get_realtime_clock_receiver());
                                     device_server
                                         .receive_to_external_buffer(
                                             channels,
-                                            start_time_rx,
+                                            anchor,
                                             current_timestamp,
                                             on_transfer,
                                         )
@@ -98,16 +99,17 @@ fn get_or_create_instance(settings: &Settings) -> Arc<Mutex<InfernoInstance>> {
                                 }
                                 Command::StartTransmitter(StartArgs {
                                     channels,
-                                    start_time_rx,
+                                    anchor,
                                     clock_rx_tx,
                                     current_timestamp,
                                     on_transfer,
                                 }) => {
-                                    clock_rx_tx.send(device_server.get_realtime_clock_receiver());
+                                    let _ = clock_rx_tx
+                                        .send(device_server.get_realtime_clock_receiver());
                                     device_server
                                         .transmit_from_external_buffer(
                                             channels,
-                                            start_time_rx,
+                                            anchor,
                                             current_timestamp,
                                             on_transfer,
                                         )
@@ -146,16 +148,55 @@ fn get_or_create_instance(settings: &Settings) -> Arc<Mutex<InfernoInstance>> {
         .clone()
 }
 
-fn get_instance(settings: &Settings) -> Option<Arc<Mutex<InfernoInstance>>> {
-    let instances_locked = global_instances.read().unwrap();
-    instances_locked
-        .get(&settings.self_info.factory_device_id)
-        .map(|a| a.clone())
+/// Position bookkeeping, shared with the transmitter thread (see `written_from`).
+struct StreamInfo {
+    /// ALSA's hw and application pointers wrap around at boundary
+    boundary: AtomicUsize,
+    /// added to our position (frames since start_time) to get ALSA's hw pointer
+    boundary_add: AtomicIsize,
+    /// `MyIOPlug::io.appl_ptr`, kept up to date by alsa-lib: ioplug's `pcm->appl.ptr` points to it
+    appl_ptr: *const snd_pcm_uframes_t,
 }
 
-struct StreamInfo {
-    boundary: snd_pcm_uframes_t,
-    boundary_add: Wrapping<snd_pcm_sframes_t>,
+// safety: appl_ptr is only dereferenced while the PCM's buffers are valid (ExternalBuffer checks that),
+// the PCM, and so `io`, lives longer
+unsafe impl Send for StreamInfo {}
+unsafe impl Sync for StreamInfo {}
+
+impl StreamInfo {
+    fn new(appl_ptr: *const snd_pcm_uframes_t) -> Arc<Self> {
+        Arc::new(Self {
+            boundary: AtomicUsize::new(0),
+            boundary_add: AtomicIsize::new(0),
+            appl_ptr,
+        })
+    }
+    /// Number of frames starting at `position` (frames since start_time) the application has written.
+    fn written_from(&self, position: usize) -> usize {
+        let boundary = self.boundary.load(Ordering::Relaxed) as isize;
+        // alsa-lib writes it non-atomically, but an aligned word is never torn
+        let appl_ptr =
+            unsafe { AtomicUsize::from_ptr(self.appl_ptr as *mut usize) }.load(Ordering::Relaxed);
+        let hw_position = (position as isize)
+            .wrapping_add(self.boundary_add.load(Ordering::Relaxed))
+            .rem_euclid(boundary);
+        // modulo boundary, so that either pointer may wrap around first
+        let written = (appl_ptr as isize - hw_position).rem_euclid(boundary);
+        if written > boundary / 2 {
+            0 // the application is behind
+        } else {
+            written as usize
+        }
+    }
+}
+
+/// Identifies what a running receiver/transmitter was started with: the memory it is bound to,
+/// (address, length, stride) per channel, and the period size (wakeup interval).
+/// It only changes when the application changes hw_params.
+#[derive(PartialEq)]
+struct BuffersSignature {
+    areas: Vec<(usize, usize, usize)>,
+    period_size: snd_pcm_uframes_t,
 }
 
 #[repr(C)]
@@ -166,12 +207,15 @@ struct MyIOPlug {
     //config: BTreeMap<String, String>,
     ref_time: Instant,
     use_flows_clock: bool,
-    stream_info: Option<StreamInfo>,
+    stream_info: Arc<StreamInfo>,
     buffers_valid: Arc<RwLock<bool>>,
     media_clock: MediaClock,
     clock_receiver: Option<RealTimeClockReceiver>,
     start_time: Option<Clock>,
-    start_time_tx: Option<oneshot::Sender<Clock>>,
+    /// shared with the receiver/transmitter serving this PCM
+    anchor: StreamAnchor,
+    /// buffers the running receiver/transmitter writes to/reads from, if any
+    active_buffers: Option<BuffersSignature>,
     current_timestamp: Arc<AtomicUsize>,
     on_transfer_eventfd: libc::c_int,
     on_transfer_enabled: bool,
@@ -190,13 +234,22 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
         .current_timestamp
         .load(Ordering::SeqCst /*TODO: really needed?*/);
 
+    // Position the transmitter/receiver has actually processed up to, if it's running.
+    // It is important to use actual input/output clock here because sample precision is required.
+    // Otherwise app may overwrite not-yet-sent samples or read not-yet-received ones.
+    let flows_ptr = match this.start_time {
+        Some(start_time) if cur != usize::MAX => {
+            Some(cur.wrapping_sub(start_time) as snd_pcm_sframes_t)
+        }
+        _ => None,
+    };
+
     // TODO may be non-monotonic in edge cases (switching between clocks)
     // TODO rethink int sizes here
-    let mut ptr: snd_pcm_sframes_t = if this.start_time.is_some() && (cur != usize::MAX) {
-        //println!("using current_timestamp: {cur}");
-        // It is important to use actual input/output clock here because sample precision is required.
-        // Otherwise app may overwrite not-yet-sent samples or read not-yet-received ones.
-        cur.wrapping_sub(this.start_time.unwrap()) as snd_pcm_sframes_t
+    let mut ptr: snd_pcm_sframes_t = if let (true, Some(flows_ptr)) =
+        (this.use_flows_clock, flows_ptr)
+    {
+        flows_ptr
     } else {
         //println!("using own clock");
         // ... but fall back to system clock when not transmitting/receiving right now
@@ -231,17 +284,20 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
         }
         //now_samples_opt.map(|now_samples| now_samples.wrapping_sub(this.start_time.unwrap())).unwrap_or(0) as i64
     };
+    if let (SND_PCM_STREAM_PLAYBACK, Some(flows_ptr)) = ((*io).stream, flows_ptr) {
+        // The transmitter reads a packet once its first sample is due, so when its thread wakes up
+        // late, the media clock is already past samples it hasn't read. Never report those as
+        // consumed, or an application keeping its buffer full overwrites them.
+        if flows_ptr.wrapping_sub(ptr) < 0 {
+            ptr = flows_ptr;
+        }
+    }
 
-    let boundary: snd_pcm_sframes_t = this
-        .stream_info
-        .as_ref()
-        .unwrap()
-        .boundary
-        .try_into()
-        .unwrap();
+    let stream_info = &*this.stream_info;
+    let boundary = stream_info.boundary.load(Ordering::Relaxed) as snd_pcm_sframes_t;
     let max_diff = boundary >> 2;
-    let appl_ptr = ((*io).appl_ptr as snd_pcm_sframes_t)
-        .wrapping_add(this.stream_info.as_ref().unwrap().boundary_add.0);
+    let boundary_add = stream_info.boundary_add.load(Ordering::Relaxed) as snd_pcm_sframes_t;
+    let appl_ptr = ((*io).appl_ptr as snd_pcm_sframes_t).wrapping_add(boundary_add);
     let mut diff = ptr.wrapping_sub(appl_ptr);
     // handle situation when our "hardware" pointer wraps around boundary but the application pointer not yet (or vice versa):
     if diff.saturating_abs() > max_diff {
@@ -253,7 +309,7 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
             if d.saturating_abs() <= max_diff {
                 diff = d;
             } else {
-                error!("very large hw-appl ptr diff: {diff} = {ptr} - {appl_ptr}, boundary_add {} ({boundary}). reporting xrun because something is clearly wrong", this.stream_info.as_ref().unwrap().boundary_add.0);
+                error!("very large hw-appl ptr diff: {diff} = {ptr} - {appl_ptr}, boundary_add {boundary_add} ({boundary}). reporting xrun because something is clearly wrong");
                 return (-EPIPE).try_into().unwrap(); // report xrun
             }
         }
@@ -264,6 +320,18 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
         SND_PCM_STREAM_PLAYBACK => ("playback", (0 as snd_pcm_sframes_t).wrapping_sub(diff)),
         _ => ("???", 0),
     };
+
+    if (*io).stream == SND_PCM_STREAM_CAPTURE
+        && (*io).state == SND_PCM_STATE_RUNNING
+        && buffered > (*io).buffer_size as snd_pcm_sframes_t
+    {
+        // the application didn't read in time, samples it hasn't read yet have been overwritten
+        warn!(
+            "XRUN: capture overrun, buffered {buffered} > buffer size {}",
+            (*io).buffer_size
+        );
+        return (-EPIPE).try_into().unwrap();
+    }
 
     if buffered < 0
         && ((*io).state == SND_PCM_STATE_RUNNING || (*io).state == SND_PCM_STATE_DRAINING)
@@ -278,16 +346,17 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
         }
 
         // workaround for pipewire: grace period during startup:
-        if ptr > 100000 || this.stream_info.as_ref().unwrap().boundary_add.0 != 0 {
+        if ptr > 100000 || boundary_add != 0 {
             return (-EPIPE).try_into().unwrap(); // report xrun
                                                  // TODO check for xruns in ExternalRingBuffer because this function may be called too seldom
-                                                 // FIXME we're restarting the whole transmitter/receiver on xrun which results in a LONG break, unacceptable!
         }
     }
 
-    ptr = ptr.wrapping_add(this.stream_info.as_ref().unwrap().boundary_add.0);
+    ptr = ptr.wrapping_add(boundary_add);
     if ptr >= boundary {
-        this.stream_info.as_mut().unwrap().boundary_add -= boundary;
+        stream_info
+            .boundary_add
+            .fetch_sub(boundary as isize, Ordering::Relaxed);
         ptr -= boundary;
     }
     //log::debug!("pointer: {ptr}");
@@ -303,6 +372,29 @@ fn get_app_name() -> Option<String> {
             .to_string_lossy()
             .to_string(),
     )
+}
+
+fn is_running(common: &InfernoInstance, stream: snd_pcm_stream_t) -> bool {
+    match stream {
+        SND_PCM_STREAM_CAPTURE => common.capturing,
+        SND_PCM_STREAM_PLAYBACK => common.playing,
+        _ => false,
+    }
+}
+
+/// Stops the receiver or transmitter serving `stream`, if running. Returns false on failure.
+fn stop_stream(common: &mut InfernoInstance, stream: snd_pcm_stream_t) -> bool {
+    // TODO blocking_send inside mutex, risk of deadlock?
+    let (running, command) = match stream {
+        SND_PCM_STREAM_CAPTURE => (&mut common.capturing, Command::StopReceiver),
+        SND_PCM_STREAM_PLAYBACK => (&mut common.playing, Command::StopTransmitter),
+        _ => return false,
+    };
+    if !*running {
+        return true;
+    }
+    *running = false;
+    common.commands_sender.blocking_send(command).is_ok()
 }
 
 unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
@@ -334,18 +426,40 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
     }
     debug!("period size: {}", (*io).period_size);
 
+    let buffers_signature = BuffersSignature {
+        areas: channels_areas
+            .iter()
+            .map(|area| {
+                (
+                    area.addr as usize + (area.first / 8) as usize,
+                    (*io).buffer_size as usize,
+                    area.step as usize,
+                )
+            })
+            .collect(),
+        period_size: (*io).period_size,
+    };
+
     let channels_buffers = channels_areas
         .iter()
         .enumerate()
         .map(|(_ch_index, area)| {
-            ExternalBufferParameters::<Sample>::new(
+            let params = ExternalBufferParameters::<Sample>::new(
                 area.addr.byte_offset((area.first / 8) as isize) as *const AtomicSample,
                 ((*io).buffer_size as usize) * channels_areas.len()
                     - ((area.first / bits_per_sample) as usize),
                 (area.step / bits_per_sample) as usize,
                 this.buffers_valid.clone(),
                 None,
-            )
+            );
+            if (*io).stream == SND_PCM_STREAM_PLAYBACK {
+                // send silence, not stale buffer contents, when the application doesn't keep up or stops
+                let stream_info = this.stream_info.clone();
+                params
+                    .with_written_from(Arc::new(move |position| stream_info.written_from(position)))
+            } else {
+                params
+            }
         })
         .collect();
 
@@ -367,25 +481,65 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
     snd_pcm_sw_params_free(swparams);
     assert!(boundary != 0);
     debug!("boundary: {boundary}");
-    this.stream_info = Some(StreamInfo {
-        boundary,
-        boundary_add: Wrapping(0),
-    });
+    this.stream_info
+        .boundary
+        .store(boundary as usize, Ordering::Relaxed);
+    this.stream_info.boundary_add.store(0, Ordering::Relaxed);
     this.start_time = None;
-
-    let (start_time_tx, start_time_rx) = oneshot::channel::<Clock>();
-    let (clock_rx_tx, clock_rx_rx) = oneshot::channel::<RealTimeClockReceiver>();
+    this.anchor.pause();
+    // The buffer becomes valid in plugin_start. Until then, a receiver thread which hasn't noticed
+    // the pause yet mustn't write to it: we're going to clear it, and the application may even
+    // free it (hw_params is allowed in the PREPARED state).
+    // Taking the write lock also waits for any write in progress.
+    *this.buffers_valid.write().unwrap() = false;
 
     let inferno_instance = get_or_create_instance(&this.settings);
+    let running = is_running(&inferno_instance.lock().unwrap(), (*io).stream);
+    if running && this.active_buffers.as_ref() == Some(&buffers_signature) {
+        // Restarting the PCM (transport stop/start, xrun recovery): keep the receiver/transmitter,
+        // its flows and subscriptions running, the stream will be re-anchored in plugin_start.
+        debug!("re-preparing running stream");
+    } else {
+        let r = start_stream(io, this, &inferno_instance, channels_buffers);
+        if r != 0 {
+            return r;
+        }
+        this.active_buffers = Some(buffers_signature);
+    }
+
+    if (*io).stream == SND_PCM_STREAM_CAPTURE {
+        // don't let the application read leftovers from previous runs or uninitialised memory
+        snd_pcm_areas_silence(
+            channels_areas.as_ptr(),
+            0,
+            (*io).channels,
+            (*io).buffer_size,
+            (*io).format,
+        );
+    }
+
+    0
+}
+
+/// (Re)starts the receiver or transmitter serving this PCM, bound to the given buffers.
+unsafe fn start_stream(
+    io: *mut snd_pcm_ioplug_t,
+    this: &mut MyIOPlug,
+    inferno_instance: &Mutex<InfernoInstance>,
+    channels_buffers: Vec<ExternalBufferParameters<Sample>>,
+) -> c_int {
+    let (clock_rx_tx, clock_rx_rx) = oneshot::channel::<RealTimeClockReceiver>();
+    this.anchor = StreamAnchor::new_paused();
+    this.active_buffers = None;
     {
         let mut common = inferno_instance.lock().unwrap();
-        this.start_time_tx = None;
         this.current_timestamp.store(usize::MAX, Ordering::SeqCst);
         let args = StartArgs {
             channels: channels_buffers,
-            start_time_rx,
+            anchor: this.anchor.clone(),
             clock_rx_tx,
-            current_timestamp: if this.use_flows_clock {
+            // playback always needs the transmitter's read position, see plugin_pointer
+            current_timestamp: if this.use_flows_clock || (*io).stream == SND_PCM_STREAM_PLAYBACK {
                 this.current_timestamp.clone()
             } else {
                 Default::default()
@@ -402,33 +556,21 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
                 None
             },
         };
-        let mut err = false;
+        let mut err = !stop_stream(&mut common, (*io).stream);
         match (*io).stream {
             SND_PCM_STREAM_CAPTURE => {
-                if common.capturing {
-                    err = common
-                        .commands_sender
-                        .blocking_send(Command::StopReceiver)
-                        .is_err();
-                }
-                common.capturing = !err;
                 err |= common
                     .commands_sender
                     .blocking_send(Command::StartReceiver(args))
                     .is_err();
+                common.capturing = !err;
             }
             SND_PCM_STREAM_PLAYBACK => {
-                if common.playing {
-                    err = common
-                        .commands_sender
-                        .blocking_send(Command::StopTransmitter)
-                        .is_err();
-                }
-                common.playing = !err;
                 err |= common
                     .commands_sender
                     .blocking_send(Command::StartTransmitter(args))
                     .is_err();
+                common.playing = !err;
             }
             _ => {
                 error!("unknown stream direction");
@@ -448,7 +590,6 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
             return -libc::EINVAL;
         }
     };
-    this.start_time_tx = Some(start_time_tx);
     if let Some(clock_receiver) = &mut this.clock_receiver {
         let mut ctr = 0;
         loop {
@@ -467,7 +608,6 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
             }
         }
     }
-    *this.buffers_valid.write().unwrap() = true;
 
     0
 }
@@ -487,21 +627,16 @@ unsafe extern "C" fn plugin_start(io: *mut snd_pcm_ioplug_t) -> c_int {
             warn!("no overlay for media_clock");
         }
     }
-    // start_time is used (mostly via channels) in:
-    // * flows_rx and flows_ts for calculating ringbuffer positions
+    // start_time is used in:
+    // * flows_rx and flows_tx (via anchor) for calculating ringbuffer positions
     // * plugin_pointer for calculating pointer
     // all these calculations are wrapping so we can use wrapping clock
     let now_samples_opt = this.media_clock.wrapping_now_in_timebase((*io).rate as u64);
     if now_samples_opt.is_some() && this.start_time.is_none() {
-        this.start_time = Some(now_samples_opt.unwrap() as usize);
-        if let Err(e) = this
-            .start_time_tx
-            .take()
-            .unwrap()
-            .send(now_samples_opt.unwrap())
-        {
-            error!("failed to send start timestamp: {e}. tx/rx will not work.");
-        }
+        let start_time = now_samples_opt.unwrap() as usize;
+        this.start_time = Some(start_time);
+        *this.buffers_valid.write().unwrap() = true;
+        this.anchor.start(start_time);
     } else {
         warn!(
             "can't set start_time in plugin_start: now_samples_opt: {:?}, start_time: {:?}",
@@ -522,46 +657,32 @@ unsafe extern "C" fn plugin_stop(io: *mut snd_pcm_ioplug_t) -> c_int {
     debug!("plugin_stop called");
 
     let this = get_private(io);
+    // Only pause: the receiver/transmitter, its flows and subscriptions keep running,
+    // so that the PCM can be restarted without a break in Dante connections.
+    // While paused, the receiver doesn't touch the buffer and the transmitter sends silence.
+    this.anchor.pause();
     *this.buffers_valid.write().unwrap() = false;
-    drop(this.start_time_tx.take());
 
-    // TODO blocking_send inside mutex, risk of deadlock?
-    if let Some(common_mutex) = get_instance(&this.settings) {
-        let mut common = common_mutex.lock().unwrap();
-        match (*io).stream {
-            SND_PCM_STREAM_CAPTURE => {
-                if common.capturing {
-                    common
-                        .commands_sender
-                        .blocking_send(Command::StopReceiver)
-                        .unwrap();
-                    common.capturing = false;
-                } else {
-                    warn!("plugin_stop called more than once for capture stream");
-                }
-            }
-            SND_PCM_STREAM_PLAYBACK => {
-                if common.playing {
-                    common
-                        .commands_sender
-                        .blocking_send(Command::StopTransmitter)
-                        .unwrap();
-                    common.playing = false;
-                } else {
-                    warn!("plugin_stop called more than once for playback stream");
-                }
-            }
-            _ => {
-                error!("unknown stream direction");
-                return -libc::EINVAL;
-            }
-        }
-        if (!common.capturing) && (!common.playing) {
-            //common.commands_sender.blocking_send(Command::Shutdown).unwrap();
-            // don't do this, TODO think of something better
-        }
+    0
+}
+
+/// Like ioplug's default (frames in the buffer), plus the network latency,
+/// so that applications can compensate for it.
+unsafe extern "C" fn plugin_delay(
+    io: *mut snd_pcm_ioplug_t,
+    delayp: *mut snd_pcm_sframes_t,
+) -> c_int {
+    let hw_ptr = plugin_pointer(io);
+    if hw_ptr < 0 {
+        return hw_ptr as c_int;
     }
-
+    let buffered = match (*io).stream {
+        SND_PCM_STREAM_CAPTURE => snd_pcm_ioplug_avail(io, hw_ptr as _, (*io).appl_ptr),
+        _ => snd_pcm_ioplug_hw_avail(io, hw_ptr as _, (*io).appl_ptr),
+    };
+    let this = get_private(io);
+    *delayp =
+        buffered as snd_pcm_sframes_t + this.anchor.network_latency_samples() as snd_pcm_sframes_t;
     0
 }
 
@@ -612,7 +733,8 @@ unsafe extern "C" fn plugin_transfer(
 unsafe extern "C" fn plugin_close(io: *mut snd_pcm_ioplug_t) -> c_int {
     debug!("plugin_close called");
     let this = get_private(io);
-    drop(this.start_time_tx.take());
+    this.anchor.pause();
+    *this.buffers_valid.write().unwrap() = false;
     {
         let mut instances_locked = global_instances.write().unwrap();
         // TODO blocking_send inside mutex, risk of deadlock?
@@ -620,7 +742,10 @@ unsafe extern "C" fn plugin_close(io: *mut snd_pcm_ioplug_t) -> c_int {
             .get(&this.settings.self_info.factory_device_id)
             .map(|a| a.clone())
         {
-            let common = common_mutex.lock().unwrap();
+            let mut common = common_mutex.lock().unwrap();
+            if this.active_buffers.take().is_some() && !stop_stream(&mut common, (*io).stream) {
+                log::error!("BUG: error sending to Inferno thread");
+            }
             if (!common.capturing) && (!common.playing) {
                 if let Err(e) = common.commands_sender.blocking_send(Command::Shutdown) {
                     log::error!("BUG: send shutdown via channel failed: {e:?}");
@@ -681,6 +806,7 @@ unsafe extern "C" fn plugin_define(
         pointer: Some(plugin_pointer),
         close: Some(plugin_close),
         poll_revents: Some(plugin_demangle_revents),
+        delay: Some(plugin_delay),
         //transfer: Some(plugin_transfer),
         ..zeroed()
     };
@@ -704,18 +830,21 @@ unsafe extern "C" fn plugin_define(
         settings,
         ref_time: Instant::now(),
         use_flows_clock,
-        stream_info: None,
+        stream_info: StreamInfo::new(std::ptr::null()), // set below, when io's address is known
         buffers_valid: Arc::new(RwLock::new(false)),
         media_clock: MediaClock::new(false /* TODO */),
         clock_receiver: None,
         start_time: None,
-        start_time_tx: None,
+        anchor: StreamAnchor::new_paused(),
+        active_buffers: None,
         current_timestamp: Arc::new(AtomicUsize::new(usize::MAX)),
         on_transfer_eventfd: efd,
         on_transfer_enabled: !disable_pollfd,
         last_transfer_buffer_offset: 0,
         transfer_offset_add: Wrapping(0),
     }));
+
+    (*myio).stream_info = StreamInfo::new(&(*myio).io.appl_ptr);
 
     let io = &mut (*myio).io;
     io.version = (1 << 16) | (0 << 8) | 2;

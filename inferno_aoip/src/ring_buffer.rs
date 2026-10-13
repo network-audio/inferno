@@ -19,7 +19,15 @@ pub trait ProxyToBuffer<T> {
   /// If buffer is unavailable, returns None
   fn map<R>(&self, cb: impl FnOnce(&[T]) -> R) -> Option<R>;
   fn unconditional_read(&self) -> bool;
+  /// For unconditionally read buffers: how many items starting at `position` have been written, if known.
+  fn written_from(&self, _position: usize) -> Option<usize> {
+    None
+  }
 }
+
+/// Reports how many items starting at the given ring buffer position the producer has written.
+/// Called from realtime threads, must not block.
+pub type WrittenFrom = Arc<dyn Fn(usize) -> usize + Send + Sync>;
 
 pub trait ProxyToSamplesBuffer: ProxyToBuffer<Atomic<Sample>> {}
 
@@ -56,6 +64,7 @@ pub struct ExternalBuffer<T> {
   length: usize,
   // we're using separate flag because ExternalBuffer may be one of the views of the same interleaved buffer with different offsets
   valid: Arc<RwLock<bool>>,
+  written_from: Option<WrittenFrom>,
 }
 
 // safety: is guaranteed by lockable valid flag
@@ -71,8 +80,13 @@ impl<T> ExternalBuffer<T> {
   /// (it can't be atomic_bool by design - it must be locked all time the buffer is in use)
   ///
   /// Safety: user must ensure that ptr & length correspond to a valid memory region containing a slice `[T; length]`
-  unsafe fn new(ptr: *const T, length: usize, valid: Arc<RwLock<bool>>) -> Self {
-    Self { ptr, length, valid }
+  unsafe fn new(
+    ptr: *const T,
+    length: usize,
+    valid: Arc<RwLock<bool>>,
+    written_from: Option<WrittenFrom>,
+  ) -> Self {
+    Self { ptr, length, valid, written_from }
   }
 }
 
@@ -97,6 +111,16 @@ impl<T> ProxyToBuffer<T> for ExternalBuffer<T> {
   #[inline(always)]
   fn unconditional_read(&self) -> bool {
     true
+  }
+  fn written_from(&self, position: usize) -> Option<usize> {
+    let written_from = self.written_from.as_ref()?;
+    // the producer may be gone when the buffer is invalid
+    let guard = self.valid.try_read().ok()?;
+    if *guard {
+      Some(written_from(position))
+    } else {
+      None
+    }
   }
 }
 
@@ -399,7 +423,11 @@ impl<T: NoUninit, P: ProxyToBuffer<Atomic<T>>> RBOutput<T, P> {
   pub fn read_at(&self, start_timestamp: usize, output: &mut [T]) -> ReadResult {
     // in normal case: start_ts < readable_pos <= writing_pos
     let output_len = if self.rb.buffer.unconditional_read() {
-      output.len()
+      // don't read what the producer hasn't written (yet or anymore), it would be stale data
+      match self.rb.buffer.written_from(start_timestamp) {
+        Some(written) => output.len().min(written),
+        None => output.len(),
+      }
     } else {
       let readable = wrapsub(self.rb.readable_pos.load(Ordering::Acquire), start_timestamp);
       if readable < 0 || readable > self.rb.items_size.try_into().unwrap() {
@@ -507,6 +535,7 @@ pub struct ExternalBufferParameters<T> {
   stride: usize,
   valid: Arc<RwLock<bool>>,
   readable_pos_dest: Option<PositionReportDestination>,
+  written_from: Option<WrittenFrom>,
 }
 
 // safety: is guaranteed by lockable valid flag
@@ -521,7 +550,13 @@ impl<T> ExternalBufferParameters<T> {
     valid: Arc<RwLock<bool>>,
     readable_pos_dest: Option<PositionReportDestination>,
   ) -> Self {
-    Self { ptr, length, stride, valid, readable_pos_dest }
+    Self { ptr, length, stride, valid, readable_pos_dest, written_from: None }
+  }
+  /// For a source buffer: lets readers know how far the producer has written, so that they read silence
+  /// instead of stale data when it falls behind or stops.
+  pub fn with_written_from(mut self, written_from: WrittenFrom) -> Self {
+    self.written_from = Some(written_from);
+    self
   }
 }
 
@@ -530,7 +565,9 @@ pub fn shared_from_external<T: Default>(
   par: &ExternalBufferParameters<T>,
   start_time: usize,
 ) -> Arc<RingBufferShared<T, ExternalBuffer<Atomic<T>>>> {
-  let external = unsafe { ExternalBuffer::<Atomic<T>>::new(par.ptr, par.length, par.valid.clone()) };
+  let external = unsafe {
+    ExternalBuffer::<Atomic<T>>::new(par.ptr, par.length, par.valid.clone(), par.written_from.clone())
+  };
   RingBufferShared::new(external, par.stride, start_time, par.readable_pos_dest.clone())
 }
 
@@ -1031,6 +1068,41 @@ mod tests {
     );
     // positions 12..15 = original audio, 16..19 = zeros (future-filled)
     assert_eq!(read_tail, vec![112, 113, 114, 115, 0, 0, 0, 0]);
+  }
+
+  /// A source ExternalBuffer read beyond what its producer has written yields only the written part,
+  /// so that the reader sends silence instead of stale data; without the limit everything is read.
+  #[test]
+  fn test_external_source_written_from_limits_read() {
+    use atomic::Atomic;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let buf: Arc<Vec<Atomic<i32>>> = Arc::new((0..16).map(|i| Atomic::new(100 + i)).collect());
+    std::mem::forget(buf.clone());
+    let valid = Arc::new(std::sync::RwLock::new(true));
+    let written_until = Arc::new(AtomicUsize::new(19));
+    let w = written_until.clone();
+    let params =
+      unsafe { ExternalBufferParameters::new(buf.as_ptr(), buf.len(), 1, valid.clone(), None) }
+        .with_written_from(Arc::new(move |pos: usize| {
+          (w.load(Ordering::Relaxed) as isize).wrapping_sub(pos as isize).max(0) as usize
+        }));
+    let output = wrap_external_source(&params, 0);
+
+    let mut out = vec![-1; 8];
+    // positions 16..19 written (ring indices 0..3), 20..23 not yet
+    assert_eq!(output.read_at(16, &mut out), ReadResult { useful_start_index: 0, useful_end_index: 3 });
+    assert_eq!(&out[..3], &[100, 101, 102]);
+
+    // producer fell behind the reader: nothing useful
+    assert_eq!(output.read_at(24, &mut out), ReadResult { useful_start_index: 0, useful_end_index: 0 });
+
+    written_until.store(40, Ordering::Relaxed);
+    assert_eq!(output.read_at(24, &mut out), ReadResult { useful_start_index: 0, useful_end_index: 8 });
+
+    // invalid buffer: nothing is read, and the producer isn't asked
+    *valid.write().unwrap() = false;
+    assert_eq!(output.read_at(24, &mut out), ReadResult { useful_start_index: 0, useful_end_index: 0 });
   }
 
   /// Write via the ring_buffer API into an ExternalBuffer, then read the

@@ -38,12 +38,16 @@ pub(crate) mod samples_collector;
 pub(crate) mod samples_utils;
 pub(crate) mod saved_settings;
 pub(crate) mod settings;
+mod stream_anchor;
 pub(crate) mod tx_multicasts;
 
 pub use crate::common::{Clock, ClockDiff, Sample};
 pub use crate::media_clock::{MediaClock, RealTimeClockReceiver};
-pub use crate::ring_buffer::{new_owned, ExternalBufferParameters, PositionReportDestination, RBInput};
+pub use crate::ring_buffer::{
+  new_owned, ExternalBufferParameters, PositionReportDestination, RBInput, WrittenFrom,
+};
 pub use settings::Settings;
+pub use stream_anchor::StreamAnchor;
 pub type AtomicSample = atomic::Atomic<Sample>;
 
 use channels_subscriber::{ChannelsBuffering, ChannelsSubscriber, ExternalBuffering, OwnedBuffering};
@@ -187,28 +191,30 @@ impl DeviceServer {
     );
     let tasks = vec![tokio::spawn(col_fut)];
     let buffering = OwnedBuffering::new(524288 /*TODO*/, 4800 /*TODO*/, Arc::new(col));
-    self.receive(tasks, None, buffering, Default::default(), None).await;
+    self.receive(tasks, StreamAnchor::new_started(0), buffering, Default::default(), None).await;
   }
   pub async fn receive_realtime(&mut self) -> RealTimeSamplesReceiver<OwnedBuffer<Atomic<Sample>>> {
     let (col, col_fut, rt_recv) =
       SamplesCollector::new_realtime(self.self_info.clone(), self.get_realtime_clock_receiver());
     let tasks = vec![tokio::spawn(col_fut)];
     let buffering = OwnedBuffering::new(524288 /*TODO*/, 4800 /*TODO*/, Arc::new(col));
-    self.receive(tasks, None, buffering, Default::default(), None).await;
+    self.receive(tasks, StreamAnchor::new_started(0), buffering, Default::default(), None).await;
 
     rt_recv
   }
+  /// Receives into buffers owned by the caller (e.g. ALSA mmap areas), addressed relative to `anchor`.
+  /// The stream may be paused and re-anchored any number of times without restarting the receiver.
   pub async fn receive_to_external_buffer(
     &mut self,
     rx_channels_buffers: Vec<ExternalBufferParameters<Sample>>,
-    start_time_rx: tokio::sync::oneshot::Receiver<Clock>,
+    anchor: StreamAnchor,
     current_timestamp: Arc<AtomicUsize>,
     on_transfer: Option<TransferNotifier>,
   ) {
     let buffering = ExternalBuffering::new(rx_channels_buffers, 4800 /*TODO*/);
     let rbs = buffering.ring_buffers.clone();
     *self.rx_peaks_supplier.write().unwrap() = Box::new(move || peaks_of_buffers(&rbs));
-    self.receive(vec![], Some(start_time_rx), buffering, current_timestamp, on_transfer).await;
+    self.receive(vec![], anchor, buffering, current_timestamp, on_transfer).await;
   }
   async fn receive<
     P: ProxyToSamplesBuffer + Send + Sync + 'static,
@@ -216,29 +222,16 @@ impl DeviceServer {
   >(
     &mut self,
     mut tasks: Vec<JoinHandle<()>>,
-    start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>,
+    anchor: StreamAnchor,
     channels_buffering: B,
     current_timestamp: Arc<AtomicUsize>,
     on_transfer: Option<TransferNotifier>,
   ) {
-    let (srx1, srx2) = if let Some(in_rx) = start_time_rx {
-      let (stx1, srx1) = tokio::sync::oneshot::channel::<Clock>();
-      let (stx2, srx2) = tokio::sync::oneshot::channel::<Clock>();
-      tokio::spawn(async {
-        if let Ok(v) = in_rx.await {
-          let _ = stx1.send(v);
-          let _ = stx2.send(v);
-        }
-      });
-      (Some(srx1), Some(srx2))
-    } else {
-      (None, None)
-    };
     let (flows_rx_handle, flows_rx_thread) = flows_rx::FlowsReceiver::start(
       self.self_info.clone(),
       self.get_realtime_clock_receiver(),
       self.ref_instant,
-      srx1,
+      anchor,
       current_timestamp,
       on_transfer,
     );
@@ -250,9 +243,7 @@ impl DeviceServer {
       self.mdns_client.clone(),
       self.mcast_tx.clone(),
       channels_buffering,
-      self.tx_latency_ns, /* FIXME should be RX latency */
       self.state_storage.clone(),
-      srx2,
       self.ref_instant,
     );
     let channels_sub_handle = Arc::new(channels_sub_handle);
@@ -278,10 +269,13 @@ impl DeviceServer {
     self.rx_shutdown_todo.take().unwrap().await;
   }
 
+  /// Transmits from buffers owned by the caller (e.g. ALSA mmap areas), addressed relative to `anchor`.
+  /// The stream may be paused (silence is sent) and re-anchored any number of times
+  /// without restarting the transmitter.
   pub async fn transmit_from_external_buffer(
     &mut self,
     tx_channels_buffers: Vec<ExternalBufferParameters<Sample>>,
-    start_time_rx: tokio::sync::oneshot::Receiver<Clock>,
+    anchor: StreamAnchor,
     current_timestamp: Arc<AtomicUsize>,
     on_transfer: Option<TransferNotifier>,
   ) {
@@ -289,11 +283,11 @@ impl DeviceServer {
       tx_channels_buffers.iter().map(|par| ring_buffer::wrap_external_source(par, 0)).collect();
     let rbs = rb_outputs.iter().map(|rbo| rbo.shared().clone()).collect_vec();
     *self.tx_peaks_supplier.write().unwrap() = Box::new(move || peaks_of_buffers(&rbs));
-    self.transmit(Some(start_time_rx), rb_outputs, current_timestamp, on_transfer).await;
+    self.transmit(anchor, rb_outputs, current_timestamp, on_transfer).await;
   }
   async fn transmit<P: ProxyToSamplesBuffer + Send + Sync + 'static>(
     &mut self,
-    start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>,
+    anchor: StreamAnchor,
     rb_outputs: Vec<RBOutput<Sample, P>>,
     current_timestamp: Arc<AtomicUsize>,
     on_transfer: Option<TransferNotifier>,
@@ -306,7 +300,7 @@ impl DeviceServer {
       self.tx_source_bit_depth,
       self.get_realtime_clock_receiver(),
       rb_outputs.clone(),
-      start_time_rx,
+      anchor,
       current_timestamp.clone(),
       on_transfer,
     );

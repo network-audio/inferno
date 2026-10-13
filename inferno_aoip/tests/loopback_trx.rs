@@ -15,7 +15,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use inferno_aoip::device_server::{
-  AtomicSample, DeviceServer, ExternalBufferParameters, MediaClock, Sample, Settings, TransferNotifier,
+  AtomicSample, DeviceServer, ExternalBufferParameters, MediaClock, Sample, Settings, StreamAnchor,
+  TransferNotifier,
 };
 
 const BUF_SIZE: usize = 65536;
@@ -79,15 +80,14 @@ async fn wait_for_clock(
   }
 }
 
+/// Compares `b` with the ring buffer `a` starting at `a_start`, wrapping around its end.
 #[inline(always)]
-fn compare_samples(a: &[AtomicSample], b: &[Sample]) -> bool {
-  if a.len() != b.len() {
-    return false;
-  }
+fn compare_samples(a: &[AtomicSample], a_start: usize, b: &[Sample]) -> bool {
   let mut mindiff = Sample::MAX;
   let mut maxdiff = Sample::MIN;
-  for (a, b) in a.iter().zip(b) {
-    let diff = a.load(atomic::Ordering::Relaxed).saturating_sub(*b);
+  for (i, b) in b.iter().enumerate() {
+    let a = a[(a_start + i) % a.len()].load(atomic::Ordering::Relaxed);
+    let diff = a.saturating_sub(*b);
     if diff.saturating_abs() > 384 {
       return false;
     }
@@ -102,15 +102,9 @@ fn compare_samples(a: &[AtomicSample], b: &[Sample]) -> bool {
   true
 }
 
+/// Position of `b` in the ring buffer `a`.
 fn find_samples_offset(a: &[AtomicSample], b: &[Sample]) -> Option<usize> {
-  let mut offset = 0;
-  while offset < a.len() - b.len() {
-    if compare_samples(&a[offset..][..b.len()], b) {
-      return Some(offset);
-    }
-    offset += 1;
-  }
-  None
+  (0..a.len()).find(|&offset| compare_samples(a, offset, b))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -167,13 +161,13 @@ async fn test_loopback_trx() {
     })
     .collect();
 
-  let (tx_start_tx, tx_start_rx) = tokio::sync::oneshot::channel::<usize>();
+  let tx_anchor = StreamAnchor::new_paused();
   let tx_current_timestamp: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(usize::MAX));
 
   tx_server
     .transmit_from_external_buffer(
       tx_external_params,
-      tx_start_rx,
+      tx_anchor.clone(),
       tx_current_timestamp.clone(),
       Some(TransferNotifier { callback: Box::new(|| {}), max_interval_samples: 480 }),
     )
@@ -208,41 +202,42 @@ async fn test_loopback_trx() {
         if found_offset.is_none() {
           panic!("compared only non-zero samples but failed to find offset");
         }
-        offset.store(found_offset.unwrap() - start_pos_per_channel[0], atomic::Ordering::Relaxed);
+        offset.store(
+          (found_offset.unwrap() + BUF_SIZE - start_pos_per_channel[0]) % BUF_SIZE,
+          atomic::Ordering::Relaxed,
+        );
         has_offset.store(true, atomic::Ordering::Relaxed);
       }
       if has_offset.load(atomic::Ordering::Relaxed) {
+        // the transmitter reads its buffer as a ring
         let offset_v = offset.load(atomic::Ordering::Relaxed);
-        let cnt = samples_count.min(tx_buffers[0].len() - offset_v);
-        if cnt == 0 {
-          return;
-        }
-
         for (chi, samples) in channels.iter().enumerate() {
           if !has_ch[chi] {
             continue;
           }
-          let transmitted = &tx_buffers[chi];
           let start = start_pos_per_channel[chi];
-          let ch_cnt = cnt - start;
-          assert!(compare_samples(
-            &transmitted[offset_v + start..][..ch_cnt],
-            &samples[start..][..ch_cnt]
-          ));
-          total_samples_per_channel[chi].fetch_add(ch_cnt, atomic::Ordering::Relaxed);
+          assert!(compare_samples(&tx_buffers[chi], offset_v + start, &samples[start..samples_count]));
+          total_samples_per_channel[chi].fetch_add(samples_count - start, atomic::Ordering::Relaxed);
         }
-        offset.fetch_add(cnt, atomic::Ordering::Relaxed);
+        offset.store((offset_v + samples_count) % BUF_SIZE, atomic::Ordering::Relaxed);
       }
     }
   };
 
   rx_server.receive_with_callback(Box::new(rx_callback)).await;
 
-  let _ = tx_start_tx.send(tx_start_time);
+  tx_anchor.start(tx_start_time);
   rx_server.subscribe(0, "TX 1", &tx_hostname).await;
   rx_server.subscribe(1, "TX 2", &tx_hostname).await;
 
-  tokio::time::sleep(Duration::from_secs(2)).await;
+  // wait for more than a whole buffer (so its wrap-around is verified too) instead of a fixed time:
+  // startup (subscription, first packets) varies
+  let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+  while total_samples_per_channel.iter().any(|t| t.load(Ordering::Relaxed) <= BUF_SIZE * 5 / 4)
+    && tokio::time::Instant::now() < deadline
+  {
+    tokio::time::sleep(Duration::from_millis(50)).await;
+  }
 
   rx_server.shutdown().await;
   tx_server.shutdown().await;
@@ -258,6 +253,6 @@ async fn test_loopback_trx() {
     total_samples_per_channel
   );
   assert!(has_offset.load(atomic::Ordering::Relaxed));
-  assert!(total_samples_per_channel[0].load(Ordering::Relaxed) > BUF_SIZE * 3 / 4);
-  assert!(total_samples_per_channel[1].load(Ordering::Relaxed) > BUF_SIZE * 3 / 4);
+  assert!(total_samples_per_channel[0].load(Ordering::Relaxed) > BUF_SIZE * 5 / 4);
+  assert!(total_samples_per_channel[1].load(Ordering::Relaxed) > BUF_SIZE * 5 / 4);
 }

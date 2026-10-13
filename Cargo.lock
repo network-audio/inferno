@@ -33,6 +33,7 @@ dependencies = [
  "libc",
  "log",
  "tokio",
+ "usrvclock",
 ]
 
 [[package]]
