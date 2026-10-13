@@ -228,7 +228,12 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
           (transfer.max_interval_samples as u64 * 1_000_000_000u64 / self.sample_rate as u64) / 2,
         )
       })
-      .unwrap_or(CLOSING_SAMPLES_INTERVAL);
+      .unwrap_or(CLOSING_SAMPLES_INTERVAL)
+      // closing ahead (below) must stay within what packets already write (latency ahead), otherwise the
+      // closed silence would overwrite samples readers haven't read yet
+      .min(Duration::from_nanos(
+        self.default_latency_samples as u64 * 1_000_000_000 / self.sample_rate as u64 / 4,
+      ));
     let mut next_closing_samples = Instant::now() + closing_samples_interval;
     // Readers may read up to the current time at any moment, so each closing pass must close beyond it,
     // until (at least) the next pass. Two intervals leave slack for a late wakeup.

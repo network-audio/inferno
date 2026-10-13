@@ -5,8 +5,9 @@ use alsa_sys_all::*;
 use futures_util::FutureExt;
 use inferno_aoip::device_info::DeviceId;
 use inferno_aoip::device_server::{
-    AtomicSample, Clock, DeviceServer, ExternalBufferParameters, MediaClock, RealTimeClockReceiver,
-    Sample, Settings, StreamAnchor, TransferNotifier,
+    AtomicSample, Clock, DeviceServer, ExternalBufferParameters, MediaClock,
+    PositionReportDestination, RealTimeClockReceiver, Sample, Settings, StreamAnchor,
+    TransferNotifier,
 };
 use inferno_aoip::utils::run_future_in_new_thread;
 use itertools::Itertools;
@@ -207,6 +208,8 @@ struct MyIOPlug {
     //config: BTreeMap<String, String>,
     ref_time: Instant,
     use_flows_clock: bool,
+    /// capture: per channel, how far the running receiver has written (frames since start_time)
+    capture_written: Arc<Vec<AtomicUsize>>,
     stream_info: Arc<StreamInfo>,
     buffers_valid: Arc<RwLock<bool>>,
     media_clock: MediaClock,
@@ -322,13 +325,21 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
     };
 
     if (*io).stream == SND_PCM_STREAM_CAPTURE && (*io).state == SND_PCM_STATE_RUNNING {
-        // The receiver writes up to the network latency ahead of our pointer: if the application doesn't
-        // read in time, samples it hasn't read yet get overwritten.
-        let latency = this.anchor.network_latency_samples() as snd_pcm_sframes_t;
-        if buffered + latency > (*io).buffer_size as snd_pcm_sframes_t {
+        // The receiver writes ahead of our pointer (by up to the network latency): if the application
+        // doesn't read in time, samples it hasn't read yet get overwritten.
+        let buffer_size = (*io).buffer_size as snd_pcm_sframes_t;
+        let appl = ptr.wrapping_sub(buffered) as usize;
+        let written_ahead = this
+            .capture_written
+            .iter()
+            .map(|w| w.load(Ordering::Acquire).wrapping_sub(appl) as snd_pcm_sframes_t)
+            // ignore channels without a writer and positions from before a restart
+            .filter(|&w| w >= buffered && w <= buffered + 2 * buffer_size)
+            .max()
+            .unwrap_or(0);
+        if buffered > buffer_size || written_ahead > buffer_size {
             warn!(
-                "XRUN: capture overrun, buffered {buffered} + network latency {latency} > buffer size {}",
-                (*io).buffer_size
+                "XRUN: capture overrun, buffered {buffered}, written {written_ahead} > buffer size {buffer_size}"
             );
             return (-EPIPE).try_into().unwrap();
         }
@@ -462,10 +473,16 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
         period_size: (*io).period_size,
     };
 
+    // a running receiver keeps reporting to the table it was started with
+    let capture_written = if this.capture_written.len() == channels_areas.len() {
+        this.capture_written.clone()
+    } else {
+        Arc::new(channels_areas.iter().map(|_| AtomicUsize::new(0)).collect())
+    };
     let channels_buffers = channels_areas
         .iter()
         .enumerate()
-        .map(|(_ch_index, area)| {
+        .map(|(ch_index, area)| {
             let params = ExternalBufferParameters::<Sample>::new(
                 area.addr.byte_offset((area.first / 8) as isize) as *const AtomicSample,
                 ((*io).buffer_size as usize) * channels_areas.len()
@@ -480,7 +497,10 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
                 params
                     .with_written_from(Arc::new(move |position| stream_info.written_from(position)))
             } else {
-                params
+                params.with_written_pos_report(PositionReportDestination::new(
+                    capture_written.clone(),
+                    ch_index,
+                ))
             }
         })
         .collect();
@@ -527,6 +547,11 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
         }
         this.active_buffers = Some(buffers_signature);
     }
+    // the paused receiver doesn't write; positions of the next run start at 0
+    for w in capture_written.iter() {
+        w.store(0, Ordering::Release);
+    }
+    this.capture_written = capture_written;
 
     if (*io).stream == SND_PCM_STREAM_CAPTURE {
         // don't let the application read leftovers from previous runs or uninitialised memory
@@ -851,6 +876,7 @@ unsafe extern "C" fn plugin_define(
         settings,
         ref_time: Instant::now(),
         use_flows_clock,
+        capture_written: Arc::new(vec![]),
         stream_info: StreamInfo::new(std::ptr::null()), // set below, when io's address is known
         anchor: StreamAnchor::new_paused_guarding(buffers_valid.clone()),
         buffers_valid,

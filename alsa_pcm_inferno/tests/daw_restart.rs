@@ -1186,3 +1186,57 @@ fn capture_restart_has_no_misplaced_samples() {
         "{stale} stale or misplaced samples captured right after restarts"
     );
 }
+
+/// T11: a valid configuration read on time (each period up to about half a period late, like Ardour does)
+/// must not get xruns: only real overwrites of unread samples may be reported.
+#[test]
+fn capture_read_slightly_late_has_no_false_xruns() {
+    let ids = TestIds {
+        base_port: 32000,
+        base_pid: 32,
+        tag: "capnofalse",
+        latency_ns: LATENCY_NS,
+    };
+    // 10 ms (480 frames) + 1024 <= 2048
+    let fx = CaptureFixture::with_pcm(&ids, |config| {
+        Pcm::open_with(config, SND_PCM_STREAM_CAPTURE, 1024, 2048).expect("1024x2 refused")
+    });
+    let pcm = fx.pcm();
+    let mut buf = vec![0 as Sample; pcm.period_size * CHANNELS];
+    let (mut xruns, mut discontinuities, mut frames) = (0, 0, 0usize);
+    let mut last_ts: Option<usize> = None;
+    let end = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < end {
+        // wait for a period, then process it a bit late: 2..6 ms, within the 1024 - 480 frames (11 ms) left
+        while pcm.avail() < pcm.period_size as i64 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(2 + (frames / 1024 % 5) as u64));
+        let r = pcm.read(&mut buf);
+        if r == -(libc::EPIPE as i64) {
+            xruns += 1;
+            last_ts = None;
+            pcm.prepare();
+            pcm.start();
+            continue;
+        }
+        assert!(r >= 0, "snd_pcm_readi failed: {r}");
+        frames += r as usize;
+        for frame in buf[..r as usize * CHANNELS].chunks(CHANNELS) {
+            if !is_fresh_ramp_sample(frame[0], 0) {
+                last_ts = None;
+                continue;
+            }
+            let ts = (frame[0] as u32 >> 9) as usize;
+            if last_ts.is_some_and(|prev| ts != (prev + 1) & (RAMP_LEN - 1)) {
+                discontinuities += 1;
+            }
+            last_ts = Some(ts);
+        }
+    }
+    log::info!(
+        "slightly late capture: {frames} frames, {xruns} xruns, {discontinuities} discontinuities"
+    );
+    assert_eq!(discontinuities, 0, "captured audio is discontinuous");
+    assert_eq!(xruns, 0, "false xruns: nothing unread was overwritten");
+}

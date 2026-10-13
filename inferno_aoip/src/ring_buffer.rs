@@ -148,6 +148,8 @@ pub struct RingBufferShared<T, P: ProxyToBuffer<Atomic<T>>> {
   holes_count: AtomicUsize,
 
   readable_pos_dest: Option<PositionReportDestination>,
+  /// where to report the end of the furthest item written (including holes before it)
+  written_pos_dest: Option<PositionReportDestination>,
 }
 
 impl<T, P: ProxyToBuffer<Atomic<T>>> RingBufferShared<T, P> {
@@ -156,6 +158,7 @@ impl<T, P: ProxyToBuffer<Atomic<T>>> RingBufferShared<T, P> {
     stride: usize,
     start_time: usize,
     readable_pos_dest: Option<PositionReportDestination>,
+    written_pos_dest: Option<PositionReportDestination>,
   ) -> Arc<Self> {
     let items_size = (storage.len() + stride - 1) / stride;
     assert!(items_size.is_power_of_two());
@@ -168,6 +171,7 @@ impl<T, P: ProxyToBuffer<Atomic<T>>> RingBufferShared<T, P> {
       writing_pos: start_time.into(),
       holes_count: 0.into(),
       readable_pos_dest,
+      written_pos_dest,
     })
   }
   #[inline(always)]
@@ -179,6 +183,9 @@ impl<T, P: ProxyToBuffer<Atomic<T>>> RingBufferShared<T, P> {
   fn commit_readable_pos(&self) {
     if let Some(dest) = &self.readable_pos_dest {
       dest.tab[dest.offset].store(self.readable_pos.load(Ordering::Relaxed), Ordering::Release);
+    }
+    if let Some(dest) = &self.written_pos_dest {
+      dest.tab[dest.offset].store(self.writing_pos.load(Ordering::Relaxed), Ordering::Release);
     }
   }
 
@@ -494,7 +501,7 @@ pub fn new_owned<T: Default>(
   start_time: usize,
   hole_fix_wait: usize,
 ) -> (RBInput<T, OwnedBuffer<Atomic<T>>>, RBOutput<T, OwnedBuffer<Atomic<T>>>) {
-  let shared = RingBufferShared::new(OwnedBuffer::<Atomic<T>>::new(length), 1, start_time, None);
+  let shared = RingBufferShared::new(OwnedBuffer::<Atomic<T>>::new(length), 1, start_time, None, None);
   (
     RBInput { rb: shared.clone(), item_ready: boolvec![false; shared.items_size], hole_fix_wait },
     RBOutput { rb: shared },
@@ -535,6 +542,7 @@ pub struct ExternalBufferParameters<T> {
   stride: usize,
   valid: Arc<RwLock<bool>>,
   readable_pos_dest: Option<PositionReportDestination>,
+  written_pos_dest: Option<PositionReportDestination>,
   written_from: Option<WrittenFrom>,
 }
 
@@ -550,7 +558,13 @@ impl<T> ExternalBufferParameters<T> {
     valid: Arc<RwLock<bool>>,
     readable_pos_dest: Option<PositionReportDestination>,
   ) -> Self {
-    Self { ptr, length, stride, valid, readable_pos_dest, written_from: None }
+    Self { ptr, length, stride, valid, readable_pos_dest, written_pos_dest: None, written_from: None }
+  }
+  /// For a sink buffer: reports how far the writer has written (end of the furthest item written), e.g. so
+  /// that the reader can tell whether unread items have been overwritten.
+  pub fn with_written_pos_report(mut self, dest: PositionReportDestination) -> Self {
+    self.written_pos_dest = Some(dest);
+    self
   }
   /// For a source buffer: lets readers know how far the producer has written, so that they read silence
   /// instead of stale data when it falls behind or stops.
@@ -568,7 +582,13 @@ pub fn shared_from_external<T: Default>(
   let external = unsafe {
     ExternalBuffer::<Atomic<T>>::new(par.ptr, par.length, par.valid.clone(), par.written_from.clone())
   };
-  RingBufferShared::new(external, par.stride, start_time, par.readable_pos_dest.clone())
+  RingBufferShared::new(
+    external,
+    par.stride,
+    start_time,
+    par.readable_pos_dest.clone(),
+    par.written_pos_dest.clone(),
+  )
 }
 
 pub fn wrap_external_source<T: Default>(
@@ -1068,6 +1088,28 @@ mod tests {
     );
     // positions 12..15 = original audio, 16..19 = zeros (future-filled)
     assert_eq!(read_tail, vec![112, 113, 114, 115, 0, 0, 0, 0]);
+  }
+
+  /// A sink reports the end of the furthest item written, also beyond a hole, and after closing.
+  #[test]
+  fn test_external_sink_reports_written_position() {
+    use atomic::Atomic;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let buf: Arc<Vec<Atomic<i32>>> = Arc::new((0..16).map(|_| Atomic::new(-1)).collect());
+    std::mem::forget(buf.clone());
+    let valid = Arc::new(std::sync::RwLock::new(true));
+    let tab = Arc::new(vec![AtomicUsize::new(0), AtomicUsize::new(0)]);
+    let params = unsafe { ExternalBufferParameters::new(buf.as_ptr(), buf.len(), 1, valid, None) }
+      .with_written_pos_report(PositionReportDestination::new(tab.clone(), 1));
+    let mut input = wrap_external_sink(&params, 100, 100);
+    input.write_from_at(100, (0..4).map(|x| x as i32));
+    assert_eq!(tab[1].load(Ordering::Relaxed), 104);
+    input.write_from_at(108, (0..2).map(|x| x as i32)); // hole 104..108
+    assert_eq!(tab[1].load(Ordering::Relaxed), 110);
+    input.close_items_until(113);
+    assert_eq!(tab[1].load(Ordering::Relaxed), 113);
+    assert_eq!(tab[0].load(Ordering::Relaxed), 0, "other channel's slot untouched");
   }
 
   /// A source ExternalBuffer read beyond what its producer has written yields only the written part,
