@@ -478,6 +478,7 @@ mod tests {
       netmask: std::net::Ipv4Addr::new(255, 255, 255, 0),
       gateway: std::net::Ipv4Addr::new(192, 168, 1, 1),
       mac_address: netdev::mac::MacAddr::from_hex_format("00:11:22:33:44:55"),
+      interface_name: None,
       link_speed: 1000,
       board_name: "TestBoard".to_string(),
       manufacturer: "TestMfg".to_string(),

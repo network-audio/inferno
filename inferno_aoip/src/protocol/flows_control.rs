@@ -208,6 +208,7 @@ mod tests {
       netmask: Ipv4Addr::new(0, 0, 0, 0),
       gateway: Ipv4Addr::new(0, 0, 0, 0),
       mac_address: MacAddr::zero(),
+      interface_name: None,
       link_speed: 0,
       board_name: String::new(),
       manufacturer: String::new(),

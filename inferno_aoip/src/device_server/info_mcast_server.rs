@@ -6,8 +6,10 @@ use crate::net_utils::UdpSocketWrapper;
 use crate::protocol::mcast::{make_packet, MulticastMessage};
 use crate::{byte_utils::write_str_to_buffer, device_info::DeviceInfo};
 use bytebuffer::ByteBuffer;
+use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::RwLock;
+use std::time::Instant;
 use std::{
   net::{IpAddr, Ipv4Addr, SocketAddr},
   sync::Arc,
@@ -41,6 +43,9 @@ struct Multicaster<'s> {
   channels_subscriber: Option<Arc<ChannelsSubscriber>>,
   get_peaks: PeaksCallback,
   had_clock: bool,
+  /// latest sample of the network interface's counters, taken with every heartbeat
+  interface_sample: Option<(Instant, InterfaceCounters)>,
+  interface_statistics: Option<InterfaceStatistics>,
 }
 
 impl<'s> Multicaster<'s> {
@@ -76,6 +81,8 @@ impl<'s> Multicaster<'s> {
       channels_subscriber: None,
       get_peaks,
       had_clock: false,
+      interface_sample: None,
+      interface_statistics: None,
     };
     write_str_to_buffer(&mut r.vendor, 0, 8, &self_info.vendor_string);
     return r;
@@ -312,6 +319,36 @@ impl<'s> Multicaster<'s> {
       .await;
   }
 
+  /// Updates the interface statistics, call about once a second
+  fn sample_interface(&mut self) {
+    let Some(name) = &self.self_info.interface_name else {
+      return;
+    };
+    let Some(counters) =
+      read_interface_counters(&Path::new("/sys/class/net").join(name).join("statistics"))
+    else {
+      self.interface_statistics = None;
+      return;
+    };
+    let now = (Instant::now(), counters);
+    if let Some(prev) = &self.interface_sample {
+      self.interface_statistics = Some(interface_statistics(prev, &now));
+    }
+    self.interface_sample = Some(now);
+  }
+
+  async fn send_interface_statistics(&mut self) {
+    let content = interface_statistics_content(self.interface_statistics, self.self_info.link_speed);
+    self
+      .send(
+        self.device_info_destination,
+        0xffff,
+        [0x07, 0x2a, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00],
+        &content,
+      )
+      .await;
+  }
+
   async fn send_network_info(&mut self) {
     let mut bytes = ByteBuffer::new();
     bytes.set_endian(bytebuffer::Endian::BigEndian);
@@ -337,6 +374,93 @@ impl<'s> Multicaster<'s> {
       )
       .await;
   }
+}
+
+/// Cumulative counters of a network interface, as reported by the OS.
+#[derive(Clone, Copy, Debug)]
+struct InterfaceCounters {
+  tx_bytes: u64,
+  rx_bytes: u64,
+  tx_errors: u64,
+  rx_errors: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct InterfaceStatistics {
+  tx_bytes_per_s: u32,
+  rx_bytes_per_s: u32,
+  /// cumulative
+  tx_errors: u32,
+  rx_errors: u32,
+}
+
+/// Reads counters from a Linux sysfs interface statistics directory (`/sys/class/net/<name>/statistics`).
+fn read_interface_counters(dir: &Path) -> Option<InterfaceCounters> {
+  let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok()?.trim().parse::<u64>().ok();
+  Some(InterfaceCounters {
+    tx_bytes: read("tx_bytes")?,
+    rx_bytes: read("rx_bytes")?,
+    tx_errors: read("tx_errors")?,
+    rx_errors: read("rx_errors")?,
+  })
+}
+
+/// Rates between two samples of the counters, and the latest cumulative error counts.
+fn interface_statistics(
+  prev: &(Instant, InterfaceCounters),
+  now: &(Instant, InterfaceCounters),
+) -> InterfaceStatistics {
+  let secs = now.0.saturating_duration_since(prev.0).as_secs_f64();
+  let rate = |a: u64, b: u64| {
+    if secs > 0.0 {
+      (b.saturating_sub(a) as f64 / secs).round().min(u32::MAX as f64) as u32
+    } else {
+      0
+    }
+  };
+  let clamp = |v: u64| v.min(u32::MAX as u64) as u32;
+  InterfaceStatistics {
+    tx_bytes_per_s: rate(prev.1.tx_bytes, now.1.tx_bytes),
+    rx_bytes_per_s: rate(prev.1.rx_bytes, now.1.rx_bytes),
+    tx_errors: clamp(now.1.tx_errors),
+    rx_errors: clamp(now.1.rx_errors),
+  }
+}
+
+/// Content of the interface statistics (0x0040) reply: one interface group with one record. Utilization and
+/// error counts are advertised only when the interface's counters are available.
+fn interface_statistics_content(stats: Option<InterfaceStatistics>, link_speed_mbps: u16) -> Vec<u8> {
+  let mut bytes = ByteBuffer::new();
+  bytes.set_endian(bytebuffer::Endian::BigEndian);
+  // offsets are relative to the opcode field, which precedes this content (8 bytes)
+  bytes.write_u16(1); // groups count
+  bytes.write_u16(0x24); // group offset
+  bytes.write_u16(0x10); // header offset
+  bytes.write_u16(0);
+  // header, first 16 bytes as in real devices:
+  bytes.write_bytes(&[0x00, 0x14, 0, 0, 0, 0, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0]);
+  bytes.write_u32(if stats.is_some() {
+    0x3 /* utilization, errors */
+  } else {
+    0
+  }); // capabilities
+      // group:
+  bytes.write_u16(1); // records count
+  bytes.write_u16(0x28); // record offset
+                         // record:
+  let stats = stats.unwrap_or(InterfaceStatistics {
+    tx_bytes_per_s: 0,
+    rx_bytes_per_s: 0,
+    tx_errors: 0,
+    rx_errors: 0,
+  });
+  bytes.write_u32(stats.tx_bytes_per_s);
+  bytes.write_u32(stats.rx_bytes_per_s);
+  bytes.write_u32(stats.tx_errors);
+  bytes.write_u32(stats.rx_errors);
+  bytes.write_u32(1); // ??? 1 in real devices with link up
+  bytes.write_u32(link_speed_mbps.into());
+  bytes.into_vec()
 }
 
 /// Status of a fixed, not configurable u32 setting (sample rate, encoding): current = requested = the only choice.
@@ -512,6 +636,9 @@ pub async fn run_server(
           [0x07, _, 0, 0x13, 0, 0, 0, _] => {
             mcaster.send_network_info().await;
           }
+          [0x07, _, 0, 0x41, 0, 0, 0, 0] => {
+            mcaster.send_interface_statistics().await;
+          }
           [0x07, _, 0, 0x77, 0, 0, 0, _]=> {
             mcaster.send(
               mcaster.device_info_destination, 0xffff, [0x07, 0x2a, 0x00, 0x78, 0, 0, 0, 0],
@@ -550,6 +677,7 @@ pub async fn run_server(
         }
       },
       _ = heartbeat_interval.tick() => {
+        mcaster.sample_interface();
         mcaster.send_heartbeat().await;
       },
       _ = channels_sub_rx.changed() => {
@@ -585,6 +713,59 @@ mod tests {
       master_uuid: c[20..28].to_vec(),
       grandmaster_uuid: c[28..36].to_vec(),
     }
+  }
+
+  /// Real AVIO interface statistics reply (netaudio fixture `interface_statistics`): 100 Mb/s, rates and errors.
+  const AVIO_INTERFACE_STATISTICS: &str = "ffff00589ed40000001dc1fffe50368b417564696e6174650738004000000000000100240010000000140000000000010000000000000000000000030001002800085fd80009926d00000000000000000000000100000064";
+
+  #[test]
+  fn interface_statistics_reply_layout_matches_real_device() {
+    let capture = hex::decode(AVIO_INTERFACE_STATISTICS).unwrap();
+    let stats = InterfaceStatistics {
+      tx_bytes_per_s: 0x85fd8,
+      rx_bytes_per_s: 0x9926d,
+      tx_errors: 0,
+      rx_errors: 0,
+    };
+    assert_eq!(hex::encode(interface_statistics_content(Some(stats), 100)), hex::encode(&capture[32..]));
+  }
+
+  #[test]
+  fn interface_statistics_without_counters_supports_nothing() {
+    let c = interface_statistics_content(None, 1000);
+    assert_eq!(c.len(), 88 - 32);
+    assert_eq!(&c[0x18..0x1c], [0, 0, 0, 0], "capability mask");
+    assert_eq!(&c[0x20..0x30], [0u8; 16], "counters");
+    assert_eq!(&c[0x34..0x38], 1000u32.to_be_bytes(), "link speed");
+  }
+
+  #[test]
+  fn interface_rates_are_per_second() {
+    let a = InterfaceCounters { tx_bytes: 1000, rx_bytes: 5000, tx_errors: 1, rx_errors: 2 };
+    let b = InterfaceCounters { tx_bytes: 251000, rx_bytes: 505000, tx_errors: 1, rx_errors: 3 };
+    let t0 = Instant::now();
+    let stats = interface_statistics(&(t0, a), &(t0 + Duration::from_secs(2), b));
+    assert_eq!((stats.tx_bytes_per_s, stats.rx_bytes_per_s), (125000, 250000));
+    assert_eq!((stats.tx_errors, stats.rx_errors), (1, 3));
+    // counters reset (e.g. interface re-created): no negative rates
+    let stats = interface_statistics(&(t0, b), &(t0 + Duration::from_secs(1), a));
+    assert_eq!((stats.tx_bytes_per_s, stats.rx_bytes_per_s), (0, 0));
+  }
+
+  #[test]
+  fn interface_counters_are_read_from_sysfs() {
+    let dir = std::env::temp_dir().join(format!("inferno-test-iface-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, value) in
+      [("tx_bytes", "123\n"), ("rx_bytes", "456\n"), ("tx_errors", "7\n"), ("rx_errors", "8\n")]
+    {
+      std::fs::write(dir.join(name), value).unwrap();
+    }
+    let c = read_interface_counters(&dir).unwrap();
+    assert_eq!((c.tx_bytes, c.rx_bytes, c.tx_errors, c.rx_errors), (123, 456, 7, 8));
+    std::fs::remove_file(dir.join("rx_errors")).unwrap();
+    assert!(read_interface_counters(&dir).is_none());
+    std::fs::remove_dir_all(&dir).unwrap();
   }
 
   /// Settings status replies; expected bytes are the content after the opcode field of replies netaudio

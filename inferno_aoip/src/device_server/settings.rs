@@ -78,6 +78,7 @@ fn create_self_info(
   let mut netmask = Ipv4Addr::new(0, 0, 0, 0);
   let mut gateway = Ipv4Addr::new(0, 0, 0, 0);
   let mut mac_address = MacAddr::zero();
+  let mut interface_name = None;
   let mut speed = 0;
   for iface in interfaces {
     let mut our_iface = false;
@@ -89,6 +90,7 @@ fn create_self_info(
       }
     }
     if our_iface {
+      interface_name = Some(iface.name.clone());
       speed =
         [iface.transmit_speed.unwrap_or(0), iface.receive_speed.unwrap_or(0)].iter().max().unwrap_or(&0)
           / 1_000_000;
@@ -117,6 +119,7 @@ fn create_self_info(
     netmask,
     gateway,
     mac_address,
+    interface_name,
     link_speed: speed.clamp(0, 10000).try_into().unwrap(),
 
     board_name: "Inferno-AoIP".to_owned(),

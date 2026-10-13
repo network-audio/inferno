@@ -19,6 +19,8 @@ pub struct DeviceInfo {
   pub netmask: Ipv4Addr,
   pub gateway: Ipv4Addr,
   pub mac_address: MacAddr,
+  /// network interface (as named by the OS) with ip_address, if known
+  pub interface_name: Option<String>,
   pub link_speed: u16,
 
   pub board_name: String,
@@ -60,6 +62,7 @@ mod tests {
       netmask: Ipv4Addr::UNSPECIFIED,
       gateway: Ipv4Addr::UNSPECIFIED,
       mac_address: MacAddr::zero(),
+      interface_name: None,
       link_speed: 0,
       board_name: String::new(),
       manufacturer: String::new(),
