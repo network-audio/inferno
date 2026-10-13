@@ -321,16 +321,17 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
         _ => ("???", 0),
     };
 
-    if (*io).stream == SND_PCM_STREAM_CAPTURE
-        && (*io).state == SND_PCM_STATE_RUNNING
-        && buffered > (*io).buffer_size as snd_pcm_sframes_t
-    {
-        // the application didn't read in time, samples it hasn't read yet have been overwritten
-        warn!(
-            "XRUN: capture overrun, buffered {buffered} > buffer size {}",
-            (*io).buffer_size
-        );
-        return (-EPIPE).try_into().unwrap();
+    if (*io).stream == SND_PCM_STREAM_CAPTURE && (*io).state == SND_PCM_STATE_RUNNING {
+        // The receiver writes up to the network latency ahead of our pointer: if the application doesn't
+        // read in time, samples it hasn't read yet get overwritten.
+        let latency = this.anchor.network_latency_samples() as snd_pcm_sframes_t;
+        if buffered + latency > (*io).buffer_size as snd_pcm_sframes_t {
+            warn!(
+                "XRUN: capture overrun, buffered {buffered} + network latency {latency} > buffer size {}",
+                (*io).buffer_size
+            );
+            return (-EPIPE).try_into().unwrap();
+        }
     }
 
     if buffered < 0
@@ -395,6 +396,27 @@ fn stop_stream(common: &mut InfernoInstance, stream: snd_pcm_stream_t) -> bool {
     }
     *running = false;
     common.commands_sender.blocking_send(command).is_ok()
+}
+
+/// Refuses capture buffers which can't hold the network latency plus a period: the receiver writes one latency
+/// ahead of the hardware pointer, so it would overwrite samples before the application reads them.
+unsafe extern "C" fn plugin_hw_params(
+    io: *mut snd_pcm_ioplug_t,
+    _params: *mut snd_pcm_hw_params_t,
+) -> c_int {
+    let this = get_private(io);
+    if (*io).stream == SND_PCM_STREAM_CAPTURE {
+        let latency = this.settings.self_info.latency_samples();
+        let (buffer, period) = ((*io).buffer_size as usize, (*io).period_size as usize);
+        if buffer < latency + period {
+            error!(
+                "capture buffer of {buffer} frames is too small for RX latency of {latency} frames + period of \
+                 {period} frames: use a larger buffer or more periods, or decrease RX_LATENCY_NS"
+            );
+            return -libc::EINVAL;
+        }
+    }
+    0
 }
 
 unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
@@ -807,6 +829,7 @@ unsafe extern "C" fn plugin_define(
         close: Some(plugin_close),
         poll_revents: Some(plugin_demangle_revents),
         delay: Some(plugin_delay),
+        hw_params: Some(plugin_hw_params),
         //transfer: Some(plugin_transfer),
         ..zeroed()
     };

@@ -239,6 +239,85 @@ impl Pcm {
         }
     }
 
+    /// Opens with an explicit period and buffer size (in frames), like DAWs do.
+    /// Returns the error code if the configuration is refused.
+    fn open_with(
+        config_text: &str,
+        stream: snd_pcm_stream_t,
+        period_frames: usize,
+        buffer_frames: usize,
+    ) -> Result<Self, i32> {
+        unsafe {
+            let mut config = std::ptr::null_mut();
+            assert_eq!(snd_config_top(&mut config), 0);
+            let mut input = std::ptr::null_mut();
+            let text = CString::new(config_text).unwrap();
+            assert_eq!(
+                snd_input_buffer_open(&mut input, text.as_ptr(), config_text.len() as isize),
+                0
+            );
+            assert_eq!(
+                snd_config_load(config, input),
+                0,
+                "failed to parse ALSA config"
+            );
+            snd_input_close(input);
+            let mut pcm = std::ptr::null_mut();
+            let name = CString::new("dut").unwrap();
+            let r = snd_pcm_open_lconf(
+                &mut pcm,
+                name.as_ptr(),
+                stream,
+                SND_PCM_NONBLOCK as i32,
+                config,
+            );
+            assert_eq!(r, 0, "snd_pcm_open_lconf failed: {r}");
+            let pcm_struct = Self {
+                pcm,
+                config,
+                period_size: period_frames,
+                buffer_size: buffer_frames,
+            };
+            let mut hw = std::ptr::null_mut();
+            assert_eq!(snd_pcm_hw_params_malloc(&mut hw), 0);
+            let mut period = period_frames as snd_pcm_uframes_t;
+            let mut buffer = buffer_frames as snd_pcm_uframes_t;
+            let mut dir = 0;
+            let mut r = snd_pcm_hw_params_any(pcm, hw);
+            if r >= 0 {
+                r = snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
+            }
+            if r >= 0 {
+                r = snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S32);
+            }
+            if r >= 0 {
+                r = snd_pcm_hw_params_set_channels(pcm, hw, CHANNELS as u32);
+            }
+            if r >= 0 {
+                r = snd_pcm_hw_params_set_rate(pcm, hw, SAMPLE_RATE, 0);
+            }
+            if r >= 0 {
+                r = snd_pcm_hw_params_set_period_size_near(pcm, hw, &mut period, &mut dir);
+            }
+            if r >= 0 {
+                r = snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &mut buffer);
+            }
+            if r >= 0 {
+                r = snd_pcm_hw_params(pcm, hw);
+            }
+            snd_pcm_hw_params_free(hw);
+            if r < 0 {
+                return Err(r);
+            }
+            assert_eq!(
+                (period as usize, buffer as usize),
+                (period_frames, buffer_frames),
+                "PCM didn't take the requested sizes"
+            );
+            Ok(pcm_struct)
+        }
+    }
+
     fn prepare(&self) {
         let r = unsafe { snd_pcm_prepare(self.pcm) };
         assert_eq!(r, 0, "snd_pcm_prepare failed: {r}");
@@ -447,6 +526,12 @@ struct CaptureFixture {
 
 impl CaptureFixture {
     fn new(ids: &TestIds) -> Self {
+        Self::with_pcm(ids, |config| {
+            Pcm::open(config, SND_PCM_STREAM_CAPTURE, 85_333)
+        })
+    }
+    /// `open_pcm` opens the capture PCM from the plugin's ALSA config
+    fn with_pcm(ids: &TestIds, open_pcm: impl FnOnce(&str) -> Pcm) -> Self {
         init_test_env();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -456,11 +541,7 @@ impl CaptureFixture {
         let clock = ClockServer::start(ids.clock_path());
         let (tx_server, tx_hostname, ramps) = start_library_transmitter(&rt, ids);
         seed_plugin_subscriptions(ids, &tx_hostname);
-        let pcm = Pcm::open(
-            &plugin_config(ids, &format!("plug-rx-{}", ids.tag)),
-            SND_PCM_STREAM_CAPTURE,
-            85_333,
-        );
+        let pcm = open_pcm(&plugin_config(ids, &format!("plug-rx-{}", ids.tag)));
         pcm.prepare();
         pcm.start();
         let waited = capture_until_audio(&pcm, 0, ROUTING_TIMEOUT)
@@ -912,4 +993,98 @@ fn playback_underrun_sends_silence() {
         "after the last written frame the receiver must get only silence, got values (counter frames): {:?}",
         &after_last[..after_last.len().min(10)]
     );
+}
+
+/// Capture latency used by T7/T8, like Ardour on Docker Desktop: 40 ms = 1920 samples.
+const LONG_LATENCY_NS: u32 = 40_000_000;
+
+/// T7: a capture buffer that can't hold the network latency plus a period is refused: the receiver writes
+/// one latency ahead of the hardware pointer, so it would overwrite samples the application hasn't read.
+#[test]
+fn capture_buffer_too_small_for_latency_is_refused() {
+    let ids = TestIds {
+        base_port: 28000,
+        base_pid: 28,
+        tag: "capsmall",
+        latency_ns: LONG_LATENCY_NS,
+    };
+    init_test_env();
+    let _clock = ClockServer::start(ids.clock_path());
+    let config = plugin_config(&ids, "plug-rx-capsmall");
+    // 1920 + 1024 > 2048 (Ardour's default 1024x2)
+    let r = Pcm::open_with(&config, SND_PCM_STREAM_CAPTURE, 1024, 2048).err();
+    assert!(
+        r.is_some(),
+        "1024x2 capture buffer accepted with 40 ms latency"
+    );
+    assert!(
+        Pcm::open_with(&config, SND_PCM_STREAM_CAPTURE, 1024, 4096).is_ok(),
+        "1024x4 capture buffer refused with 40 ms latency"
+    );
+}
+
+/// T8: an application reading capture late (more than buffer - latency unread) must get an xrun,
+/// never audio overwritten by the receiver.
+#[test]
+fn capture_reading_late_reports_xrun_instead_of_overwritten_audio() {
+    let ids = TestIds {
+        base_port: 29000,
+        base_pid: 29,
+        tag: "caplate",
+        latency_ns: LONG_LATENCY_NS,
+    };
+    let fx = CaptureFixture::with_pcm(&ids, |config| {
+        Pcm::open_with(config, SND_PCM_STREAM_CAPTURE, 1024, 4096).expect("1024x4 refused")
+    });
+    let pcm = fx.pcm();
+    let mut buf = vec![0 as Sample; pcm.period_size * CHANNELS];
+    let mut last_ts: Option<usize> = None;
+    let mut discontinuities = vec![];
+    let mut xruns = 0;
+    for round in 0..20 {
+        // every 4th period, read late: ~2900 frames pending > 4096 - 1920
+        if round % 4 == 3 {
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let r = loop {
+            let r = pcm.read(&mut buf);
+            if r != 0 || Instant::now() > deadline {
+                break r;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        if r == -(libc::EPIPE as i64) {
+            xruns += 1;
+            last_ts = None;
+            pcm.prepare();
+            pcm.start();
+            continue;
+        }
+        assert!(r > 0, "snd_pcm_readi failed or timed out: {r}");
+        for frame in buf[..r as usize * CHANNELS].chunks(CHANNELS) {
+            let s = frame[0];
+            if !is_fresh_ramp_sample(s, 0) {
+                last_ts = None; // silence after (re)start
+                continue;
+            }
+            let ts = (s as u32 >> 9) as usize;
+            if let Some(prev) = last_ts {
+                if ts != (prev + 1) & (RAMP_LEN - 1) {
+                    discontinuities.push((round, prev, ts));
+                }
+            }
+            last_ts = Some(ts);
+        }
+    }
+    log::info!(
+        "late capture: {xruns} xruns, {} discontinuities",
+        discontinuities.len()
+    );
+    assert!(
+        discontinuities.is_empty(),
+        "captured audio is discontinuous (overwritten by the receiver?), first (round, prev ts, ts): {:?}",
+        &discontinuities[..discontinuities.len().min(5)]
+    );
+    assert!(xruns > 0, "late reads must be reported as xruns");
 }
