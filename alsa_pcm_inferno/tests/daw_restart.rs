@@ -1240,3 +1240,78 @@ fn capture_read_slightly_late_has_no_false_xruns() {
     assert_eq!(discontinuities, 0, "captured audio is discontinuous");
     assert_eq!(xruns, 0, "false xruns: nothing unread was overwritten");
 }
+
+/// T12: xrun recovery like Ardour's (stall until underrun, drop, prepare, prefill silence, start): after the
+/// old run's audio has ended, none of it may be transmitted again (e.g. read from the ring with stale addressing).
+#[test]
+fn playback_xrun_recovery_sends_no_old_audio() {
+    let ids = TestIds {
+        base_port: 33000,
+        base_pid: 33,
+        tag: "pbrecover",
+        latency_ns: LONG_LATENCY_NS,
+    };
+    let mut fx = PlaybackFixture::new(&ids);
+    let first_received = fx.arrivals.lock().unwrap().len();
+    for round in 0..3 {
+        // the old run: a counter, keeping the buffer full
+        let pcm = fx.pcm.as_ref().unwrap();
+        let mut chunk = vec![0 as Sample; pcm.period_size * CHANNELS];
+        let mut next_frame = 1usize;
+        let end = Instant::now() + Duration::from_millis(700);
+        while Instant::now() < end {
+            for (i, frame) in chunk.chunks_mut(CHANNELS).enumerate() {
+                frame.fill(counter_sample(next_frame + i));
+            }
+            let r = pcm.write(&chunk);
+            assert!(r >= 0, "snd_pcm_writei failed: {r}");
+            next_frame += r as usize;
+            if r == 0 {
+                std::thread::sleep(Duration::from_micros(500));
+            }
+        }
+        // stall: no calls into the PCM until the buffer has run out
+        std::thread::sleep(Duration::from_millis(300));
+        let pcm = fx.pcm.as_ref().unwrap();
+        pcm.drop_stream();
+        pcm.prepare();
+        let silence = vec![0 as Sample; pcm.period_size * CHANNELS];
+        for _ in 0..3 {
+            pcm.write(&silence);
+        }
+        pcm.start_if_prepared();
+        fx.next_epoch();
+        fx.pump(Duration::from_millis(700));
+        log::info!("round {round} done");
+    }
+    let values: Vec<Sample> = fx.arrivals.lock().unwrap()[first_received..]
+        .iter()
+        .map(|&(_, s, _)| s)
+        .collect();
+    // counter samples are multiples of 256 below the patterns' range
+    let is_counter = |s: Sample| s != 0 && s & 0xff == 0 && (s >> 8) < 0x10000;
+    let mut stale = 0;
+    let mut in_counter_run = false;
+    let mut silent_after_counter = false;
+    for &s in &values {
+        if is_counter(s) {
+            if silent_after_counter && !in_counter_run {
+                stale += 1;
+            }
+            in_counter_run = true;
+        } else if s == 0 {
+            if in_counter_run {
+                silent_after_counter = true;
+            }
+            in_counter_run = false;
+        } else {
+            // a new epoch's pattern: the next counter run is legitimate
+            in_counter_run = false;
+            silent_after_counter = false;
+        }
+    }
+    assert_eq!(
+        stale, 0,
+        "{stale} fragments of old audio transmitted after xrun recoveries"
+    );
+}

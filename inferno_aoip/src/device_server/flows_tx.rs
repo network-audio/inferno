@@ -180,19 +180,24 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
               // keep flows alive so that receivers neither mute nor drop the subscription
               tmp_samples[0..flow.fpp].fill(0);
             } else {
-              let r =
-                self.channels_sources[ch_index].read_at(start_ts as usize, &mut tmp_samples[0..flow.fpp]);
-              if r.useful_start_index != 0 || r.useful_end_index != flow.fpp {
+              // right after a start, a packet may begin before the stream: nothing was written there
+              // (the buffer still holds the previous run's audio)
+              let skip = samples_before_start(start_ts as usize, flow.fpp, max_lag_samples);
+              tmp_samples[0..skip].fill(0);
+              let r = self.channels_sources[ch_index]
+                .read_at((start_ts as usize).wrapping_add(skip), &mut tmp_samples[skip..flow.fpp]);
+              let (useful_start, useful_end) = (skip + r.useful_start_index, skip + r.useful_end_index);
+              if useful_start != 0 || useful_end != flow.fpp {
                 /* error!(
                     "didn't have enough samples, transmitting silence. {} {}",
-                    r.useful_start_index,
-                    flow.fpp - r.useful_end_index
+                    useful_start,
+                    flow.fpp - useful_end
                 ); */
 
-                tmp_samples[0..r.useful_start_index].fill(0);
-                tmp_samples[r.useful_end_index..].fill(0);
+                tmp_samples[skip..useful_start].fill(0);
+                tmp_samples[useful_end..flow.fpp].fill(0);
 
-                let missing_samples = r.useful_start_index + flow.fpp - r.useful_end_index;
+                let missing_samples = useful_start + flow.fpp - useful_end;
                 max_missing_samples = max_missing_samples.max(missing_samples);
               }
             }
@@ -746,5 +751,42 @@ impl FlowsTransmitter {
   }
   pub fn get_flows_info(&self) -> &Vec<Option<FlowInfo>> {
     &self.flows_info
+  }
+}
+
+/// Number of samples at the beginning of a packet at stream position `position` (frames since the
+/// stream's start, wrapping) which precede the start. A packet can begin before the start by less than
+/// the maximum lag plus a packet, so larger distances are positions after a wrap-around instead.
+fn samples_before_start(position: usize, fpp: usize, max_lag_samples: usize) -> usize {
+  let before = position.wrapping_neg();
+  if before != 0 && before <= max_lag_samples + fpp {
+    before.min(fpp)
+  } else {
+    0
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn packet_partly_before_the_start() {
+    assert_eq!(samples_before_start(0usize.wrapping_sub(5), 32, 480), 5);
+    assert_eq!(samples_before_start(0usize.wrapping_sub(1), 32, 480), 1);
+  }
+
+  #[test]
+  fn packet_entirely_before_the_start() {
+    assert_eq!(samples_before_start(0usize.wrapping_sub(100), 32, 480), 32);
+  }
+
+  #[test]
+  fn packets_after_the_start() {
+    assert_eq!(samples_before_start(0, 32, 480), 0);
+    assert_eq!(samples_before_start(1000, 32, 480), 0);
+    // just before the position counter wraps around: long after the start
+    assert_eq!(samples_before_start(usize::MAX / 2 + 7, 32, 480), 0);
+    assert_eq!(samples_before_start(0usize.wrapping_sub(10_000), 32, 480), 0);
   }
 }

@@ -1057,3 +1057,33 @@ pub extern "C" fn _snd_pcm_inferno_open(
 
 #[no_mangle]
 pub extern "C" fn __snd_pcm_inferno_open_dlsym_pcm_001() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stream_info(appl_ptr: &snd_pcm_uframes_t, boundary: usize) -> Arc<StreamInfo> {
+        let info = StreamInfo::new(appl_ptr);
+        info.boundary.store(boundary, Ordering::Relaxed);
+        info
+    }
+
+    #[test]
+    fn written_from_counts_frames_up_to_the_application_pointer() {
+        let appl: snd_pcm_uframes_t = 3072;
+        let info = stream_info(&appl, 1 << 30);
+        assert_eq!(info.written_from(0), 3072);
+        assert_eq!(info.written_from(3000), 72);
+        assert_eq!(info.written_from(3072), 0);
+        assert_eq!(info.written_from(4000), 0, "beyond the application pointer");
+    }
+
+    #[test]
+    fn written_from_across_the_boundary() {
+        // the application pointer wrapped around the boundary, our hw position not yet (boundary_add = 0)
+        let boundary = 1 << 20;
+        let appl: snd_pcm_uframes_t = 100;
+        let info = stream_info(&appl, boundary);
+        assert_eq!(info.written_from(boundary - 50), 150);
+    }
+}
