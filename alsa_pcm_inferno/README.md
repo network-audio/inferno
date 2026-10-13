@@ -57,6 +57,7 @@ Tested with [Ardour](https://ardour.org/) 8.12 (ALSA backend; tests ran headless
   * `RX_LATENCY_NS` = 40 ms: 1024 samples × 3 periods, 2048 × 3. 2048 × 2 starts but has too little slack (occasional xruns). Ardour's default 1024 × 2 is refused: Ardour shows `AlsaAudioBackend: failed to allocate parameters` / `Cannot start Audio/MIDI engine`, and Inferno's explanation (`capture buffer of ... frames is too small ...`) is printed to Ardour's standard error, i.e. visible when Ardour is started from a terminal.
   * `RX_LATENCY_NS` = 10 ms: 256 × 2, 512 × 3, 1024 × 2. 512 × 2 starts but has too little slack.
 * Ardour doesn't use `snd_pcm_delay`, so enter the network latency as systemic latency in Audio/MIDI Setup: input = receive latency in samples minus 24 (e.g. 1896 at 40 ms, 456 at 10 ms), output = receive latency of the device(s) receiving Ardour's output. These values are derived from the measured network delay and Ardour's own port latencies; Ardour's resulting compensation wasn't verified.
+* After an xrun, Ardour itself outputs about 32 samples of audio from before the xrun on tracks monitoring their input (its input is silent at that point); recorded takes aren't affected.
 * For bit-exact output set `TX_SOURCE_BIT_DEPTH` to 24 (`TX_SOURCE_BIT_DEPTH "24"` in the `pcm` block of your `.asoundrc`, or `INFERNO_TX_SOURCE_BIT_DEPTH=24` in the environment): by default (32) Inferno dithers when transmitting 24-bit audio.
 
 
