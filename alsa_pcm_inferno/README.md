@@ -19,9 +19,11 @@ If you don't want to change anything outside your `$HOME`, you can set ALSA envi
 
 ## Recommended: audio server
 
-This plugin is entirely user-space and contained in a library. It means that the Dante device is emulated only when the ALSA device is in use in an application and certainly can't outlive the process. When the stream is stopped or the whole audio app is closed, device disappears from the network. Next time it is opened, audio flows have to be established again and it takes time during which silence is played or recorded (in other words, several seconds of sound will be lost).
+This plugin is entirely user-space and contained in a library. It means that the Dante device is emulated only while the ALSA device is open in an application and certainly can't outlive the process.
 
-So the Inferno ALSA PCM is intended to be constantly running. The easiest way of ensuring this is using an audio server, for example [JACK](https://jackaudio.org/) (not tested yet) or [PipeWire](https://www.pipewire.org/) (see script [`start_pipewire_sink`](start_pipewire_sink)), making sure that automatic suspending of audio device is disabled (or, to save energy, set to a timeout long enough that it won't be annoying). Some DAWs (e.g. [Ardour](https://ardour.org/), [BespokeSynth](https://www.bespokesynth.com/), NOT Audacity) also keep the audio interface running all time.
+Stopping and restarting a stream (transport stop/start, xrun recovery: `snd_pcm_drop`/`snd_pcm_prepare`/`snd_pcm_start`) keeps the Dante device, its flows and subscriptions running: audio resumes within about the network latency. While the stream is stopped, silence is transmitted. Only closing the device (or changing its buffer configuration) tears it down: next time it is opened, audio flows have to be established again, which takes a few seconds during which silence is played or recorded.
+
+So the Inferno ALSA PCM is best kept open. The easiest way of ensuring this is using an audio server, for example [JACK](https://jackaudio.org/) or [PipeWire](https://www.pipewire.org/) (see script [`start_pipewire_sink`](start_pipewire_sink)), making sure that automatic suspending of audio device is disabled (or, to save energy, set to a timeout long enough that it won't be annoying). DAWs (e.g. [Ardour](https://ardour.org/), see [below](#daws), [BespokeSynth](https://www.bespokesynth.com/), NOT Audacity) also keep the audio interface open while running.
 
 ## Buffer sizes
 
@@ -35,14 +37,27 @@ Unlike ASIO, ALSA allows more than 2 periods per buffer (it is useful for energy
 
 In PipeWire, there's additional setting, similar to ALSA period size: [`api.alsa.headroom`](https://docs.pipewire.org/page_man_pipewire-props_7.html) (in samples), which is *[t]he amount of extra space to keep in the ringbuffer*. Increasing it directly increases the latency.
 
-For receiving, the whole buffer size must be greater than `maximum receive latency + ALSA period size` (for PipeWire: `maximum receive latency + api.alsa.period-size + api.alsa.headroom`). Note that:
+For receiving, the whole buffer size must be at least `receive latency + ALSA period size` (for PipeWire: `maximum receive latency + api.alsa.period-size + api.alsa.headroom`): received audio is written up to the receive latency ahead of what the application reads. Capture buffers smaller than `RX_LATENCY_NS` + period size are refused (the application gets an error when setting hardware parameters, and Inferno logs `capture buffer of ... frames is too small for RX latency ...`). Use a larger buffer or more periods, or decrease `RX_LATENCY_NS`. Note that:
 
 * maximum receive latency does not necessarily equal `RX_LATENCY_NS` - some transmitting devices with high latency setting may force our receive latency to be higher.
 * latency in Dante UI (DC/DVS) is expressed in milliseconds or microseconds, in Inferno (and Dante protocol) - in nanoseconds, in ALSA and PipeWire config - in samples.
 
 When using Inferno in PipeWire, it is a good idea to set `api.alsa.headroom` to a value greater than 0. Actually, it is more important than `api.alsa.period-size`. In theory, as long as the CPU keeps up, `api.alsa.period-size` does not influence stability, but `api.alsa.headroom` does - it is the ***sample clock headroom*** parameter we need because Inferno is multi-threaded.
 
-Inferno will not work correctly with apps that allow nearly full buffers during capture, but fortunately this is rare. Fixing this would require jeopardizing the zero-copy architecture.
+If a capturing application reads so late that received audio overwrites samples it hasn't read yet (e.g. it allows nearly full buffers), Inferno reports an xrun instead of returning the overwritten audio. Leave the application some slack: with a buffer just big enough (e.g. 512×2 at 10 ms receive latency), small scheduling delays already cause xruns.
+
+`snd_pcm_delay` includes the network latency (receive latency for capture, transmit latency for playback), so applications that use it can compensate for it.
+
+## DAWs
+
+Tested with [Ardour](https://ardour.org/) 8.12 (ALSA backend; tests ran headless): recording and playback are bit-exact (24-bit), transport stop/start doesn't restart the device, and xruns recover in place without losing Dante subscriptions.
+
+* Ardour's ALSA backend lists only hardware cards. Start Ardour with `ARDOUR_ALSA_DEVICE=inferno` (the name of the `pcm` device in your `.asoundrc`).
+* Choose a buffer big enough for the receive latency (see [Buffer sizes](#buffer-sizes)): periods × period size must be at least `RX_LATENCY_NS` (in samples) + period size, and one more period leaves comfortable slack. Settings that worked at 48 kHz:
+  * `RX_LATENCY_NS` = 40 ms: 1024 samples × 3 periods, 2048 × 2. Ardour's default 1024 × 2 is refused: Ardour shows `AlsaAudioBackend: failed to allocate parameters` / `Cannot start Audio/MIDI engine`.
+  * `RX_LATENCY_NS` = 10 ms: 256 × 2, 512 × 3, 1024 × 2 (512 × 2 starts but has too little slack).
+* Ardour doesn't use `snd_pcm_delay`, so enter the network latency as systemic latency in Audio/MIDI Setup: input = receive latency in samples minus 24 (e.g. 1896 at 40 ms, 456 at 10 ms), output = receive latency of the device(s) receiving Ardour's output.
+* For bit-exact output set `TX_SOURCE_BIT_DEPTH` to 24: by default (32) Inferno dithers when transmitting 24-bit audio.
 
 
 # Quirks
@@ -61,7 +76,8 @@ Inferno will not work correctly with apps that allow nearly full buffers during 
 | [PipeWire](https://pipewire.org/) | 1.2.7 | ✅ OK  | needs [service patch](../os_integration/systemd_allow_clock.conf) if launched by systemd |
 | [spotifyd](https://github.com/Spotifyd/spotifyd) | ... | ✅ OK  | [source](https://gist.github.com/scientress/b7fd79ac761a8574842b96f15696c2b7) |
 | 🔒 HQPlayer | ... | ❔ maybe fixed? | [didn't work](https://github.com/teodly/inferno/issues/9), maybe fixed together with JACK? |
-| [JACK](https://jackaudio.org/) | 1.9.22-r4 | ✅❔ experimental | [didn't work](https://github.com/teodly/inferno/issues/8#issuecomment-2784660805), now part of containerized automated test |
+| [JACK](https://jackaudio.org/) | 1.9.22 | ✅❔ experimental | part of containerized automated test; xruns recover without losing Dante subscriptions |
+| [Ardour](https://ardour.org/) | 8.12 | ✅❔ experimental | see [DAWs](#daws): needs a large enough buffer and manual latency compensation; tested headless, export not tested |
 | Audacity | <= 3.5.1        | ✖ WONTFIX | does not support S32 samples so no zero-copy buffers |
 
 🔒 - non-FOSS apps, discouraged by Inferno developers
