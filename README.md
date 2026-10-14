@@ -25,7 +25,7 @@ Big thanks to [Project Pendulum](https://github.com/pendulum-project) (by [Trife
 | Platforms | Linux  | Mac, Windows  | Linux |
 | Supported protocols | Dante | Dante | AES67 |
 | Directly supported audio backends | ALSA | CoreAudio, ASIO, WDM | ALSA |
-| Works with DAWs | 💣 experimental, [tested with Ardour](alsa_pcm_inferno/README.md#daws) | ✅ Yes | ✅ Yes |
+| Works with DAWs | ✅ Yes ([tested with Ardour](alsa_pcm_inferno/README.md#daws)) | ✅ Yes | ✅ Yes |
 | Route audio using Dante Controller patchbay | ✅ Yes! | ✅ Yes | 🚫 AES67->Dante only |
 | Configurable using Dante Controller | ⏳ A bit (channel names, TX multicasts) | ✅ Yes | 🚫 No |
 | Compatible with Dante Domain Manager | 🚫 No | ✅ Yes | 🚫 No (but AES67 integration possible) |
