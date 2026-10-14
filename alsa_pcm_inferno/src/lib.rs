@@ -5,9 +5,9 @@ use alsa_sys_all::*;
 use futures_util::FutureExt;
 use inferno_aoip::device_info::DeviceId;
 use inferno_aoip::device_server::{
-    AtomicSample, Clock, DeviceServer, ExternalBufferParameters, MediaClock,
-    PositionReportDestination, RealTimeClockReceiver, Sample, Settings, StreamAnchor,
-    TransferNotifier,
+    clock_path_or_default, diagnose_missing_clock, AtomicSample, Clock, DeviceServer,
+    ExternalBufferParameters, MediaClock, PositionReportDestination, RealTimeClockReceiver, Sample,
+    Settings, StreamAnchor, TransferNotifier,
 };
 use inferno_aoip::utils::run_future_in_new_thread;
 use itertools::Itertools;
@@ -45,9 +45,20 @@ struct InfernoInstance {
     thread: JoinHandle<()>,
     capturing: bool,
     playing: bool,
+    /// set if the device server failed to start (its thread then ends)
+    start_error: Arc<Mutex<Option<String>>>,
 }
 
 const PLUGIN_NAME: [u8; 23] = *b"Inferno virtual device\0";
+
+/// Keys of the PCM's ALSA config (upper case) that are not `Settings` but plugin options or ALSA's own.
+const PLUGIN_KEYS: &[&str] = &[
+    "TYPE",
+    "HINT",
+    "COMMENT",
+    "DISABLE_POLLFD",
+    "USE_FLOWS_CLOCK",
+];
 
 lazy_static! {
     static ref global_instances: RwLock<BTreeMap<DeviceId, Arc<Mutex<InfernoInstance>>>> =
@@ -82,6 +93,32 @@ async fn transmit_silence(device_server: &mut DeviceServer, channels: usize) -> 
     Transmitter::Silent
 }
 
+/// The device thread didn't take a request: it failed to start (already logged why), or has ended.
+/// The failed device is forgotten, so that a later attempt (e.g. after freeing its ports) starts it again.
+/// Call without holding `instance`'s lock (lock order: `global_instances`, then an instance).
+fn device_thread_failed(instance: &Mutex<InfernoInstance>, settings: &Settings) -> c_int {
+    let failed_to_start = instance
+        .lock()
+        .unwrap()
+        .start_error
+        .lock()
+        .unwrap()
+        .is_some();
+    if !failed_to_start {
+        error!("BUG: the Inferno thread has ended");
+        return -libc::EPIPE;
+    }
+    let mut instances = global_instances.write().unwrap();
+    let id = &settings.self_info.factory_device_id;
+    if instances
+        .get(id)
+        .is_some_and(|entry| std::ptr::eq(Arc::as_ptr(entry), instance))
+    {
+        instances.remove(id);
+    }
+    -libc::EBUSY
+}
+
 fn get_or_create_instance(settings: &Settings) -> Arc<Mutex<InfernoInstance>> {
     let mut instances_locked = global_instances.write().unwrap();
     let entry = instances_locked.entry(settings.self_info.factory_device_id);
@@ -98,12 +135,20 @@ fn get_or_create_instance(settings: &Settings) -> Arc<Mutex<InfernoInstance>> {
             let (commands_sender, mut commands_rx) = mpsc::channel(16);
 
             let settings = settings.clone();
+            let start_error: Arc<Mutex<Option<String>>> = Default::default();
+            let thread_start_error = start_error.clone();
             let thread = run_future_in_new_thread("Inferno main", move || {
                 async move {
-                    // TODO DeviceServer::start may fail internally (e.g. if other process using Inferno is already listening on network ports)
-                    // retrying infinitely will spam the log. (Audacity behaves this way if Inferno is already running)
                     let tx_channels = settings.self_info.tx_channels.len();
-                    let mut device_server = DeviceServer::start(settings).await;
+                    let mut device_server = match DeviceServer::try_start(settings).await {
+                        Ok(device_server) => device_server,
+                        Err(e) => {
+                            error!("{e}");
+                            // reported by plugin_prepare; dropping commands_rx fails its requests
+                            *thread_start_error.lock().unwrap() = Some(e.to_string());
+                            return;
+                        }
+                    };
                     // While the device exists, it transmits: from the playback PCM, or silence (e.g. for
                     // capture-only applications), so that receivers don't see a broken stream.
                     let mut tx = Transmitter::None;
@@ -196,6 +241,7 @@ fn get_or_create_instance(settings: &Settings) -> Arc<Mutex<InfernoInstance>> {
                 thread,
                 capturing: false.into(),
                 playing: false.into(),
+                start_error,
             }))
         })
         .clone()
@@ -685,17 +731,14 @@ unsafe fn start_stream(
             }
         }
         if err {
-            error!("BUG: error sending to Inferno thread");
-            return -libc::EPIPE;
+            drop(common);
+            return device_thread_failed(inferno_instance, &this.settings);
         }
     }
 
     this.clock_receiver = match clock_rx_rx.blocking_recv() {
         Ok(clk) => Some(clk),
-        Err(_) => {
-            error!("no clock available (couldn't receive clock receiver)");
-            return -libc::EINVAL;
-        }
+        Err(_) => return device_thread_failed(inferno_instance, &this.settings),
     };
     if let Some(clock_receiver) = &mut this.clock_receiver {
         let mut ctr = 0;
@@ -710,7 +753,11 @@ unsafe fn start_stream(
             std::thread::sleep(Duration::from_millis(250));
             ctr += 1;
             if ctr >= 20 {
-                error!("no clock available (timeout waiting for overlay update)");
+                let path = clock_path_or_default(&this.settings.clock_path);
+                error!(
+                    "no clock after 5 s, can't start the stream: {}",
+                    diagnose_missing_clock(&path)
+                );
                 return -libc::ETIMEDOUT;
             }
         }
@@ -875,11 +922,12 @@ unsafe extern "C" fn plugin_define(
     {
         let mut locked_flag = global_initialized.lock().unwrap();
         if !*locked_flag {
-            let logenv = env_logger::Env::default().default_filter_or("debug");
-            env_logger::builder()
+            // runs inside the application (e.g. PipeWire): only what the user should see, unless RUST_LOG
+            let logenv = env_logger::Env::default().default_filter_or("info");
+            let _ = env_logger::builder()
                 .parse_env(logenv)
                 .format_timestamp_micros()
-                .init();
+                .try_init();
             *locked_flag = true;
         }
     }
@@ -902,6 +950,29 @@ unsafe extern "C" fn plugin_define(
         pos = snd_config_iterator_next(pos);
     }
 
+    let config = Settings::merged_config(&config);
+    let unknown = Settings::unknown_keys(&config, PLUGIN_KEYS);
+    if !unknown.is_empty() {
+        warn!(
+            "ignoring unknown settings (misspelt?): {}",
+            unknown.join(", ")
+        );
+    }
+    let app_name = get_app_name().unwrap_or(format!("process {}", std::process::id().to_string()));
+    let settings = match Settings::try_new(&app_name, &app_name, None, &config) {
+        Ok(settings) => settings,
+        Err(e) => {
+            error!("{e}");
+            return -libc::EINVAL;
+        }
+    };
+    let disable_pollfd = config
+        .get("DISABLE_POLLFD")
+        .is_some_and(|v| v.trim() == "1");
+    let use_flows_clock = config
+        .get("USE_FLOWS_CLOCK")
+        .is_some_and(|v| v.trim() == "1");
+
     let efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
 
     let callbacks = snd_pcm_ioplug_callback_t {
@@ -916,19 +987,6 @@ unsafe extern "C" fn plugin_define(
         //transfer: Some(plugin_transfer),
         ..zeroed()
     };
-
-    let app_name = get_app_name().unwrap_or(format!("process {}", std::process::id().to_string()));
-    let settings = Settings::new(&app_name, &app_name, None, &config);
-
-    let disable_pollfd = config
-        .get("DISABLE_POLLFD")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-
-    let use_flows_clock = config
-        .get("USE_FLOWS_CLOCK")
-        .map(|v| v == "1")
-        .unwrap_or(false);
 
     let buffers_valid = Arc::new(RwLock::new(false));
     let myio = Box::into_raw(Box::new(MyIOPlug {

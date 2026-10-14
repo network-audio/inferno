@@ -1,6 +1,7 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::time::{Duration, Instant};
 
 pub use usrvclock::AsyncClient as ClockReceiver;
 pub use usrvclock::ClockOverlay;
@@ -98,16 +99,45 @@ impl MediaClock {
   }
 }
 
-pub fn start_clock_receiver(path: Option<PathBuf>) -> ClockReceiver {
-  ClockReceiver::start(
-    path.unwrap_or(usrvclock::DEFAULT_SERVER_SOCKET_PATH.into()),
-    Box::new(|e| warn!("clock receive error: {e:?}")),
-  )
+/// The clock source of `CLOCK_PATH`: a usrvclock socket of the PTP daemon, or a PTP hardware clock device.
+pub fn clock_path_or_default(path: &Option<PathBuf>) -> PathBuf {
+  path.clone().unwrap_or(usrvclock::DEFAULT_SERVER_SOCKET_PATH.into())
 }
 
+/// Why no clock arrives from `path`, and what to check.
+pub fn diagnose_missing_clock(path: &Path) -> String {
+  use std::os::unix::fs::FileTypeExt;
+  let shown = path.display();
+  match std::fs::metadata(path) {
+    Err(_) => format!(
+      "nothing at {shown}: is the PTP daemon (Statime) running? Its usrvclock socket must be at CLOCK_PATH \
+       (default {})",
+      usrvclock::DEFAULT_SERVER_SOCKET_PATH
+    ),
+    Ok(m) if m.file_type().is_socket() => format!(
+      "{shown} exists but sends no clock updates: is the PTP daemon still running, and does it have a \
+       clock leader to follow? (If the application runs in a sandbox or with a private /tmp, it can't reach \
+       the daemon.)"
+    ),
+    Ok(m) if m.file_type().is_char_device() => {
+      format!("{shown} is a PTP hardware clock but gives no time: can this user read it?")
+    }
+    Ok(_) => format!("{shown} is neither a usrvclock socket nor a PTP hardware clock device: check CLOCK_PATH"),
+  }
+}
+
+pub fn start_clock_receiver(path: Option<PathBuf>) -> ClockReceiver {
+  ClockReceiver::start(clock_path_or_default(&path), Box::new(|e| warn!("clock receive error: {e:?}")))
+}
+
+/// How long without a clock before it is reported as an error.
+const CLOCK_MISSING_REPORT_AFTER: Duration = Duration::from_secs(5);
+
+/// A media clock following `receiver`. Reports once, as an error, if no clock arrives from `path` in time.
 pub async fn make_shared_media_clock(
   receiver: &ClockReceiver,
   use_safe_clock: bool,
+  path: PathBuf,
 ) -> Arc<RwLock<MediaClock>> {
   let mut rx = receiver.subscribe();
   let media_clock = MediaClock::new(use_safe_clock);
@@ -129,13 +159,26 @@ pub async fn make_shared_media_clock(
   let media_clock = Arc::new(RwLock::new(media_clock));
   let media_clock1 = media_clock.clone();
   tokio::spawn(async move {
+    let start = Instant::now();
+    let mut available = false;
+    let mut reported_missing = false;
     loop {
       let overlay_opt = rx.borrow_and_update().clone();
       if let Some(overlay) = overlay_opt {
         media_clock.write().unwrap().update_overlay(overlay);
+        if !available {
+          available = true;
+          info!("clock available from {} after {:?}", path.display(), start.elapsed());
+        }
       }
-      if rx.changed().await.is_err() {
-        break;
+      tokio::select! {
+        changed = rx.changed() => if changed.is_err() {
+          break;
+        },
+        _ = tokio::time::sleep(CLOCK_MISSING_REPORT_AFTER), if !available && !reported_missing => {
+          error!("no clock after {CLOCK_MISSING_REPORT_AFTER:?}: {}", diagnose_missing_clock(&path));
+          reported_missing = true;
+        }
       }
     }
   });
@@ -211,5 +254,26 @@ mod tests {
     clock.update_overlay(overlay2);
     assert_eq!(clock.get_overlay().unwrap().clock_id, 1);
     assert_eq!(clock.get_overlay().unwrap().last_sync, 200);
+  }
+
+  #[test]
+  fn missing_clock_diagnosis_says_what_is_at_the_path() {
+    let dir = std::env::temp_dir().join(format!("inferno-clock-diag-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let missing = dir.join("missing");
+    let d = diagnose_missing_clock(&missing);
+    assert!(d.contains(&missing.display().to_string()) && d.contains("Statime"), "{d}");
+
+    let socket_path = dir.join("socket");
+    let _ = std::fs::remove_file(&socket_path);
+    let _socket = std::os::unix::net::UnixDatagram::bind(&socket_path).unwrap();
+    let d = diagnose_missing_clock(&socket_path);
+    assert!(d.contains("sends no clock updates"), "{d}");
+
+    let file = dir.join("file");
+    std::fs::write(&file, b"").unwrap();
+    let d = diagnose_missing_clock(&file);
+    assert!(d.contains("check CLOCK_PATH"), "{d}");
+    let _ = std::fs::remove_dir_all(&dir);
   }
 }

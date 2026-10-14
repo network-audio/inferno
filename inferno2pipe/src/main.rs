@@ -42,7 +42,7 @@ struct Args {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let logenv = env_logger::Env::default().default_filter_or("debug");
+    let logenv = env_logger::Env::default().default_filter_or("info");
     env_logger::init_from_env(logenv);
 
     let args = Args::parse();
@@ -50,7 +50,21 @@ async fn main() {
     let (stop_tx, stop_rx) = oneshot::channel();
     let mut stop_tx = Some(stop_tx);
 
-    let mut settings = Settings::new("Inferno2pipe", "Inferno2pipe", None, &Default::default());
+    let config = Settings::merged_config(&Default::default());
+    let unknown = Settings::unknown_keys(&config, &[]);
+    if !unknown.is_empty() {
+        log::warn!(
+            "ignoring unknown INFERNO_* settings (misspelt?): {}",
+            unknown.join(", ")
+        );
+    }
+    let mut settings = match Settings::try_new("Inferno2pipe", "Inferno2pipe", None, &config) {
+        Ok(settings) => settings,
+        Err(e) => {
+            log::error!("{e}");
+            std::process::exit(2);
+        }
+    };
     settings.make_rx_channels(ch_count);
     settings.make_tx_channels(0);
 

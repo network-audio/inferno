@@ -38,11 +38,10 @@ pub async fn run_server(
   mut channels_sub_rx: watch::Receiver<Option<Arc<ChannelsSubscriber>>>,
   flows_tx: Arc<Mutex<Option<FlowsTransmitter>>>,
   tx_multicasts: Arc<Mutex<Option<TransmitMulticasts>>>,
-  shutdown: BroadcastReceiver<()>,
+  server: UdpSocketWrapper,
 ) {
   let mut subscriber = None;
   let mut saved_channels = SavedChannelsSettings::load(state_storage, self_info.clone());
-  let server = UdpSocketWrapper::new(Some(self_info.ip_address), self_info.arc_port, shutdown).await;
   let mut conn = req_resp::Connection::new(server);
   let mut recv_buff = net_utils::ReceiveBuffer::new();
   while conn.should_work() {

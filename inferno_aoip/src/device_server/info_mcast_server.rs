@@ -618,10 +618,8 @@ pub async fn run_server(
   clock: Arc<RwLock<MediaClock>>,
   mut channels_sub_rx: watch::Receiver<Option<Arc<ChannelsSubscriber>>>,
   get_peaks: PeaksCallback,
-  shutdown: BroadcastReceiver<()>,
+  server: UdpSocketWrapper,
 ) {
-  let server =
-    UdpSocketWrapper::new(Some(self_info.ip_address), self_info.info_request_port, shutdown).await;
   let mut recv_buff = crate::net_utils::ReceiveBuffer::new();
   let mut mcaster = Multicaster::new(self_info.as_ref(), server, clock, get_peaks);
   mcaster.send_board_info().await;

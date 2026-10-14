@@ -2,6 +2,7 @@ use crate::mdns_client::{MdnsClient, PointerToMulticast};
 use crate::media_clock::{
   async_clock_receiver_to_realtime, make_shared_media_clock, start_clock_receiver, ClockReceiver,
 };
+use crate::net_utils::UdpSocketWrapper;
 use crate::ring_buffer::{
   self, ExternalBuffer, OwnedBuffer, ProxyToBuffer, ProxyToSamplesBuffer, RBOutput,
 };
@@ -11,6 +12,7 @@ use flows_tx::FlowsTransmitter;
 use futures::{Future, FutureExt};
 use itertools::Itertools;
 use mdns_server::DeviceMDNSResponder;
+use std::net::SocketAddrV4;
 use tokio::task::JoinHandle;
 use tx_multicasts::TransmitMulticasts;
 
@@ -44,11 +46,13 @@ mod stream_anchor;
 pub(crate) mod tx_multicasts;
 
 pub use crate::common::{Clock, ClockDiff, Sample};
-pub use crate::media_clock::{MediaClock, RealTimeClockReceiver};
+pub use crate::media_clock::{
+  clock_path_or_default, diagnose_missing_clock, MediaClock, RealTimeClockReceiver,
+};
 pub use crate::ring_buffer::{
   new_owned, ExternalBufferParameters, PositionReportDestination, RBInput, WrittenFrom,
 };
-pub use settings::Settings;
+pub use settings::{Settings, SettingsError};
 pub use stream_anchor::StreamAnchor;
 pub type AtomicSample = atomic::Atomic<Sample>;
 
@@ -62,6 +66,31 @@ const PEAKS_ITER_SLEEP: Duration = Duration::from_millis(100);
 pub struct TransferNotifier {
   pub callback: Box<dyn Fn() + Send + Sync>,
   pub max_interval_samples: Clock,
+}
+
+/// The device couldn't listen on one of its network ports.
+#[derive(Debug)]
+pub struct StartError {
+  pub service: &'static str,
+  pub addr: SocketAddrV4,
+  pub source: std::io::Error,
+}
+
+impl std::fmt::Display for StartError {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "can't listen on UDP {} for {}: {}. Is another Inferno device (or Dante software) using it? Each device \
+       on a host needs its own ports: give them ALT_PORT values at least 4 apart.",
+      self.addr, self.service, self.source
+    )
+  }
+}
+
+impl std::error::Error for StartError {
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    Some(&self.source)
+  }
 }
 
 pub struct DeviceServer {
@@ -96,14 +125,35 @@ struct ExternalReceiver {
 }
 
 impl DeviceServer {
+  /// Like `try_start`, but panics if the device can't start.
   pub async fn start(settings: settings::Settings) -> Self {
+    Self::try_start(settings).await.unwrap_or_else(|e| panic!("{e}"))
+  }
+
+  /// Starts the device. Fails if it can't listen on its network ports (e.g. used by another device).
+  pub async fn try_start(settings: settings::Settings) -> Result<Self, StartError> {
     let self_info = Arc::new(settings.self_info);
-    let state_storage = Arc::new(StateStorage::new(&self_info));
     let ref_instant = Instant::now();
 
-    let (shutdown_send, shdn_recv1) = broadcast_queue::channel(16);
-    let shdn_recv2 = shutdown_send.subscribe();
-    let shdn_recv3 = shutdown_send.subscribe();
+    // before anything else is started, so that nothing needs to be undone on failure
+    let (shutdown_send, _) = broadcast_queue::channel(16);
+    let ip = self_info.ip_address;
+    let listen = |service: &'static str, port: u16| {
+      let shutdown = shutdown_send.subscribe();
+      async move {
+        UdpSocketWrapper::bind(Some(ip), port, shutdown).await.map_err(|source| StartError {
+          service,
+          addr: SocketAddrV4::new(ip, port),
+          source,
+        })
+      }
+    };
+    let arc_socket = listen("ARC (routing control)", self_info.arc_port).await?;
+    let cmc_socket = listen("CMC (control and monitoring)", self_info.cmc_port).await?;
+    let flows_control_socket = listen("flows control", self_info.flows_control_port).await?;
+    let info_socket = listen("device info", self_info.info_request_port).await?;
+
+    let state_storage = Arc::new(StateStorage::new(&self_info));
     let tx_multicasts_by_channel: Arc<RwLock<BTreeMap<usize, PointerToMulticast>>> = Default::default();
     let mdns_handle = Arc::new(mdns_server::DeviceMDNSResponder::start(
       self_info.clone(),
@@ -113,12 +163,11 @@ impl DeviceServer {
     let mdns_client = Arc::new(crate::mdns_client::MdnsClient::new(self_info.clone()));
     let (mcast_tx, mcast_rx) = mpsc::channel(100);
 
-    info!("clock path: {:?}", settings.clock_path);
+    let clock_path = clock_path_or_default(&settings.clock_path);
+    info!("clock: {}", clock_path.display());
     let clock_receiver = start_clock_receiver(settings.clock_path.clone());
-
-    info!("waiting for clock");
-    let shared_media_clock = make_shared_media_clock(&clock_receiver, settings.use_safe_clock).await;
-    info!("clock ready");
+    let shared_media_clock =
+      make_shared_media_clock(&clock_receiver, settings.use_safe_clock, clock_path).await;
 
     let mut tasks = vec![];
 
@@ -143,16 +192,21 @@ impl DeviceServer {
         channels_sub_rx.clone(),
         flows_tx.clone(),
         tx_multicasts.clone(),
-        shdn_recv1,
+        arc_socket,
       )),
-      tokio::spawn(cmc_server::run_server(self_info.clone(), shdn_recv2)),
+      tokio::spawn(cmc_server::run_server(self_info.clone(), cmc_socket)),
+      tokio::spawn(flows_control_server::run_server(
+        self_info.clone(),
+        flows_tx.clone(),
+        flows_control_socket,
+      )),
       tokio::spawn(info_mcast_server::run_server(
         self_info.clone(),
         mcast_rx,
         shared_media_clock.clone(),
         channels_sub_rx,
         Box::new(move || ((rxps.read().unwrap())(), (txps.read().unwrap())())),
-        shdn_recv3,
+        info_socket,
       )),
     ]);
 
@@ -168,7 +222,7 @@ impl DeviceServer {
     }
     .boxed();
 
-    Self {
+    Ok(Self {
       self_info,
       ref_instant,
       state_storage,
@@ -192,7 +246,7 @@ impl DeviceServer {
       rx_shutdown_todo: None,
       external_rx: None,
       tx_shutdown_todo: None,
-    }
+    })
   }
 
   pub async fn receive_with_callback(&mut self, samples_callback: SamplesCallback) {
@@ -360,12 +414,6 @@ impl DeviceServer {
       self.mdns_server.remove_tx_channel(index);
       self.mdns_server.add_tx_channel(index);
     }
-    let (shutdown_send, shutdown_recv) = broadcast_queue::channel(16);
-    let flows_control_task = tokio::spawn(flows_control_server::run_server(
-      self.self_info.clone(),
-      self.flows_tx.clone(),
-      shutdown_recv,
-    ));
     //let peaks_work = Arc::new(AtomicBool::new(true));
     //let peaks_work1 = peaks_work.clone();
     //let peaks = self.tx_peaks.clone();
@@ -396,9 +444,9 @@ impl DeviceServer {
         if let Some(txm) = tx_multicasts.lock().await.take() {
           txm.shutdown().await;
         }
-        shutdown_send.send(()).unwrap();
-        flows_control_task.await.unwrap();
-        *flows_tx.lock().await = None;
+        if let Some(flows_tx) = flows_tx.lock().await.take() {
+          flows_tx.shutdown().await;
+        }
         flows_tx_thread.join().unwrap();
         //peaks_thread.join().unwrap();
         info!("transmitter stopped");

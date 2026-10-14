@@ -9,8 +9,7 @@ use crate::protocol::req_resp;
 use bytebuffer::ByteBuffer;
 use tokio::sync::broadcast::Receiver as BroadcastReceiver;
 
-pub async fn run_server(self_info: Arc<DeviceInfo>, shutdown: BroadcastReceiver<()>) {
-  let server = UdpSocketWrapper::new(Some(self_info.ip_address), self_info.cmc_port, shutdown).await;
+pub async fn run_server(self_info: Arc<DeviceInfo>, server: UdpSocketWrapper) {
   let mut conn = req_resp::Connection::new(server);
   let mut recv_buff = crate::net_utils::ReceiveBuffer::new();
   while conn.should_work() {

@@ -1550,8 +1550,16 @@ fn capture_reconfiguration_keeps_subscriptions() {
 
 /// Runs `f` with this process's stderr (fd 2) redirected to a file, returning what was written to it:
 /// the plugin is a separately loaded library with its own logger, writing to fd 2.
+/// Captures are serialised: fd 2 belongs to the whole process.
 fn with_stderr_captured<R>(f: impl FnOnce() -> R) -> (R, String) {
-    let path = std::env::temp_dir().join(format!("daw_restart_stderr_{}", std::process::id()));
+    static CAPTURE: Mutex<usize> = Mutex::new(0);
+    let mut count = CAPTURE.lock().unwrap_or_else(|e| e.into_inner());
+    *count += 1;
+    let path = std::env::temp_dir().join(format!(
+        "daw_restart_stderr_{}_{}",
+        std::process::id(),
+        *count
+    ));
     let file = std::fs::File::create(&path).unwrap();
     let r = unsafe {
         use std::os::fd::AsRawFd;
@@ -1602,5 +1610,204 @@ fn playback_drain_completes_without_xrun() {
     assert!(
         xruns.is_empty(),
         "draining was reported as an xrun: {xruns:?}"
+    );
+}
+
+/// Opens the PCM `dut` of `config_text`, returning the error code, or 0 (and closes it) on success.
+fn open_result(config_text: &str, stream: snd_pcm_stream_t) -> i32 {
+    unsafe {
+        let mut config = std::ptr::null_mut();
+        assert_eq!(snd_config_top(&mut config), 0);
+        let mut input = std::ptr::null_mut();
+        let text = CString::new(config_text).unwrap();
+        assert_eq!(
+            snd_input_buffer_open(&mut input, text.as_ptr(), config_text.len() as isize),
+            0
+        );
+        assert_eq!(snd_config_load(config, input), 0);
+        snd_input_close(input);
+        let mut pcm = std::ptr::null_mut();
+        let name = CString::new("dut").unwrap();
+        let r = snd_pcm_open_lconf(
+            &mut pcm,
+            name.as_ptr(),
+            stream,
+            SND_PCM_NONBLOCK as i32,
+            config,
+        );
+        if r == 0 {
+            snd_pcm_close(pcm);
+        }
+        snd_config_delete(config);
+        r
+    }
+}
+
+/// T17: an invalid setting makes opening the PCM fail with a message naming the setting, instead of
+/// aborting the application (e.g. PipeWire or a DAW).
+#[test]
+fn invalid_setting_fails_open_instead_of_aborting() {
+    init_test_env();
+    let ids = TestIds {
+        base_port: 38000,
+        base_pid: 38,
+        tag: "badconf",
+        latency_ns: LATENCY_NS,
+    };
+    let good = plugin_config(&ids, "plug-badconf");
+    for (from, to) in [
+        (r#"BIND_IP "127.0.0.1""#, r#"BIND_IP "no-such-interface0""#),
+        (r#"ALT_PORT "38100""#, r#"ALT_PORT "65535""#),
+        (r#"TX_SOURCE_BIT_DEPTH "24""#, r#"TX_SOURCE_BIT_DEPTH "20""#),
+    ] {
+        assert!(good.contains(from), "test config lacks {from}");
+        let config = good.replace(from, to);
+        let key = to.split(' ').next().unwrap();
+        let (r, log) = with_stderr_captured(|| open_result(&config, SND_PCM_STREAM_CAPTURE));
+        assert_eq!(r, -libc::EINVAL, "{to}: open returned {r}");
+        assert!(
+            log.lines().any(|l| l.contains("ERROR") && l.contains(key)),
+            "{to}: no error naming {key} in the log: {log}"
+        );
+    }
+}
+
+/// T18: without a clock, starting the stream fails with a message saying what is wrong at CLOCK_PATH.
+#[test]
+fn missing_clock_is_reported_with_its_path() {
+    init_test_env();
+    let ids = TestIds {
+        base_port: 39000,
+        base_pid: 39,
+        tag: "noclock",
+        latency_ns: LATENCY_NS,
+    };
+    // no clock server started
+    let clock = ids.clock_path();
+    let _ = std::fs::remove_file(&clock);
+    let config = plugin_config(&ids, "plug-noclock");
+    let (r, log) = with_stderr_captured(|| unsafe {
+        let mut cfg = std::ptr::null_mut();
+        assert_eq!(snd_config_top(&mut cfg), 0);
+        let mut input = std::ptr::null_mut();
+        let text = CString::new(config.as_str()).unwrap();
+        assert_eq!(
+            snd_input_buffer_open(&mut input, text.as_ptr(), config.len() as isize),
+            0
+        );
+        assert_eq!(snd_config_load(cfg, input), 0);
+        snd_input_close(input);
+        let mut pcm = std::ptr::null_mut();
+        let name = CString::new("dut").unwrap();
+        let r = snd_pcm_open_lconf(
+            &mut pcm,
+            name.as_ptr(),
+            SND_PCM_STREAM_CAPTURE,
+            SND_PCM_NONBLOCK as i32,
+            cfg,
+        );
+        assert_eq!(r, 0, "open failed: {r}");
+        // hw_params prepares the stream, which needs the clock
+        let r = snd_pcm_set_params(
+            pcm,
+            SND_PCM_FORMAT_S32,
+            SND_PCM_ACCESS_RW_INTERLEAVED,
+            CHANNELS as u32,
+            SAMPLE_RATE,
+            0,
+            85_333,
+        );
+        snd_pcm_close(pcm);
+        snd_config_delete(cfg);
+        r
+    });
+    assert!(r < 0, "the stream started without a clock");
+    assert!(
+        log.lines()
+            .any(|l| l.contains("ERROR") && l.contains(&clock) && l.contains("Statime")),
+        "no error naming {clock} and the PTP daemon: {log}"
+    );
+}
+
+/// T19: a second device on ports already in use fails to start the stream with an error naming the clash,
+/// instead of running without them (invisible to controllers); the first device keeps working.
+#[test]
+fn device_on_ports_in_use_fails_with_an_error() {
+    init_test_env();
+    let ids = TestIds {
+        base_port: 40000,
+        base_pid: 40,
+        tag: "portclash",
+        latency_ns: LATENCY_NS,
+    };
+    let _clock = ClockServer::start(ids.clock_path());
+    let first = Pcm::open(
+        &plugin_config(&ids, "plug-portclash-a"),
+        SND_PCM_STREAM_CAPTURE,
+        85_333,
+    );
+    // another device (own DEVICE_ID and PROCESS_ID) on the same ALT_PORT
+    let second_config = plugin_config(&ids, "plug-portclash-b")
+        .replace(&plugin_device_id(&ids), "00000000deadbeef")
+        .replace(
+            &format!(r#"PROCESS_ID "{}""#, ids.base_pid + 100),
+            r#"PROCESS_ID "999""#,
+        );
+    let (r, log) = with_stderr_captured(|| unsafe {
+        let mut cfg = std::ptr::null_mut();
+        assert_eq!(snd_config_top(&mut cfg), 0);
+        let mut input = std::ptr::null_mut();
+        let text = CString::new(second_config.as_str()).unwrap();
+        assert_eq!(
+            snd_input_buffer_open(&mut input, text.as_ptr(), second_config.len() as isize),
+            0
+        );
+        assert_eq!(snd_config_load(cfg, input), 0);
+        snd_input_close(input);
+        let mut pcm = std::ptr::null_mut();
+        let name = CString::new("dut").unwrap();
+        let r = snd_pcm_open_lconf(
+            &mut pcm,
+            name.as_ptr(),
+            SND_PCM_STREAM_CAPTURE,
+            SND_PCM_NONBLOCK as i32,
+            cfg,
+        );
+        assert_eq!(r, 0, "open failed: {r}");
+        let r = snd_pcm_set_params(
+            pcm,
+            SND_PCM_FORMAT_S32,
+            SND_PCM_ACCESS_RW_INTERLEAVED,
+            CHANNELS as u32,
+            SAMPLE_RATE,
+            0,
+            85_333,
+        );
+        snd_pcm_close(pcm);
+        snd_config_delete(cfg);
+        r
+    });
+    assert_eq!(r, -libc::EBUSY, "second device: {r}");
+    assert!(
+        log.lines().any(|l| l.contains("ERROR")
+            && l.contains("127.0.0.1:40100")
+            && l.contains("ALT_PORT")),
+        "no error naming the port in use: {log}"
+    );
+    // the first device is unaffected
+    first.prepare();
+    first.start_if_prepared();
+    let mut buf = vec![0 as Sample; first.period_size * CHANNELS];
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut read = 0;
+    while read < first.buffer_size && Instant::now() < deadline {
+        let r = first.read(&mut buf);
+        assert!(r >= 0, "first device: read failed: {r}");
+        read += r as usize;
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        read >= first.buffer_size,
+        "first device stopped delivering audio"
     );
 }

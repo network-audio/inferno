@@ -15,13 +15,12 @@ use crate::{
 };
 use tokio::sync::broadcast::Receiver as BroadcastReceiver;
 
+/// Serves flow requests for the device's whole lifetime; while it isn't transmitting, they are refused.
 pub async fn run_server(
   self_info: Arc<DeviceInfo>,
   flows_tx: Arc<Mutex<Option<FlowsTransmitter>>>,
-  shutdown: BroadcastReceiver<()>,
+  server: UdpSocketWrapper,
 ) {
-  let server =
-    UdpSocketWrapper::new(Some(self_info.ip_address), self_info.flows_control_port, shutdown).await;
   let mut conn = req_resp::Connection::new(server);
   let mut recv_buff = crate::net_utils::ReceiveBuffer::new();
   while conn.should_work() {
@@ -106,13 +105,14 @@ pub async fn run_server(
             dst_port: rx_port,
             local_channel_indices: channel_indices,
           };
-          let result = flows_tx
-            .lock()
-            .await
-            .as_mut()
-            .unwrap()
-            .add_flow(flow_info, fpp as usize, (bits_per_sample / 8) as usize, None, false)
-            .await;
+          let mut flows_tx = flows_tx.lock().await;
+          let Some(flows_tx) = flows_tx.as_mut() else {
+            warn!("refusing flow request: not transmitting");
+            conn.respond_with_code(FlowControlError::TooManyTXFlows as u16, &[]).await;
+            continue;
+          };
+          let result =
+            flows_tx.add_flow(flow_info, fpp as usize, (bits_per_sample / 8) as usize, None, false).await;
           match result {
             Ok((flow_index, handle)) => {
               conn.respond(&handle).await;
@@ -131,7 +131,11 @@ pub async fn run_server(
             error!("packet too short: {}", hex::encode(request.content()));
             continue;
           };
-          if let Ok(flow_index) = flows_tx.lock().await.as_mut().unwrap().remove_flow(handle).await {
+          let removed = match flows_tx.lock().await.as_mut() {
+            Some(flows_tx) => flows_tx.remove_flow(handle).await.is_ok(),
+            None => false,
+          };
+          if removed {
             info!("stopped flow {handle:?}");
             conn.respond(&[]).await;
           } else {
@@ -155,9 +159,11 @@ pub async fn run_server(
             })
             .collect_vec();
 
-          if let Ok(_flow_index) =
-            flows_tx.lock().await.as_mut().unwrap().set_channels(handle, channel_indices.clone()).await
-          {
+          let updated = match flows_tx.lock().await.as_mut() {
+            Some(flows_tx) => flows_tx.set_channels(handle, channel_indices.clone()).await.is_ok(),
+            None => false,
+          };
+          if updated {
             info!("set channels {channel_indices:?} in flow {handle:?}");
             conn.respond(&[]).await;
           } else {
@@ -180,5 +186,4 @@ pub async fn run_server(
       error!("whole packet: {:?}", hex::encode(request.into_storage()));
     }
   }
-  flows_tx.lock().await.as_mut().unwrap().shutdown().await;
 }
