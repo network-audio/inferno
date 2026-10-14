@@ -654,10 +654,9 @@ unsafe fn start_stream(
                 None
             },
         };
-        // A running transmitter is switched to the new buffers, keeping its flows (see the
-        // device server thread), the receiver is restarted.
-        let mut err =
-            (*io).stream == SND_PCM_STREAM_CAPTURE && !stop_stream(&mut common, (*io).stream);
+        // A running receiver/transmitter is switched to the new buffers, keeping its flows and
+        // subscriptions (see the device server thread).
+        let mut err = false;
         match (*io).stream {
             SND_PCM_STREAM_CAPTURE => {
                 err |= common

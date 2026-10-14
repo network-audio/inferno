@@ -272,12 +272,21 @@ impl Pcm {
                 config,
             );
             assert_eq!(r, 0, "snd_pcm_open_lconf failed: {r}");
-            let pcm_struct = Self {
+            let mut pcm_struct = Self {
                 pcm,
                 config,
-                period_size: period_frames,
-                buffer_size: buffer_frames,
+                period_size: 0,
+                buffer_size: 0,
             };
+            pcm_struct.set_hw_params(period_frames, buffer_frames)?;
+            Ok(pcm_struct)
+        }
+    }
+
+    /// (Re)configures period and buffer size (in frames); the PCM must not be running.
+    fn set_hw_params(&mut self, period_frames: usize, buffer_frames: usize) -> Result<(), i32> {
+        let pcm = self.pcm;
+        unsafe {
             let mut hw = std::ptr::null_mut();
             assert_eq!(snd_pcm_hw_params_malloc(&mut hw), 0);
             let mut period = period_frames as snd_pcm_uframes_t;
@@ -314,7 +323,9 @@ impl Pcm {
                 (period_frames, buffer_frames),
                 "PCM didn't take the requested sizes"
             );
-            Ok(pcm_struct)
+            self.period_size = period as usize;
+            self.buffer_size = buffer as usize;
+            Ok(())
         }
     }
 
@@ -1495,4 +1506,44 @@ fn transmitter_switches_between_silence_and_playback_without_dropping_flows() {
 
     drop(capture);
     rt.block_on(rx_server.shutdown());
+}
+
+/// T15: changing the capture buffer configuration (e.g. a DAW changing its buffer size) must not tear down the
+/// receiver and its subscriptions: fresh audio resumes within about the latency, not after re-subscribing.
+#[test]
+fn capture_reconfiguration_keeps_subscriptions() {
+    let ids = TestIds {
+        base_port: 36000,
+        base_pid: 36,
+        tag: "capreconf",
+        latency_ns: LATENCY_NS,
+    };
+    let mut fx = CaptureFixture::with_pcm(&ids, |config| {
+        Pcm::open_with(config, SND_PCM_STREAM_CAPTURE, 1024, 4096).expect("1024x4 refused")
+    });
+    for (round, (period, buffer)) in [(512, 2048), (1024, 4096), (256, 2048)]
+        .into_iter()
+        .enumerate()
+    {
+        fx.pcm().drop_stream();
+        fx.next_epoch();
+        fx.pcm
+            .as_mut()
+            .unwrap()
+            .set_hw_params(period, buffer)
+            .expect("reconfiguration refused");
+        let t0 = Instant::now();
+        fx.pcm().prepare();
+        fx.pcm().start();
+        let gap = capture_until_audio(fx.pcm(), fx.epoch, ROUTING_TIMEOUT).map(|_| t0.elapsed());
+        log::info!(
+            "reconfiguration {round} to {period}x{}: audio resumed after {gap:?}",
+            buffer / period
+        );
+        let gap = gap.expect("audio never resumed after reconfiguration");
+        assert!(
+            gap < MAX_RESTART_GAP,
+            "audio resumed after {gap:?}, expected < {MAX_RESTART_GAP:?}"
+        );
+    }
 }

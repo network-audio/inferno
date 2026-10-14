@@ -294,6 +294,7 @@ If you want to contribute but can't code or don't know where to start because th
 * DAW support in the ALSA plugin: stopping and restarting a stream (transport stop/start, xrun recovery) keeps the Dante device, flows and subscriptions running, audio resumes within about the network latency instead of several seconds
 * `snd_pcm_delay` includes the network latency, for latency compensation in DAWs
 * the device transmits silence while no application is playing (e.g. capture-only applications), so receivers don't see a broken stream; starting or stopping playback switches the transmitter without interrupting flows
+* changing the buffer configuration (e.g. a DAW changing its buffer size) switches the receiver and transmitter to the new buffers, keeping flows and subscriptions
 * capture: buffers too small for the receive latency are refused, overwritten samples are reported as xruns instead of being returned
 * playback: samples are no longer overwritten before they're transmitted, and silence (not the stale buffer) is transmitted when the application falls behind or stops
 * receiving: no audio from the previous buffer cycle while a transmitter stalls, late packets (e.g. queued while the receiver was stalled) are dropped instead of landing on positions about to be read

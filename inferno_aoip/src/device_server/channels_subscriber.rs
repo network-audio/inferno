@@ -224,10 +224,13 @@ impl ChannelsBuffering<OwnedBuffer<Atomic<Sample>>> for OwnedBuffering {
   }
 }
 
+pub(crate) type ExternalRingBuffers = Vec<Arc<RingBufferShared<Sample, ExternalBuffer<Atomic<Sample>>>>>;
+
 pub struct ExternalBuffering {
   channels: Vec<ExternalBufferParameters<Sample>>,
-  hole_fix_wait: usize,
-  pub(crate) ring_buffers: Vec<Arc<RingBufferShared<Sample, ExternalBuffer<Atomic<Sample>>>>>,
+  pub(crate) hole_fix_wait: usize,
+  /// shared so that the buffers can be switched while receiving
+  pub(crate) ring_buffers: Arc<RwLock<ExternalRingBuffers>>,
   //on_disconnect: Vec<Option<Box<dyn FnOnce(Arc<RingBufferShared<Sample, ExternalBuffer<Atomic<Sample>>>>) -> ()>>>,
 }
 
@@ -236,7 +239,7 @@ impl ExternalBuffering {
     let channels_count = channels.len();
     let ring_buffers =
       (0..channels_count).map(|chi| ring_buffer::shared_from_external(&channels[chi], 0)).collect_vec();
-    Self { channels, hole_fix_wait, ring_buffers }
+    Self { channels, hole_fix_wait, ring_buffers: Arc::new(RwLock::new(ring_buffers)) }
   }
 }
 
@@ -249,7 +252,8 @@ impl ChannelsBuffering<ExternalBuffer<Atomic<Sample>>> for ExternalBuffering {
     _latency_samples: usize,
   ) -> Option<RBInput<Sample, ExternalBuffer<Atomic<Sample>>>> {
     debug_assert!(rb_output.is_none());
-    let rb_input = RBInput::new(self.ring_buffers[channel_index].clone(), self.hole_fix_wait);
+    let rb_input =
+      RBInput::new(self.ring_buffers.read().unwrap()[channel_index].clone(), self.hole_fix_wait);
     Some(rb_input)
   }
   fn disconnect_channel(
@@ -260,7 +264,7 @@ impl ChannelsBuffering<ExternalBuffer<Atomic<Sample>>> for ExternalBuffering {
     flows_recv: Arc<FlowsReceiver<ExternalBuffer<Atomic<Sample>>>>,
   ) {
     // TODO: this is a bit illogical, flows_recv.{connect_channel, disconnect_channel} should be in one place
-    let rb_shared = self.ring_buffers[channel_index].clone();
+    let rb_shared = self.ring_buffers.read().unwrap()[channel_index].clone();
     tokio::spawn(async move {
       flows_recv.disconnect_channel(flow_index, channel_in_flow, channel_index, rb_shared).await;
     });

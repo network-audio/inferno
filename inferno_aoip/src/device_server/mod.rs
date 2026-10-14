@@ -2,7 +2,9 @@ use crate::mdns_client::{MdnsClient, PointerToMulticast};
 use crate::media_clock::{
   async_clock_receiver_to_realtime, make_shared_media_clock, start_clock_receiver, ClockReceiver,
 };
-use crate::ring_buffer::{self, OwnedBuffer, ProxyToBuffer, ProxyToSamplesBuffer, RBOutput};
+use crate::ring_buffer::{
+  self, ExternalBuffer, OwnedBuffer, ProxyToBuffer, ProxyToSamplesBuffer, RBOutput,
+};
 use crate::state_storage::StateStorage;
 use atomic::Atomic;
 use flows_tx::FlowsTransmitter;
@@ -83,6 +85,14 @@ pub struct DeviceServer {
   shutdown_todo: Pin<Box<dyn Future<Output = ()> + Send>>,
   tx_shutdown_todo: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
   rx_shutdown_todo: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+  /// receiver into external buffers, if running: its flows receiver and buffers, to switch them
+  external_rx: Option<ExternalReceiver>,
+}
+
+struct ExternalReceiver {
+  flows_rx: Arc<flows_rx::FlowsReceiver<ExternalBuffer<Atomic<Sample>>>>,
+  ring_buffers: Arc<RwLock<channels_subscriber::ExternalRingBuffers>>,
+  hole_fix_wait: usize,
 }
 
 impl DeviceServer {
@@ -180,6 +190,7 @@ impl DeviceServer {
       //tx_inputs,
       shutdown_todo,
       rx_shutdown_todo: None,
+      external_rx: None,
       tx_shutdown_todo: None,
     }
   }
@@ -204,6 +215,7 @@ impl DeviceServer {
   }
   /// Receives into buffers owned by the caller (e.g. ALSA mmap areas), addressed relative to `anchor`.
   /// The stream may be paused and re-anchored any number of times without restarting the receiver.
+  /// If already receiving into external buffers, switches to the new ones, keeping flows and subscriptions.
   pub async fn receive_to_external_buffer(
     &mut self,
     rx_channels_buffers: Vec<ExternalBufferParameters<Sample>>,
@@ -211,10 +223,28 @@ impl DeviceServer {
     current_timestamp: Arc<AtomicUsize>,
     on_transfer: Option<TransferNotifier>,
   ) {
+    if let Some(ext) = &self.external_rx {
+      let new_rbs =
+        rx_channels_buffers.iter().map(|par| ring_buffer::shared_from_external(par, 0)).collect_vec();
+      let replacements = {
+        let mut rbs = ext.ring_buffers.write().unwrap();
+        let old = std::mem::replace(&mut *rbs, new_rbs.clone());
+        old.into_iter().zip(new_rbs.iter().cloned()).collect_vec()
+      };
+      *self.rx_peaks_supplier.write().unwrap() = Box::new(move || peaks_of_buffers(&new_rbs));
+      ext
+        .flows_rx
+        .switch_buffers(replacements, ext.hole_fix_wait, anchor, current_timestamp, on_transfer)
+        .await;
+      return;
+    }
     let buffering = ExternalBuffering::new(rx_channels_buffers, 4800 /*TODO*/);
-    let rbs = buffering.ring_buffers.clone();
-    *self.rx_peaks_supplier.write().unwrap() = Box::new(move || peaks_of_buffers(&rbs));
-    self.receive(vec![], anchor, buffering, current_timestamp, on_transfer).await;
+    let ring_buffers = buffering.ring_buffers.clone();
+    let hole_fix_wait = buffering.hole_fix_wait;
+    let rbs = ring_buffers.clone();
+    *self.rx_peaks_supplier.write().unwrap() = Box::new(move || peaks_of_buffers(&rbs.read().unwrap()));
+    let flows_rx = self.receive(vec![], anchor, buffering, current_timestamp, on_transfer).await;
+    self.external_rx = Some(ExternalReceiver { flows_rx, ring_buffers, hole_fix_wait });
   }
   async fn receive<
     P: ProxyToSamplesBuffer + Send + Sync + 'static,
@@ -226,7 +256,7 @@ impl DeviceServer {
     channels_buffering: B,
     current_timestamp: Arc<AtomicUsize>,
     on_transfer: Option<TransferNotifier>,
-  ) {
+  ) -> Arc<flows_rx::FlowsReceiver<P>> {
     let (flows_rx_handle, flows_rx_thread) = flows_rx::FlowsReceiver::start(
       self.self_info.clone(),
       self.get_realtime_clock_receiver(),
@@ -236,6 +266,7 @@ impl DeviceServer {
       on_transfer,
     );
     let flows_rx_handle = Arc::new(flows_rx_handle);
+    let flows_rx_result = flows_rx_handle.clone();
     let (channels_sub_handle, channels_sub_worker) = ChannelsSubscriber::new(
       self.self_info.clone(),
       self.shared_media_clock.clone(),
@@ -263,8 +294,10 @@ impl DeviceServer {
     }
     .boxed();
     self.rx_shutdown_todo = Some(shutdown_todo);
+    flows_rx_result
   }
   pub async fn stop_receiver(&mut self) {
+    self.external_rx = None;
     let _ = self.channels_sub_tx.send(None);
     self.rx_shutdown_todo.take().unwrap().await;
   }

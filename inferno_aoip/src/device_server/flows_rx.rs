@@ -77,7 +77,19 @@ enum Command<P: ProxyToSamplesBuffer> {
     channel_in_flow: usize,
     rb_shared: Arc<RingBufferShared<Sample, P>>,
   },
+  /// Switch to other buffers (e.g. the application reconfigured its buffer) and stream, keeping flows and
+  /// subscriptions: sinks of the first ring buffer of each pair write to the second one from now on.
+  SwitchBuffers {
+    replacements: Vec<RingReplacement<P>>,
+    hole_fix_wait: usize,
+    anchor: StreamAnchor,
+    current_timestamp: Arc<AtomicUsize>,
+    on_transfer: Option<TransferNotifier>,
+  },
 }
+
+/// (replaced ring buffer, its replacement)
+type RingReplacement<P> = (Arc<RingBufferShared<Sample, P>>, Arc<RingBufferShared<Sample, P>>);
 
 struct FlowsReceiverInternal<P: ProxyToSamplesBuffer> {
   commands_receiver: mpsc::Receiver<Command<P>>,
@@ -94,9 +106,67 @@ struct FlowsReceiverInternal<P: ProxyToSamplesBuffer> {
   /// start time currently applied to ring buffers, `None` when paused
   start_timestamp: Option<Clock>,
   default_latency_samples: usize,
+  /// ring buffers replaced by SwitchBuffers: commands sent before the switch may still refer to them
+  replaced: Vec<RingReplacement<P>>,
+  replacement_hole_fix_wait: usize,
 }
 
 impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
+  /// The ring buffer currently used instead of `rb`, if it has been replaced.
+  fn replacement_of(
+    &self,
+    rb: &Arc<RingBufferShared<Sample, P>>,
+  ) -> Option<Arc<RingBufferShared<Sample, P>>> {
+    self.replaced.iter().find(|(old, _)| Arc::ptr_eq(old, rb)).map(|(_, new)| new.clone())
+  }
+  fn switch_buffers(&mut self, replacements: Vec<RingReplacement<P>>, hole_fix_wait: usize) {
+    // earlier replacements now lead to the new buffers
+    for (_, target) in self.replaced.iter_mut() {
+      if let Some((_, new)) = replacements.iter().find(|(old, _)| Arc::ptr_eq(old, target)) {
+        *target = new.clone();
+      }
+    }
+    self.replaced.extend(replacements);
+    self.replacement_hole_fix_wait = hole_fix_wait;
+    let replaced = std::mem::take(&mut self.replaced);
+    let find = |rb: &Arc<RingBufferShared<Sample, P>>| {
+      replaced.iter().find(|(old, _)| Arc::ptr_eq(old, rb)).map(|(_, new)| new.clone())
+    };
+    // TODO is freeing memory in realtime thread safe???
+    for sd in self.sockets.iter_mut().filter_map(|opt| opt.as_mut()) {
+      for ch in sd.channels.iter_mut().filter_map(|opt| opt.as_mut()) {
+        for sink in &mut ch.sinks {
+          if let Some(new) = find(sink.shared()) {
+            *sink = RBInput::new(new, hole_fix_wait);
+          }
+        }
+      }
+    }
+    for sw in &mut self.silence_writers {
+      if let Some(new) = find(sw.sink.shared()) {
+        sw.sink = RBInput::new(new, hole_fix_wait);
+      }
+    }
+    self.replaced = replaced;
+  }
+  /// How often missing samples are closed, see `run`.
+  fn closing_samples_interval(&self) -> Duration {
+    self
+      .on_transfer
+      .as_ref()
+      .map(|transfer| {
+        Duration::from_nanos(
+          // TODO: /2 is a HACK
+          (transfer.max_interval_samples as u64 * 1_000_000_000u64 / self.sample_rate as u64) / 2,
+        )
+      })
+      .unwrap_or(CLOSING_SAMPLES_INTERVAL)
+      // closing ahead (below) must stay within what packets already write (latency ahead), otherwise the
+      // closed silence would overwrite samples readers haven't read yet
+      .min(Duration::from_nanos(
+        self.default_latency_samples as u64 * 1_000_000_000 / self.sample_rate as u64 / 4,
+      ))
+  }
   #[inline(always)]
   fn receive(
     sd: &mut SocketData<P>,
@@ -227,26 +297,14 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
     let keepalive_interval_between_flows = KEEPALIVE_INTERVAL / self.sockets.len().try_into().unwrap();
     let mut next_keepalive = Instant::now() + keepalive_interval_between_flows;
     let mut keepalive_index = 0usize;
-    let closing_samples_interval = self
-      .on_transfer
-      .as_ref()
-      .map(|transfer| {
-        Duration::from_nanos(
-          // TODO: /2 is a HACK
-          (transfer.max_interval_samples as u64 * 1_000_000_000u64 / self.sample_rate as u64) / 2,
-        )
-      })
-      .unwrap_or(CLOSING_SAMPLES_INTERVAL)
-      // closing ahead (below) must stay within what packets already write (latency ahead), otherwise the
-      // closed silence would overwrite samples readers haven't read yet
-      .min(Duration::from_nanos(
-        self.default_latency_samples as u64 * 1_000_000_000 / self.sample_rate as u64 / 4,
-      ));
+    let mut closing_samples_interval = self.closing_samples_interval();
     let mut next_closing_samples = Instant::now() + closing_samples_interval;
     // Readers may read up to the current time at any moment, so each closing pass must close beyond it,
     // until (at least) the next pass. Two intervals leave slack for a late wakeup.
-    let closing_ahead_samples =
-      (2 * closing_samples_interval.as_nanos() * self.sample_rate as u128 / 1_000_000_000) as usize;
+    let closing_ahead = |interval: Duration, sample_rate: u32| {
+      (2 * interval.as_nanos() * sample_rate as u128 / 1_000_000_000) as usize
+    };
+    let mut closing_ahead_samples = closing_ahead(closing_samples_interval, self.sample_rate);
     let mut events = mio::Events::with_capacity(MAX_FLOWS + 1); // +1 because of waker, TODO: really necessary?
     let mut may_have_command = false;
     self.publish_latency();
@@ -337,7 +395,11 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
               }
               let _ = socket;
             }
-            Command::ConnectChannel { socket_index, channel_in_flow, sink } => {
+            Command::ConnectChannel { socket_index, channel_in_flow, mut sink } => {
+              // made before a buffer switch
+              if let Some(new) = self.replacement_of(sink.shared()) {
+                sink = RBInput::new(new, self.replacement_hole_fix_wait);
+              }
               if cfg!(debug_assertions) {
                 for sd in self.sockets.iter().filter_map(|opt| opt.as_ref()) {
                   for ch in sd.channels.iter().filter_map(|opt| opt.as_ref()) {
@@ -387,6 +449,7 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
               self.publish_latency();
             }
             Command::DisconnectChannel { socket_index, channel_in_flow, rb_shared } => {
+              let rb_shared = self.replacement_of(&rb_shared).unwrap_or(rb_shared);
               if let Some(sd) = self.sockets[socket_index].as_mut() {
                 if let Some(ch) = sd.channels[channel_in_flow].as_mut() {
                   let sink_index_opt =
@@ -408,6 +471,23 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
                   }
                 }
               }
+              self.publish_latency();
+            }
+            Command::SwitchBuffers {
+              replacements,
+              hole_fix_wait,
+              anchor,
+              current_timestamp,
+              on_transfer,
+            } => {
+              self.switch_buffers(replacements, hole_fix_wait);
+              self.anchor = anchor;
+              // re-anchored (and activated) in the next iteration
+              self.start_timestamp = None;
+              self.current_timestamp = current_timestamp;
+              self.on_transfer = on_transfer;
+              closing_samples_interval = self.closing_samples_interval();
+              closing_ahead_samples = closing_ahead(closing_samples_interval, self.sample_rate);
               self.publish_latency();
             }
             Command::NoOp => {}
@@ -529,6 +609,8 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
       anchor,
       start_timestamp: None,
       default_latency_samples,
+      replaced: vec![],
+      replacement_hole_fix_wait: 0,
     };
     internal.run();
   }
@@ -648,6 +730,29 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
     self
       .commands_sender
       .send(Command::ConnectChannel { socket_index: local_flow_index, channel_in_flow, sink })
+      .await
+      .log_and_forget();
+    self.waker.wake().log_and_forget();
+  }
+  /// Switches to other buffers and stream anchor, keeping flows: sinks writing to the first ring buffer of each
+  /// pair write to the second one from now on.
+  pub async fn switch_buffers(
+    &self,
+    replacements: Vec<RingReplacement<P>>,
+    hole_fix_wait: usize,
+    anchor: StreamAnchor,
+    current_timestamp: Arc<AtomicUsize>,
+    on_transfer: Option<TransferNotifier>,
+  ) {
+    self
+      .commands_sender
+      .send(Command::SwitchBuffers {
+        replacements,
+        hole_fix_wait,
+        anchor,
+        current_timestamp,
+        on_transfer,
+      })
       .await
       .log_and_forget();
     self.waker.wake().log_and_forget();
