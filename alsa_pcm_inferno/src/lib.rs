@@ -398,6 +398,13 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
     }
 
     if buffered < 0
+        && (*io).stream == SND_PCM_STREAM_PLAYBACK
+        && (*io).state == SND_PCM_STATE_DRAINING
+    {
+        // Everything written has been played: the drain is complete, not an xrun. Reporting exactly the end
+        // of the written data lets ioplug stop the stream.
+        ptr = ptr.wrapping_add(buffered);
+    } else if buffered < 0
         && ((*io).state == SND_PCM_STATE_RUNNING || (*io).state == SND_PCM_STATE_DRAINING)
     {
         if let Ok(hw_ptr) = ptr.try_into() {

@@ -1547,3 +1547,60 @@ fn capture_reconfiguration_keeps_subscriptions() {
         );
     }
 }
+
+/// Runs `f` with this process's stderr (fd 2) redirected to a file, returning what was written to it:
+/// the plugin is a separately loaded library with its own logger, writing to fd 2.
+fn with_stderr_captured<R>(f: impl FnOnce() -> R) -> (R, String) {
+    let path = std::env::temp_dir().join(format!("daw_restart_stderr_{}", std::process::id()));
+    let file = std::fs::File::create(&path).unwrap();
+    let r = unsafe {
+        use std::os::fd::AsRawFd;
+        let saved = libc::dup(2);
+        assert!(saved >= 0);
+        libc::dup2(file.as_raw_fd(), 2);
+        let r = f();
+        libc::dup2(saved, 2);
+        libc::close(saved);
+        r
+    };
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let _ = std::fs::remove_file(&path);
+    (r, text)
+}
+
+/// T16: draining playback (e.g. aplay at the end of its input) ends the stream once everything written has
+/// been played, like on hardware. Reaching the end of the written data is not an xrun.
+#[test]
+fn playback_drain_completes_without_xrun() {
+    let ids = TestIds {
+        base_port: 37000,
+        base_pid: 37,
+        tag: "pbdrain",
+        latency_ns: LATENCY_NS,
+    };
+    let mut fx = PlaybackFixture::new(&ids);
+    // past the startup grace period of the plugin's xrun detection
+    fx.pump(Duration::from_secs(3));
+    let pcm = fx.pcm();
+    // a partly filled buffer, like the end of a file
+    let half = vec![TX_PATTERN; pcm.buffer_size / 2 * CHANNELS];
+    while pcm.avail() < (pcm.buffer_size / 2) as i64 {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(pcm.write(&half) > 0);
+    let (r, log) = with_stderr_captured(|| unsafe {
+        snd_pcm_nonblock(pcm.pcm, 0);
+        snd_pcm_drain(pcm.pcm)
+    });
+    let state = unsafe { snd_pcm_state(pcm.pcm) };
+    assert_eq!(r, 0, "snd_pcm_drain failed: {r}");
+    assert_eq!(
+        state, SND_PCM_STATE_SETUP,
+        "after drain the stream must be stopped"
+    );
+    let xruns: Vec<&str> = log.lines().filter(|l| l.contains("XRUN")).collect();
+    assert!(
+        xruns.is_empty(),
+        "draining was reported as an xrun: {xruns:?}"
+    );
+}
