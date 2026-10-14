@@ -149,6 +149,21 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
     }
     self.replaced = replaced;
   }
+  /// Keeps filling a disconnected sink's buffer with silence for a while.
+  fn start_silence_writer(&mut self, sink: RBInput<Sample, P>, timestamp_shift: ClockDiff) {
+    if let Some(now) = self.clock.wrapping_now_in_timebase(self.sample_rate.into()) {
+      let rb_size = sink.ring_buffer_size();
+      let writer = SilenceWriter {
+        sink,
+        end_timestamp: now
+          .wrapping_add(rb_size + rb_size / 2 /*TODO: ???*/)
+          .wrapping_add_signed(timestamp_shift),
+      };
+      self.silence_writers.push(writer);
+    } else {
+      warn!("no media clock, unable to initialize SilenceWriter");
+    }
+  }
   /// How often missing samples are closed, see `run`.
   fn closing_samples_interval(&self) -> Duration {
     self
@@ -379,21 +394,13 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
             Command::RemoveSocket { index } => {
               self.poll.registry().deregister(&mut self.sockets[index].as_mut().unwrap().socket).unwrap();
               let socket = self.sockets[index].take().unwrap();
-              if cfg!(debug_assertions) {
-                let count: usize = socket
-                  .channels
-                  .iter()
-                  .filter_map(|ch_opt| ch_opt.as_ref())
-                  .map(|ch| ch.sinks.len())
-                  .sum();
-                if count > 0 {
-                  error!(
-                    "BUG: still have {} channels when removing socket index {index}",
-                    socket.channels.len()
-                  );
+              // Channels may still be connected: their disconnection is sent from a separate task and may
+              // arrive later. Their buffers must be filled with silence like after disconnecting them.
+              for ch in socket.channels.into_iter().flatten() {
+                for sink in ch.sinks {
+                  self.start_silence_writer(sink, ch.timestamp_shift);
                 }
               }
-              let _ = socket;
             }
             Command::ConnectChannel { socket_index, channel_in_flow, mut sink } => {
               // made before a buffer switch
@@ -456,18 +463,8 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
                     ch.sinks.iter().position(|sink| Arc::ptr_eq(sink.shared(), &rb_shared));
                   if let Some(sink_index) = sink_index_opt {
                     let sink = ch.sinks.swap_remove(sink_index);
-                    if let Some(now) = self.clock.wrapping_now_in_timebase(self.sample_rate.into()) {
-                      let rb_size = sink.ring_buffer_size();
-                      let writer = SilenceWriter {
-                        sink,
-                        end_timestamp: now
-                          .wrapping_add(rb_size + rb_size / 2 /*TODO: ???*/)
-                          .wrapping_add_signed(ch.timestamp_shift),
-                      };
-                      self.silence_writers.push(writer);
-                    } else {
-                      warn!("no media clock, unable to initialize SilenceWriter");
-                    }
+                    let timestamp_shift = ch.timestamp_shift;
+                    self.start_silence_writer(sink, timestamp_shift);
                   }
                 }
               }
@@ -766,10 +763,9 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
   ) {
     debug!("disconnecting channel: flow index={local_flow_index}, channel in flow: {channel_in_flow}");
 
-    {
-      let mut flows_info = self.flows_info.write().unwrap();
-      flows_info[local_flow_index].as_mut().unwrap().channels_map[channel_in_flow]
-        .set(local_channel_index, false);
+    // the flow may have been removed already (its socket is removed from a separate task)
+    if let Some(flow_info) = self.flows_info.write().unwrap()[local_flow_index].as_mut() {
+      flow_info.channels_map[channel_in_flow].set(local_channel_index, false);
     }
 
     self
@@ -799,6 +795,54 @@ mod tests {
     assert!(packet_is_late(1512, 1000, 480, 32), "completely read already");
     // queued during a stall of the receiver, seconds old
     assert!(packet_is_late(1000 + 48000 * 3, 1000, 480, 32));
+  }
+
+  /// The socket of a flow may be removed before its channels are disconnected (both are sent from separate
+  /// tasks). The channels' buffers must still be filled with silence afterwards, not keep the last audio.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn socket_removed_before_its_channels_leaves_silence() {
+    use crate::device_server::settings::Settings;
+    use crate::device_server::AtomicSample;
+    use crate::ring_buffer::{shared_from_external, ExternalBufferParameters};
+    use crate::util::real_time_box_channel;
+    use std::collections::BTreeMap;
+
+    let mut config = BTreeMap::new();
+    config.insert("SAMPLE_RATE".to_string(), "48000".to_string());
+    let mut settings =
+      Settings::new("flows_rx_test", "flows_rx_test", Some(std::net::Ipv4Addr::LOCALHOST), &config);
+    settings.make_rx_channels(1);
+    let overlay =
+      ClockOverlay { clock_id: 1 /* CLOCK_MONOTONIC */, last_sync: 0, shift: 0, freq_scale: 0.0 };
+    let (clock_tx, clock_rx) = real_time_box_channel::channel(Box::new(None));
+    clock_tx.send(Box::new(Some(overlay)));
+    let (rx, rx_thread) = FlowsReceiver::start(
+      Arc::new(settings.self_info.clone()),
+      clock_rx,
+      Instant::now(),
+      StreamAnchor::new_started(0),
+      Arc::new(AtomicUsize::new(usize::MAX)),
+      None,
+    );
+
+    // the last audio received
+    let buffer: Arc<Vec<AtomicSample>> = Arc::new((0..1024).map(|_| AtomicSample::new(7)).collect());
+    let valid = Arc::new(RwLock::new(true));
+    let params = unsafe { ExternalBufferParameters::new(buffer.as_ptr(), buffer.len(), 1, valid, None) };
+    let ring = shared_from_external(&params, 0);
+
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket.set_nonblocking(true).unwrap();
+    rx.add_socket(0, UdpSocket::from_std(socket), false, 3, 1, 480, Arc::new(AtomicUsize::new(0))).await;
+    rx.connect_channel(0, 0, 0, RBInput::new(ring.clone(), 100)).await;
+    rx.remove_socket(0).await;
+    rx.disconnect_channel(0, 0, 0, ring.clone()).await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let left = buffer.iter().filter(|s| s.load(Ordering::Relaxed) != 0).count();
+    rx.shutdown().await;
+    rx_thread.join().unwrap();
+    assert_eq!(left, 0, "{left} samples of the last audio left in the buffer");
   }
 
   #[test]

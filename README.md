@@ -299,6 +299,7 @@ If you want to contribute but can't code or don't know where to start because th
 * playback: samples are no longer overwritten before they're transmitted, and silence (not the stale buffer) is transmitted when the application falls behind or stops
 * receiving: no audio from the previous buffer cycle while a transmitter stalls, late packets (e.g. queued while the receiver was stalled) are dropped instead of landing on positions about to be read
 * answers controllers' clock status, settings status (AES67, sample rate, encoding, pull-up, codec, lock) and interface statistics queries, so that e.g. netaudio doesn't wait for them to time out; fixed heartbeat record length
+* receive channels are silenced when their flow is removed (unsubscribed, transmitter gone) even if the flow's socket is removed first, instead of keeping the last audio; no more "BUG: still have N channels" error
 * RX channels are listed even without a running receiver (playback-only devices weren't usable from netaudio 0.4)
 * warning when realtime priority can't be set for the audio threads
 * integration test: netaudio 0.4, runs on arm64 and x86, exits with the test result, configurable latency (`INFERNO_TEST_LATENCY_NS`)
