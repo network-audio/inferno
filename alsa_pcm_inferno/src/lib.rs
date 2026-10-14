@@ -55,6 +55,33 @@ lazy_static! {
     static ref global_initialized: Mutex<bool> = false.into();
 }
 
+/// The transmitter of an Inferno instance (device server thread).
+#[derive(PartialEq)]
+enum Transmitter {
+    None,
+    /// sends silence
+    Silent,
+    /// serves the playback PCM
+    Pcm,
+}
+
+static SILENCE: AtomicSample = AtomicSample::new(0);
+
+/// Starts transmitting silence, or switches the running transmitter to it (keeping its flows).
+async fn transmit_silence(device_server: &mut DeviceServer, channels: usize) -> Transmitter {
+    // never valid and never started: the transmitter sends silence without touching the buffer
+    let valid = Arc::new(RwLock::new(false));
+    let anchor = StreamAnchor::new_paused_guarding(valid.clone());
+    let buffers = (0..channels)
+        .map(|_| unsafe { ExternalBufferParameters::new(&SILENCE, 1, 1, valid.clone(), None) })
+        .collect();
+    device_server
+        .transmit_from_external_buffer(buffers, anchor, Default::default(), None)
+        .await;
+    debug!("transmitting silence");
+    Transmitter::Silent
+}
+
 fn get_or_create_instance(settings: &Settings) -> Arc<Mutex<InfernoInstance>> {
     let mut instances_locked = global_instances.write().unwrap();
     let entry = instances_locked.entry(settings.self_info.factory_device_id);
@@ -75,7 +102,12 @@ fn get_or_create_instance(settings: &Settings) -> Arc<Mutex<InfernoInstance>> {
                 async move {
                     // TODO DeviceServer::start may fail internally (e.g. if other process using Inferno is already listening on network ports)
                     // retrying infinitely will spam the log. (Audacity behaves this way if Inferno is already running)
+                    let tx_channels = settings.self_info.tx_channels.len();
                     let mut device_server = DeviceServer::start(settings).await;
+                    // While the device exists, it transmits: from the playback PCM, or silence (e.g. for
+                    // capture-only applications), so that receivers don't see a broken stream.
+                    let mut tx = Transmitter::None;
+                    let mut receiving = false;
                     loop {
                         match commands_rx.recv().await {
                             Some(command) => match command {
@@ -96,7 +128,12 @@ fn get_or_create_instance(settings: &Settings) -> Arc<Mutex<InfernoInstance>> {
                                             on_transfer,
                                         )
                                         .await;
+                                    receiving = true;
                                     debug!("started receiver");
+                                    if tx == Transmitter::None && tx_channels > 0 {
+                                        tx =
+                                            transmit_silence(&mut device_server, tx_channels).await;
+                                    }
                                 }
                                 Command::StartTransmitter(StartArgs {
                                     channels,
@@ -107,6 +144,8 @@ fn get_or_create_instance(settings: &Settings) -> Arc<Mutex<InfernoInstance>> {
                                 }) => {
                                     let _ = clock_rx_tx
                                         .send(device_server.get_realtime_clock_receiver());
+                                    // switches a running (silent) transmitter, keeping its flows
+                                    tx = Transmitter::Pcm;
                                     device_server
                                         .transmit_from_external_buffer(
                                             channels,
@@ -119,11 +158,24 @@ fn get_or_create_instance(settings: &Settings) -> Arc<Mutex<InfernoInstance>> {
                                 }
                                 Command::StopReceiver => {
                                     device_server.stop_receiver().await;
+                                    receiving = false;
                                     debug!("stopped receiver");
+                                    if tx == Transmitter::Silent {
+                                        device_server.stop_transmitter().await;
+                                        tx = Transmitter::None;
+                                        debug!("stopped transmitting silence");
+                                    }
                                 }
                                 Command::StopTransmitter => {
-                                    device_server.stop_transmitter().await;
-                                    debug!("stopped transmitter");
+                                    if receiving && tx_channels > 0 {
+                                        // keep the flows for the still capturing application
+                                        tx =
+                                            transmit_silence(&mut device_server, tx_channels).await;
+                                    } else {
+                                        device_server.stop_transmitter().await;
+                                        tx = Transmitter::None;
+                                        debug!("stopped transmitter");
+                                    }
                                 }
                                 Command::Shutdown => {
                                     break;
@@ -602,7 +654,10 @@ unsafe fn start_stream(
                 None
             },
         };
-        let mut err = !stop_stream(&mut common, (*io).stream);
+        // A running transmitter is switched to the new buffers, keeping its flows (see the
+        // device server thread), the receiver is restarted.
+        let mut err =
+            (*io).stream == SND_PCM_STREAM_CAPTURE && !stop_stream(&mut common, (*io).stream);
         match (*io).stream {
             SND_PCM_STREAM_CAPTURE => {
                 err |= common

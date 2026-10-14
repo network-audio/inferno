@@ -1315,3 +1315,184 @@ fn playback_xrun_recovery_sends_no_old_audio() {
         "{stale} fragments of old audio transmitted after xrun recoveries"
     );
 }
+
+/// T13: an application only capturing still provides the device's transmit channels: receivers subscribed to them
+/// get a live (silent) flow instead of a broken stream.
+#[test]
+fn capture_only_device_transmits_silence() {
+    let ids = TestIds {
+        base_port: 34000,
+        base_pid: 34,
+        tag: "caponlytx",
+        latency_ns: LATENCY_NS,
+    };
+    init_test_env();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(4)
+        .build()
+        .unwrap();
+    let _clock = ClockServer::start(ids.clock_path());
+    let plugin_name = format!("plug-caponly-{}", ids.tag);
+    let pcm = Pcm::open(
+        &plugin_config(&ids, &plugin_name),
+        SND_PCM_STREAM_CAPTURE,
+        85_333,
+    );
+    pcm.prepare();
+    pcm.start();
+
+    let mut rx_server = rt.block_on(DeviceServer::start(library_settings(
+        &format!("lib-rx-{}", ids.tag),
+        &ids,
+        CHANNELS,
+        0,
+    )));
+    // the receiver delivers samples only while a flow is alive
+    let received = Arc::new(AtomicUsize::new(0));
+    let nonzero = Arc::new(AtomicUsize::new(0));
+    let (r, n) = (received.clone(), nonzero.clone());
+    rt.block_on(rx_server.receive_with_callback(Box::new(
+        move |count: usize, channels: &Vec<Vec<Sample>>| {
+            r.fetch_add(count, Ordering::Relaxed);
+            n.fetch_add(
+                channels[0][..count].iter().filter(|&&s| s != 0).count(),
+                Ordering::Relaxed,
+            );
+        },
+    )));
+    for ch in 0..CHANNELS {
+        rt.block_on(rx_server.subscribe(ch, &format!("TX {}", ch + 1), &plugin_name));
+    }
+    let mut buf = vec![0 as Sample; pcm.period_size * CHANNELS];
+    let deadline = Instant::now() + ROUTING_TIMEOUT;
+    while received.load(Ordering::Relaxed) < SAMPLE_RATE as usize && Instant::now() < deadline {
+        // keep capturing, like a recording application
+        let r = pcm.read(&mut buf);
+        assert!(
+            r >= 0 || r == -(libc::EPIPE as i64),
+            "snd_pcm_readi failed: {r}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let received = received.load(Ordering::Relaxed);
+    log::info!("capture-only device: receiver got {received} samples");
+    assert!(
+        received >= SAMPLE_RATE as usize,
+        "receiver got only {received} samples from a capture-only device's transmit channels"
+    );
+    assert_eq!(
+        nonzero.load(Ordering::Relaxed),
+        0,
+        "transmitted audio must be silence"
+    );
+    drop(pcm);
+    rt.block_on(rx_server.shutdown());
+}
+
+/// T14: when a capturing application also opens playback (and closes it again), the transmitter switches between
+/// silence and the application's audio without tearing down flows: receivers keep receiving throughout.
+#[test]
+fn transmitter_switches_between_silence_and_playback_without_dropping_flows() {
+    let ids = TestIds {
+        base_port: 35000,
+        base_pid: 35,
+        tag: "txswitch",
+        latency_ns: LATENCY_NS,
+    };
+    init_test_env();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(4)
+        .build()
+        .unwrap();
+    let _clock = ClockServer::start(ids.clock_path());
+    let plugin_name = format!("plug-txswitch-{}", ids.tag);
+    let config = plugin_config(&ids, &plugin_name);
+    let capture = Pcm::open(&config, SND_PCM_STREAM_CAPTURE, 85_333);
+    capture.prepare();
+    capture.start();
+
+    let mut rx_server = rt.block_on(DeviceServer::start(library_settings(
+        &format!("lib-rx-{}", ids.tag),
+        &ids,
+        CHANNELS,
+        0,
+    )));
+    let received = Arc::new(AtomicUsize::new(0));
+    let first_pattern: Arc<Mutex<Option<Instant>>> = Default::default();
+    let (r, fp) = (received.clone(), first_pattern.clone());
+    rt.block_on(rx_server.receive_with_callback(Box::new(
+        move |count: usize, channels: &Vec<Vec<Sample>>| {
+            r.fetch_add(count, Ordering::Relaxed);
+            if channels[0][..count].contains(&TX_PATTERN) {
+                fp.lock().unwrap().get_or_insert(Instant::now());
+            }
+        },
+    )));
+    for ch in 0..CHANNELS {
+        rt.block_on(rx_server.subscribe(ch, &format!("TX {}", ch + 1), &plugin_name));
+    }
+    let mut cbuf = vec![0 as Sample; capture.period_size * CHANNELS];
+    let mut capture_for = |d: Duration, playback: Option<(&Pcm, &[Sample])>| {
+        let end = Instant::now() + d;
+        while Instant::now() < end {
+            let r = capture.read(&mut cbuf);
+            assert!(
+                r >= 0 || r == -(libc::EPIPE as i64),
+                "snd_pcm_readi failed: {r}"
+            );
+            if let Some((pcm, buf)) = playback {
+                while pcm.write(buf) > 0 {}
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    // silence flowing from the capture-only device
+    let deadline = Instant::now() + ROUTING_TIMEOUT;
+    while received.load(Ordering::Relaxed) < SAMPLE_RATE as usize / 2 && Instant::now() < deadline {
+        capture_for(Duration::from_millis(20), None);
+    }
+    assert!(
+        received.load(Ordering::Relaxed) >= SAMPLE_RATE as usize / 2,
+        "no flow from the capture-only device"
+    );
+
+    // samples received during `d` must keep up with real time (the receiver only counts while a flow is alive)
+    let assert_flowing = |what: &str, before: usize, d: Duration| {
+        let got = received.load(Ordering::Relaxed) - before;
+        let expected = (d.as_secs_f64() * SAMPLE_RATE as f64) as usize;
+        assert!(
+            got > expected * 8 / 10,
+            "{what}: received {got} samples in {d:?}, expected ~{expected}"
+        );
+    };
+
+    // the application starts playing too
+    let playback = Pcm::open(&config, SND_PCM_STREAM_PLAYBACK, 85_333);
+    let pbuf = vec![TX_PATTERN; playback.period_size * CHANNELS];
+    let started = Instant::now();
+    let before = received.load(Ordering::Relaxed);
+    playback.prepare();
+    while playback.write(&pbuf) > 0 {}
+    playback.start_if_prepared();
+    capture_for(Duration::from_millis(1500), Some((&playback, &pbuf)));
+    assert_flowing("while switching to playback", before, started.elapsed());
+    let audio_after = first_pattern.lock().unwrap().map(|t| t - started);
+    log::info!("playback audio received after {audio_after:?}");
+    let audio_after = audio_after.expect("receiver never got the played audio");
+    assert!(
+        audio_after < Duration::from_millis(500),
+        "played audio arrived after {audio_after:?}"
+    );
+
+    // the application stops playing but keeps capturing
+    drop(playback);
+    let stopped = Instant::now();
+    let before = received.load(Ordering::Relaxed);
+    capture_for(Duration::from_millis(1500), None);
+    assert_flowing("after closing playback", before, stopped.elapsed());
+
+    drop(capture);
+    rt.block_on(rx_server.shutdown());
+}
