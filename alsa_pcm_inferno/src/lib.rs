@@ -13,7 +13,7 @@ use inferno_aoip::utils::run_future_in_new_thread;
 use itertools::Itertools;
 use lazy_static::lazy_static;
 use libc::{c_char, c_int, c_void, eventfd, EFD_CLOEXEC, EFD_NONBLOCK, EPIPE, POLLIN, POLLOUT};
-use log::{debug, error, warn};
+use log::{debug, error, trace, warn};
 use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::mem::zeroed;
@@ -374,7 +374,8 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
             } else {
                 error!("failed to send start timestamp: start_time_tx already used, BUG");
             }*/
-            warn!("looks like app is calling plugin_pointer before clock is valid, returning 0");
+            // the stream is prepared but not started yet (e.g. the application fills the buffer first)
+            trace!("plugin_pointer before the stream started, returning 0");
         }
         if now_samples_opt.is_some() && this.start_time.is_some() {
             (now_samples_opt.unwrap() as usize).wrapping_sub(this.start_time.unwrap())
