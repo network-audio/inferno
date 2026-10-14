@@ -299,6 +299,7 @@ If you want to contribute but can't code or don't know where to start because th
 * playback: samples are no longer overwritten before they're transmitted, and silence (not the stale buffer) is transmitted when the application falls behind or stops
 * receiving: no audio from the previous buffer cycle while a transmitter stalls, late packets (e.g. queued while the receiver was stalled) are dropped instead of landing on positions about to be read
 * answers controllers' clock status, settings status (AES67, sample rate, encoding, pull-up, codec, lock) and interface statistics queries, so that e.g. netaudio doesn't wait for them to time out; fixed heartbeat record length
+* heartbeats report late packets per receive flow (cumulative), like Dante hardware, as the advertised late packet monitoring capability promises
 * receive channels are silenced when their flow is removed (unsubscribed, transmitter gone) even if the flow's socket is removed first, instead of keeping the last audio; no more "BUG: still have N channels" error
 * draining playback (e.g. aplay at the end of a file) is no longer logged as an xrun
 * RX channels are listed even without a running receiver (playback-only devices weren't usable from netaudio 0.4)
@@ -366,7 +367,7 @@ likely in order they'll be implementated
 At this point, Inferno will roughly become alternative to Dante Virtual Soundcard.
 
 * realtime thread priorities configurable
-* report late packets in DC
+* verify the late packets reported in heartbeats show up in Dante Controller
 * operation without PTP daemon with lower clock precision - useful for OSes other than Linux
 * read configuration from text files
 * ability to work as a clock source (PTPv1 leader) - Statime

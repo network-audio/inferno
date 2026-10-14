@@ -10,7 +10,7 @@ use crate::{common::*, media_clock::MediaClock};
 
 use std::io::ErrorKind::WouldBlock;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicI32, AtomicUsize};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize};
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -50,6 +50,7 @@ struct SocketData<P: ProxyToSamplesBuffer> {
   channels: Vec<Option<Channel<P>>>,
   empty_sinks_vecs: Vec<Vec<RBInput<Sample, P>>>,
   actual_latency_samples: Arc<AtomicI32>,
+  late_packets: Arc<AtomicU32>,
 }
 
 struct SilenceWriter<P: ProxyToSamplesBuffer> {
@@ -225,6 +226,7 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
             let stride = num_channels * sd.bytes_per_sample;
             let samples_count = audio_bytes.len() / stride;
             //info!("first byte = {}, assuming {} samples in {} channels", buf[0], samples_count, num_channels);
+            let mut dropped_late = false;
             for (i, ch) in sd.channels.iter_mut().enumerate() {
               if let Some(ch) = ch {
                 // Too late, the reader is already past it. Writing it would only risk landing (modulo the
@@ -232,6 +234,7 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
                 if now_opt
                   .is_some_and(|now| packet_is_late(now, timestamp, ch.latency_samples, samples_count))
                 {
+                  dropped_late = true;
                   continue;
                 }
                 let ts = timestamp.wrapping_add_signed(ch.timestamp_shift);
@@ -252,6 +255,9 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
                   };
                 });
               }
+            }
+            if dropped_late {
+              sd.late_packets.fetch_add(1, Ordering::Relaxed);
             }
             //(sd.callback)(src, &buf[..recv_size]);
           }
@@ -570,6 +576,8 @@ pub struct FlowInfo {
   pub channels_map: Vec<BoolVec>,
   pub latency_samples: u32,
   pub actual_latency_samples: Arc<AtomicI32>,
+  /// packets dropped because they arrived after their playout time, since the flow was added
+  pub late_packets: Arc<AtomicU32>,
 }
 
 pub struct FlowsReceiver<P: ProxyToSamplesBuffer> {
@@ -677,11 +685,13 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
       .collect_vec();
     let port = socket.local_addr().unwrap().port();
     let als: Arc<AtomicI32> = Arc::new(0.into());
+    let late_packets: Arc<AtomicU32> = Arc::new(0.into());
     self.flows_info.write().unwrap()[local_index] = Some(FlowInfo {
       rx_port: port,
       channels_map: (0..channels_count).map(|_| boolvec![false; self.max_channels]).collect(),
       latency_samples: latency_samples.try_into().unwrap(),
       actual_latency_samples: als.clone(),
+      late_packets: late_packets.clone(),
     });
     self
       .commands_sender
@@ -697,6 +707,7 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
           channels: (0..channels_count).map(|_| None).collect(),
           empty_sinks_vecs,
           actual_latency_samples: als,
+          late_packets,
         },
       })
       .await
@@ -843,6 +854,68 @@ mod tests {
     rx.shutdown().await;
     rx_thread.join().unwrap();
     assert_eq!(left, 0, "{left} samples of the last audio left in the buffer");
+  }
+
+  /// Packets dropped because they arrived after their playout time are counted per flow, once per packet.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn late_packets_are_counted_per_flow() {
+    use crate::device_server::settings::Settings;
+    use crate::device_server::AtomicSample;
+    use crate::ring_buffer::{shared_from_external, ExternalBufferParameters};
+    use crate::util::real_time_box_channel;
+    use std::collections::BTreeMap;
+
+    const RATE: usize = 48000;
+    let mut config = BTreeMap::new();
+    config.insert("SAMPLE_RATE".to_string(), RATE.to_string());
+    let mut settings =
+      Settings::new("flows_rx_late", "flows_rx_late", Some(std::net::Ipv4Addr::LOCALHOST), &config);
+    settings.make_rx_channels(2);
+    let overlay =
+      ClockOverlay { clock_id: 1 /* CLOCK_MONOTONIC */, last_sync: 0, shift: 0, freq_scale: 0.0 };
+    let (clock_tx, clock_rx) = real_time_box_channel::channel(Box::new(None));
+    clock_tx.send(Box::new(Some(overlay)));
+    let (rx, rx_thread) = FlowsReceiver::start(
+      Arc::new(settings.self_info.clone()),
+      clock_rx,
+      Instant::now(),
+      StreamAnchor::new_started(0),
+      Arc::new(AtomicUsize::new(usize::MAX)),
+      None,
+    );
+
+    let buffers: Vec<Arc<Vec<AtomicSample>>> =
+      (0..2).map(|_| Arc::new((0..4096).map(|_| AtomicSample::new(0)).collect())).collect();
+    let valid = Arc::new(RwLock::new(true));
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    socket.set_nonblocking(true).unwrap();
+    rx.add_socket(0, UdpSocket::from_std(socket), false, 3, 2, 480, Arc::new(AtomicUsize::new(0))).await;
+    for (ch, buffer) in buffers.iter().enumerate() {
+      let params =
+        unsafe { ExternalBufferParameters::new(buffer.as_ptr(), buffer.len(), 1, valid.clone(), None) };
+      rx.connect_channel(0, ch, ch, RBInput::new(shared_from_external(&params, 0), 100)).await;
+    }
+    let late_packets = rx.flows_info.read().unwrap()[0].as_ref().unwrap().late_packets.clone();
+
+    let mut clock = MediaClock::new(false);
+    clock.update_overlay(overlay);
+    let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let send = |timestamp: usize| {
+      let mut packet = vec![0u8; 9 + 32 * 2 * 3];
+      packet[1..5].copy_from_slice(&((timestamp / RATE) as u32).to_be_bytes());
+      packet[5..9].copy_from_slice(&((timestamp % RATE) as u32).to_be_bytes());
+      sender.send_to(&packet, ("127.0.0.1", port)).unwrap();
+    };
+    let now = || clock.wrapping_now_in_timebase(RATE as u64).unwrap() as usize;
+    send(now()); // in time
+    send(now() - RATE); // a second late
+    send(now() - RATE / 2);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let counted = late_packets.load(Ordering::Relaxed);
+    rx.shutdown().await;
+    rx_thread.join().unwrap();
+    assert_eq!(counted, 2, "late packets counted");
   }
 
   #[test]

@@ -229,17 +229,13 @@ impl<'s> Multicaster<'s> {
             opt.as_ref().map(|fi| fi.actual_latency_samples.swap(0, Ordering::Relaxed)).unwrap_or(0);
           bytes.write_u32(latency.clamp(0, i32::MAX) as u32);
         }
-      }
 
-      /* bytes.write_bytes(&[
-        0x00, 0x1c, 0x80, 0x04,
-        0x00, 0x04, 0x00, 0x10,  H(ctr), L(ctr), 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-      ]); */
-      /*
-      0x00, 0x1c, 0x80, 0x04, 0x00, 0x04, 0x00, 0x10, 0x17, 0x0f, 0x00, 0x00,
-      0x00, 0x02, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, missed packets, 4B: 0x00, 0x03, 0x90, 0x1e, 0x00, 0x00, 0x00, 0x00
-       */
+        let late_packets = flows_info
+          .iter()
+          .map(|opt| opt.as_ref().map(|fi| fi.late_packets.load(Ordering::Relaxed)).unwrap_or(0))
+          .collect::<Vec<_>>();
+        write_late_packets_record(&mut bytes, ctr, &late_packets);
+      }
       if !self.had_clock {
         debug!("clock appeared");
       }
@@ -564,6 +560,27 @@ fn clock_status_content(
 }
 
 /// Heartbeat record 0x8002 with metering peaks, padded to a multiple of 4 bytes. Nothing if there are no peaks.
+/// Per receive flow: packets dropped because they arrived after their playout time, cumulative.
+fn write_late_packets_record(bytes: &mut ByteBuffer, ctr: u16, late_packets: &[u32]) {
+  if late_packets.is_empty() {
+    return;
+  }
+  let flows_count = late_packets.len() as u16;
+  bytes.write_u16(20 + flows_count * 4);
+  bytes.write_u16(0x8004);
+  bytes.write_u16(4);
+  bytes.write_u16(8 + flows_count * 4); // content length
+  bytes.write_u16(ctr);
+  bytes.write_u16(0);
+  bytes.write_u16(flows_count);
+  bytes.write_u16(0); // first flow index
+  bytes.write_u16(20); // offset of the counters
+  bytes.write_u16(0);
+  for &count in late_packets {
+    bytes.write_u32(count);
+  }
+}
+
 fn write_peaks_record(bytes: &mut ByteBuffer, ctr: u16, tx_peaks: &[u8], rx_peaks: &[u8]) {
   let total_peaks = rx_peaks.len() + tx_peaks.len();
   if total_peaks == 0 {
@@ -717,6 +734,27 @@ mod tests {
 
   /// Real AVIO interface statistics reply (netaudio fixture `interface_statistics`): 100 Mb/s, rates and errors.
   const AVIO_INTERFACE_STATISTICS: &str = "ffff00589ed40000001dc1fffe50368b417564696e6174650738004000000000000100240010000000140000000000010000000000000000000000030001002800085fd80009926d00000000000000000000000100000064";
+
+  /// Late packets record of a real device heartbeat (2 flows), as controllers parse it: count, first flow index,
+  /// offset of the per-flow cumulative counters.
+  #[test]
+  fn late_packets_record_layout_matches_real_device() {
+    let mut bytes = ByteBuffer::new();
+    bytes.set_endian(bytebuffer::Endian::BigEndian);
+    write_late_packets_record(&mut bytes, 0x170f, &[0x0003901e, 0]);
+    assert_eq!(
+      hex::encode(bytes.as_bytes()),
+      // length, type, ?, content length, sequence; flows, first, offset; counters
+      [
+        "001c", "8004", "0004", "0010", "170f", "0000", "0002", "0000", "0014", "0000", "0003901e",
+        "00000000"
+      ]
+      .concat()
+    );
+    let mut none = ByteBuffer::new();
+    write_late_packets_record(&mut none, 1, &[]);
+    assert!(none.as_bytes().is_empty(), "no record without flows");
+  }
 
   #[test]
   fn interface_statistics_reply_layout_matches_real_device() {
