@@ -21,7 +21,7 @@ If you don't want to change anything outside your `$HOME`, you can set ALSA envi
 
 This plugin is entirely user-space and contained in a library. It means that the Dante device is emulated only while the ALSA device is open in an application and certainly can't outlive the process.
 
-Stopping and restarting a stream (transport stop/start, xrun recovery: `snd_pcm_drop`/`snd_pcm_prepare`/`snd_pcm_start`) keeps the Dante device, its flows and subscriptions running: captured audio resumes within about the receive latency, transmitted audio as soon as the application has refilled its buffer. While the stream is stopped, silence is transmitted. Only closing the device (or changing its buffer configuration) tears it down: next time it is opened, audio flows have to be established again, which takes a few seconds during which silence is played or recorded.
+Stopping and restarting a stream (transport stop/start, xrun recovery: `snd_pcm_drop`/`snd_pcm_prepare`/`snd_pcm_start`) keeps the Dante device, its flows and subscriptions running: captured audio resumes within about the receive latency, transmitted audio as soon as the application has refilled its buffer. While the stream is stopped, silence is transmitted. Changing the buffer configuration (`snd_pcm_hw_params`) switches to the new buffers without interrupting flows either. Only closing the device tears it down: next time it is opened, audio flows have to be established again, which takes a few seconds during which silence is played or recorded.
 
 So the Inferno ALSA PCM is best kept open. The easiest way of ensuring this is using an audio server, for example [JACK](https://jackaudio.org/) or [PipeWire](https://www.pipewire.org/) (see script [`start_pipewire_sink`](start_pipewire_sink)), making sure that automatic suspending of audio device is disabled (or, to save energy, set to a timeout long enough that it won't be annoying). DAWs (e.g. [Ardour](https://ardour.org/), see [below](#daws), [BespokeSynth](https://www.bespokesynth.com/), NOT Audacity) also keep the audio interface open while running.
 
@@ -77,8 +77,8 @@ Tested with [Ardour](https://ardour.org/) 8.12 (ALSA backend; tests ran headless
 | [PipeWire](https://pipewire.org/) | 1.2.7 | ✅ OK  | needs [service patch](../os_integration/systemd_allow_clock.conf) if launched by systemd |
 | [spotifyd](https://github.com/Spotifyd/spotifyd) | ... | ✅ OK  | [source](https://gist.github.com/scientress/b7fd79ac761a8574842b96f15696c2b7) |
 | 🔒 HQPlayer | ... | ❔ maybe fixed? | [didn't work](https://github.com/teodly/inferno/issues/9), maybe fixed together with JACK? |
-| [JACK](https://jackaudio.org/) | 1.9.22 | ✅❔ experimental | part of containerized automated test; xruns recover without losing Dante subscriptions |
-| [Ardour](https://ardour.org/) | 8.12 | ✅❔ experimental | see [DAWs](#daws): needs a large enough buffer and manual latency compensation; tested headless, export not tested |
+| [JACK](https://jackaudio.org/) | 1.9.22 | ✅ OK | part of containerized automated test; xruns recover without losing Dante subscriptions |
+| [Ardour](https://ardour.org/) | 8.12 | ✅ OK | see [DAWs](#daws): needs a large enough buffer and manual latency compensation; tested headless, export not tested |
 | Audacity | <= 3.5.1        | ✖ WONTFIX | does not support S32 samples so no zero-copy buffers |
 
 🔒 - non-FOSS apps, discouraged by Inferno developers
