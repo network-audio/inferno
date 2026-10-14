@@ -53,33 +53,44 @@ Big thanks to [Project Pendulum](https://github.com/pendulum-project) (by [Trife
 
 ## Quirks, read it before using:
 * Dante protocol is undocumented. Everything was reverse-engineered or based on other reverse-engineering projects. Some things in implementation were guessed. So while it works with my setup, it may not work with yours.
-* Collisions with NTP clock synchronization have been noticed. The built-in clock filter is insufficient. [Fixing it properly is complicated.](https://github.com/pendulum-project/statime/issues/389#issuecomment-2214559362) If your network interface supports hardware timestamping, you may be able to workaround it using `/dev/ptp0` as [`CLOCK_PATH`](#configuration) and a [PTP daemon that does not use global system clock](https://gitlab.freedesktop.org/pipewire/pipewire/-/wikis/AES67#setting-up-ptp-time-sync), but you need to enable PTPv2 (AES67) in one of Dante devices then because ptp4l is not compatible with PTPv1.
+* Collisions with NTP clock synchronization have been noticed. Our Statime configuration uses `virtual-system-clock-base = "monotonic_raw"`, which should avoid them, but this fix is young (see [Software timestamping](#software-timestamping)). The built-in clock filter is insufficient. [Fixing it properly is complicated.](https://github.com/pendulum-project/statime/issues/389#issuecomment-2214559362) If your network interface supports hardware timestamping, you may be able to workaround it using `/dev/ptp0` as [`CLOCK_PATH`](#configuration) and a [PTP daemon that does not use global system clock](https://gitlab.freedesktop.org/pipewire/pipewire/-/wikis/AES67#setting-up-ptp-time-sync), but you need to enable PTPv2 (AES67) in one of Dante devices then because ptp4l is not compatible with PTPv1.
   * to fix this in Statime, [PHC-only mode](https://github.com/pendulum-project/statime/issues/517) needs to be implemented for hardware timestamps, and [CLOCK_MONOTONIC-based virtual clock with arbitrary timescale](https://github.com/pendulum-project/statime/issues/389) for software timestamps
 * Inferno2pipe is clocked by incoming media flows. When nothing is connected, "time will stop" (i.e. recording will pause) until something is connected again - silence won't be generated unless at least one channel is connected.
 
 
 # Quick start
-1. [Install Rust](https://rustup.rs/)
-2. If using a firewall, open UDP ports: 4455, 8700, 4400, 8800 (or others if [`INFERNO_ALT_PORT`](#environment-variables) is specified), 5353. Also, allow incoming UDP traffic from possible transmitters (port numbers are allocated by the OS so can't be known beforehand)
-3. Ensure that seccomp, SELinux or other kernel-level security mechanisms are not blocking clock-related syscalls. For example, if you want to use `alsa_pcm_inferno` together with PipeWire, and PipeWire service is managed by systemd, copy [`os_integration/pipewire/systemd_allow_clock.conf`](os_integration/pipewire/systemd_allow_clock.conf) to `$HOME/.config/systemd/user/pipewire.service.d/override.conf` (or, if already exists, append it)
-4. <s>If wanting to use anything other than Inferno2pipe,</s> clock synchronization daemon is needed. Inferno is compatible with modified [Statime](https://github.com/pendulum-project/statime):
-   * currently, Statime is always needed, even for just capturing audio, but it is not by design and will be fixed
-   * `git clone --recurse-submodules -b inferno-dev https://github.com/teodly/statime`
-   * `cd statime && cargo build`
-   * adjust network interface in `inferno-ptpv1.toml`
-   * `sudo target/debug/statime -c inferno-ptpv1.toml`
-   * Disable global system time synchronization while Inferno is in use (`systemctl stop chronyd.service`)
-     * Experimental clock guard has been added to our fork of Inferno, so if you're brave, you can skip it.
-5. Clone this repo with `--recursive` option (some dependencies are in submodules)
-6. `cd` to the desired program/library directory
-   * simple command line audio recorder: [`Inferno2pipe`](inferno2pipe/README.md)
-   * virtual soundcard for ALSA: [`alsa_pcm_inferno`](alsa_pcm_inferno/README.md) - also works with PipeWire, JACK and DAWs (tested with Ardour)
-7. If using `alsa_pcm_inferno`, install alsa dev libraries.
-   * `sudo apt install libasound2-dev` on Debian/Ubuntu/Mint
-   * `pacman -S alsa-lib` on Arch
-   * `dnf install alsa-lib-devel` on Fedora/Centos
-8. `cargo build`
-9. Follow the instructions in README of the specific program/library
+For the virtual soundcard (`alsa_pcm_inferno`), on Linux:
+
+1. **Prerequisites:** [Rust](https://rustup.rs/), git and the ALSA development files:
+   * Debian/Ubuntu/Mint: `sudo apt install libasound2-dev pkg-config`
+   * Fedora/CentOS: `sudo dnf install alsa-lib-devel`
+   * Arch: `sudo pacman -S alsa-lib`
+2. **Clock:** Inferno follows the Dante network's PTP clock through a PTP daemon, also when only capturing. Build our fork of [Statime](https://github.com/pendulum-project/statime) (it speaks PTPv1, which Dante devices use):
+   ```
+   git clone --recurse-submodules -b inferno-dev https://github.com/teodly/statime
+   cd statime && cargo build --release && sudo install target/release/statime /usr/local/bin/
+   ```
+   See [Clocking options](#clocking-options) for hardware timestamping and PTPv2.
+3. **Install:** clone this repository with `--recursive` (some dependencies are submodules) and run the installer in it, naming the network interface connected to the Dante network:
+   ```
+   git clone --recursive https://gitlab.com/lumifaza/inferno.git
+   cd inferno && ./install.sh --statime eth0 --pipewire
+   ```
+   It installs the ALSA plugin where your alsa-lib looks for plugins, defines the ALSA device `inferno` (`/etc/alsa/conf.d/50-inferno.conf`), installs `inferno-doctor` and, with `--statime IFACE`, starts Statime as the `inferno-statime` service. `--pipewire` adds an Inferno sink and source to PipeWire, restart PipeWire afterwards. Leave out what you don't need; `./install.sh --help` lists the options, `--uninstall` removes everything again.
+4. **Check:** `inferno-doctor` checks the plugin, the settings, the clock, the network ports and realtime permissions, and says what to fix. Run it as the user of the audio application (e.g. PipeWire).
+5. **Use:** the ALSA device `inferno`, e.g. `aplay -D inferno ...`, `jackd -dalsa -dinferno -p1024 -n4`, or PipeWire's "Inferno (Dante)" sink and source. It appears on the network while an application has it open: route its channels with Dante Controller or [netaudio](https://github.com/chris-ritsen/network-audio-controller). See [`alsa_pcm_inferno`](alsa_pcm_inferno/README.md) for buffer sizes, DAWs and channel counts, and [Configuration](#configuration) for its settings.
+
+For capturing to a file without an audio stack, see [`Inferno2pipe`](inferno2pipe/README.md) (`cargo build --release -p inferno2pipe`).
+
+**Firewall:** allow incoming UDP 4440, 8800, 4455 and 8700 (or `ALT_PORT` to `ALT_PORT+3`), 5353 (mDNS), 4321 (multicast audio), 319 and 320 (PTP), and audio flows from transmitters (their ports are chosen by the operating system, so can't be known beforehand).
+
+**Security frameworks:** seccomp, SELinux and similar must not block clock-related syscalls. For PipeWire run by systemd, `install.sh --pipewire` installs the needed override ([`os_integration/pipewire/systemd_allow_clock.conf`](os_integration/pipewire/systemd_allow_clock.conf), as `~/.config/systemd/user/pipewire.service.d/inferno-clock.conf`).
+
+**Several devices on one computer** (e.g. two applications each opening their own device): give each one its own `NAME`, `PROCESS_ID` and `ALT_PORT` (at least 10 apart), see [Settings](#settings).
+
+**Resetting a device:** subscriptions, channel names and multicast flows are saved in `~/.local/state/inferno_aoip/<device ID>`; delete that directory while the device isn't open. `inferno-doctor` shows the path.
+
+**Without the installer:** copy `target/release/libasound_module_pcm_inferno.so` into alsa-lib's plugin directory (`$(pkg-config --variable=libdir alsa)/alsa-lib`) and add the device from [`alsa_pcm_inferno/asoundrc`](alsa_pcm_inferno/asoundrc) to `~/.asoundrc`. Run Statime with `sudo statime -c inferno-ptpv1.toml`, after setting the network interface in that file.
 
 ## Cross compiling
 If you want to use Inferno on Raspberry Pi or other single-board computer, it is usually faster to compile on your desktop/server/laptop (*host*) and copy resulting binaries to the *target*. Also, you will not run out of SD card space or RAM.
@@ -100,7 +111,7 @@ If you need to compile for a different architecture, add it to `Cargo.toml` (cop
 
 
 ## Do you prefer Docker?
-This won't work with usual desktop system usage, but if you are packaging an audio application using ALSA, into a Docker container, we've got you covered! See the directory `test/containerized_trx` for inspiration.
+This won't work with usual desktop system usage, but if you are packaging an audio application using ALSA, into a Docker container, we've got you covered! See the directory `test/dockerized_trx` for inspiration (its Fedora image is installed with `install.sh --prebuilt`).
 
 Remember that:
 * Clock synchronization is still your responsibility. I didn't want to complicate the base image with service management so PTP daemon is not included. `usrvclock-rs` requires the sockets path (including client sockets) to be the same for all containers so a shared volume for `/tmp` is required. Future versions may include Statime as a separate container.
@@ -223,8 +234,10 @@ Be aware that Inferno queries the clock pretty often, which may put more load on
 # Configuration
 Configuration can be set via:
 
-* environment variables - add `INFERNO_` prefix to the setting name
-* ALSA plugin configuration - it is recommended to specify them in your `asoundrc` because too long ALSA device string may be truncated (happens with PipeWire, not sure about other apps)
+* ALSA plugin configuration - in the `pcm` device definition (e.g. `/etc/alsa/conf.d/50-inferno.conf` or `~/.asoundrc`), or as arguments of the device name (`inferno:RX_CHANNELS=8`); prefer the definition, because too long ALSA device strings may be truncated (happens with PipeWire, not sure about other apps)
+* environment variables - add `INFERNO_` prefix to the setting name, e.g. `INFERNO_BIND_IP=eth0`
+
+The ALSA configuration wins over environment variables. Names are case-insensitive. An invalid value fails opening the device with a message saying what is accepted (instead of crashing the application); unknown names are reported as warnings (misspelt?). `inferno-doctor` checks the settings an application would get.
 
 ## Settings
 All settings have default values. In a simple setup you should be able to start without specifying any parameters.
@@ -232,17 +245,30 @@ All settings have default values. In a simple setup you should be able to start 
 * `DEVICE_ID` - 16 hexadecimal digits (8 bytes) used as a device ID. Dante devices usually use MAC address padded with zeros. Inferno uses `0000<IP address>0000` by default. Device ID is the storage key when saving state.
 * `NAME` - name of advertised device. If unspecified, name based on app name and IP address will be generated. May be removed in future versions when it becomes settable from DC and so stored in a configuration file.
 * `SAMPLE_RATE` - sample rate this device will operate on
-* `PROCESS_ID` - integer number between 0 and 65535. Must be provided and unique when starting multiple instances on a single IP address. Specifying different `DEVICE_ID`s is not sufficient.
+* `PROCESS_ID` - integer number between 0 and 65535. Must be provided and unique when starting multiple instances on a single IP address. Specifying different `DEVICE_ID`s is not sufficient. Devices with the same `DEVICE_ID` (by default: IP address and `PROCESS_ID`) opened in one process are the same device, with the settings of the first one opened.
 * `ALT_PORT` - start of the range of UDP ports used by socket listeners. If not specified, standard Dante ports as seen in hardware devices will be used. Must be provided when starting multiple instances on a single IP address. Currently 4 ports are used (`ALT_PORT` to `ALT_PORT+3`) but it may change in the future, so better separate different instances by at least 10 ports.
-* `RX_CHANNELS` - number of receive channels, defaults to 2, will be overwritten by the application if it supports changing channels count.
-* `TX_CHANNELS` - number of transmit channels, defaults to 2, will be overwritten by the application if it supports changing channels count.
+* `RX_CHANNELS` - number of receive channels, defaults to 2. The ALSA plugin offers exactly this many capture channels; applications built on `inferno_aoip` may set their own count.
+* `TX_CHANNELS` - number of transmit channels, defaults to 2. The ALSA plugin offers exactly this many playback channels.
 * `RX_LATENCY_NS` - receive latency in nanoseconds, i.e. how much time to wait for media packets, relatively to PTP media clock. Equivalent to latency setting in Dante Controller. Defaults to 10ms. May be removed in future versions when it becomes settable from DC and so stored in a configuration file.
 * `TX_LATENCY_NS` - transmit latency in nanoseconds, i.e. receive latency that this device will demand from devices receiving from us. Equivalent to latency setting in Dante Virtual Soundcard. Defaults to 10ms.
 * `TX_SOURCE_BIT_DEPTH` - bit depth of the audio applications transmit (16, 24 or 32, default 32). When it's higher than the bit depth sent over the network (24 bits), the transmitted audio is dithered. Set it to 24 for bit-exact transmission of 24-bit audio.
-* `CLOCK_PATH` - path to either [usrvclock](https://gitlab.com/lumifaza/usrvclock) socket, or PTP device. If the latter, make sure [you are allowed](https://gitlab.freedesktop.org/pipewire/pipewire/-/blob/78642cc53bd84c2ad529f2175cc50a658d1e52c0/src/daemon/90-pipewire-aes67-ptp.rules) to read it. Also, write permissions are required if you want to see actual frequency offset in DC. (the clock is never adjusted from within Inferno, but the syscall to read the frequency requires write access)
+* `CLOCK_PATH` - path to either [usrvclock](https://gitlab.com/lumifaza/usrvclock) socket (default `/tmp/ptp-usrvclock`, where Statime creates it), or PTP device. If the latter, make sure [you are allowed](https://gitlab.freedesktop.org/pipewire/pipewire/-/blob/78642cc53bd84c2ad529f2175cc50a658d1e52c0/src/daemon/90-pipewire-aes67-ptp.rules) to read it. Also, write permissions are required if you want to see actual frequency offset in DC. (the clock is never adjusted from within Inferno, but the syscall to read the frequency requires write access)
+* `USE_SAFE_CLOCK` - not supported yet, must be `false` (the default).
+
+ALSA plugin only:
+* `DISABLE_POLLFD` - `1` disables the file descriptor the plugin uses to wake applications after each period. Some applications (e.g. SoX) don't work without it, so it is enabled by default.
+* `USE_FLOWS_CLOCK` - `1` reports the capture position from the receiver's progress instead of the media clock.
 
 
 # Audio stability tips
+
+## Allow realtime priority
+Inferno's audio threads ask for realtime (SCHED_FIFO) priority 80-81 and warn if they don't get it; without it, other load causes dropouts. Allow it for the user (or a group like `audio`) running the audio application, e.g. in `/etc/security/limits.conf`:
+
+    @audio - rtprio 95
+    @audio - memlock unlimited
+
+then log in again. PipeWire users usually get it via RTKit or the `pipewire` group. `inferno-doctor` checks it.
 
 ## Set appropriate latency
 
@@ -257,7 +283,7 @@ You can also add some artificial system load:
 In cyclictest output, the last column is the worst-case latency in microseconds. Multiply it by 1000, add some margin and time for network transfer and you get the lowest safe value for `TX_LATENCY_NS` and `RX_LATENCY_NS`. If the values are higher than your acceptable latency, you will have hard time using Inferno (and computer audio in general). Also keep in mind that the maximum latency that Dante officially allows is 40ms. You can try to follow tutorials to make latency more predictable:
 
 * [Professional audio @ Arch wiki](https://wiki.archlinux.org/title/Professional_audio) (not just for Arch)
-* [Performance tuning @ PipeWire wiki](https://wiki.archlinux.org/title/Professional_audio)
+* [Performance tuning @ PipeWire wiki](https://gitlab.freedesktop.org/pipewire/pipewire/-/wikis/Performance-tuning)
 * [Fedora Pipewire Low Latency Audio Configuration Reference Guide](https://linuxmusicians.com/viewtopic.php?t=27121) (Fedora-specific)
 * isolate CPU cores using `isolcpus` [or `cset`](https://unix.stackexchange.com/a/692558) and pin audio processes and network card IRQ to the isolated cores
 * if nothing else helps, try `PREEMPT_RT` kernel
@@ -300,6 +326,10 @@ If you want to contribute but can't code or don't know where to start because th
 * receiving: no audio from the previous buffer cycle while a transmitter stalls, late packets (e.g. queued while the receiver was stalled) are dropped instead of landing on positions about to be read
 * answers controllers' clock status, settings status (AES67, sample rate, encoding, pull-up, codec, lock) and interface statistics queries, so that e.g. netaudio doesn't wait for them to time out; fixed heartbeat record length
 * heartbeats report late packets per receive flow (cumulative), like Dante hardware, as the advertised late packet monitoring capability promises
+* setup: `install.sh` installs the ALSA plugin and device (optionally PipeWire nodes and the Statime clock service); `inferno-doctor` checks the setup and says what to fix
+* invalid settings fail opening the device with a message naming the setting, instead of crashing the application; misspelt settings are warned about; the ALSA plugin's own settings also work as `INFERNO_*` variables
+* a missing clock is reported, with what is wrong at `CLOCK_PATH`; a device that can't get its network ports (e.g. used by another device) fails to start with an error naming them, instead of running invisible to controllers
+* the ALSA plugin and Inferno2pipe log at `info` by default (was `debug`)
 * receive channels are silenced when their flow is removed (unsubscribed, transmitter gone) even if the flow's socket is removed first, instead of keeping the last audio; no more "BUG: still have N channels" error
 * draining playback (e.g. aplay at the end of a file) is no longer logged as an xrun
 * RX channels are listed even without a running receiver (playback-only devices weren't usable from netaudio 0.4)
@@ -375,7 +405,7 @@ At this point, Inferno will roughly become alternative to Dante Virtual Soundcar
 * add more apps and Linux distributions to the integration test
 * bit-perfect transmitter (32-bit integers are always used internally; TX dithering for 16-bit and 24-bit output is configurable via `TX_SOURCE_BIT_DEPTH`)
 * command line helper / TUI / GUI
-* installer script, with cross compilation support
+* installer support for cross-compiled builds (`install.sh --prebuilt` installs a plugin built elsewhere)
 * more refactoring of network packets serializers & deserializers to make more code reusable in upcoming controller app (because DC is bloated closed source and bad UX)
 * AES67
 * primary & secondary network support, for dual-NIC computers

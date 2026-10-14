@@ -234,7 +234,7 @@ fn check_ports(report: &mut Report, settings: &Settings) {
     } else {
         report.warn(format!(
             "UDP {} in use on {}: fine if this device is open in an application right now; \
-             otherwise another device uses them, give each device its own ALT_PORT (at least 4 apart)",
+             otherwise another device uses them, give each device its own ALT_PORT (at least 10 apart)",
             busy.join(", "),
             info.ip_address
         ));

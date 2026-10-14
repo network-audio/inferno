@@ -82,7 +82,7 @@ impl std::fmt::Display for StartError {
     write!(
       f,
       "can't listen on UDP {} for {}: {}. Is another Inferno device (or Dante software) using it? Each device \
-       on a host needs its own ports: give them ALT_PORT values at least 4 apart.",
+       on a host needs its own ports: give them ALT_PORT values at least 10 apart.",
       self.addr, self.service, self.source
     )
   }

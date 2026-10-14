@@ -4,10 +4,8 @@
 
 # How to use
 
-1. Follow common instructions in [Quick start](../README.md#quick-start) to build `alsa_pcm_inferno` and start clock synchronization daemon.
-2. Copy (or symlink) `libasound_module_pcm_inferno.so` from `target/debug/` or `target/release/` directory to `/usr/lib64/alsa-lib/` (Fedora) or `/usr/lib/x86_64-linux-gnu/alsa-lib/` (Debian, Ubuntu). If using CPU architecture other than x86_64, the target directory will be different. `find /usr/lib* -type d -name alsa-lib` if unsure.
-3. Add `pcm.` device with type `inferno` to your `.asoundrc` (example [`asoundrc`](asoundrc))
-4. In the application there should be a place where usually device name is entered, e.g. `hw:1`. Enter the name of the device created in your `.asoundrc` there. If you've copied the example `asoundrc`, the name is just `inferno`.
+1. Follow the [Quick start](../README.md#quick-start): `./install.sh` builds and installs the plugin and defines the ALSA device `inferno` (from [`asoundrc`](asoundrc), as `/etc/alsa/conf.d/50-inferno.conf`), and a clock daemon must be running. `inferno-doctor` checks the setup.
+2. In the application there should be a place where usually device name is entered, e.g. `hw:1`. Enter `inferno` there (or the name of your own `pcm` device of type `inferno`). The device isn't listed by `aplay -L`, but opening it by name works.
 
 Making Dante<->analog converter, or Dante<->Dante bridge, or Dante<->AES67 bridge, at a fraction of the price of an off-the-shelf device, using an SBC and PipeWire, is left as an exercise for the reader.
 
