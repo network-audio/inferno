@@ -6,6 +6,7 @@ members = [
     "searchfire",
     "inferno2pipe",
     "alsa_pcm_inferno",
+    "inferno_doctor",
 ]
 
 [workspace.metadata.cross.target.aarch64-unknown-linux-gnu]

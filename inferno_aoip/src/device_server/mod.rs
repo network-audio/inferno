@@ -52,6 +52,7 @@ pub use crate::media_clock::{
 pub use crate::ring_buffer::{
   new_owned, ExternalBufferParameters, PositionReportDestination, RBInput, WrittenFrom,
 };
+pub use crate::state_storage::state_dir;
 pub use settings::{Settings, SettingsError};
 pub use stream_anchor::StreamAnchor;
 pub type AtomicSample = atomic::Atomic<Sample>;

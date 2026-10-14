@@ -17,11 +17,16 @@ pub struct StateStorage {
   path_prefix: String,
 }
 
+/// Where the device's state (subscriptions, channel names, multicast flows) is saved.
+pub fn state_dir(self_info: &DeviceInfo) -> String {
+  AppDirs::new(Some("inferno_aoip"), false).unwrap().state_dir.to_str().unwrap().to_owned()
+    + MAIN_SEPARATOR_STR
+    + &hex::encode(self_info.factory_device_id)
+}
+
 impl StateStorage {
   pub fn new(self_info: &DeviceInfo) -> Self {
-    let dir = AppDirs::new(Some("inferno_aoip"), false).unwrap().state_dir.to_str().unwrap().to_owned()
-      + MAIN_SEPARATOR_STR
-      + &hex::encode(self_info.factory_device_id);
+    let dir = state_dir(self_info);
     create_dir_all(&dir).log_and_forget();
     info!("using state directory: {dir}");
     Self { path_prefix: dir + MAIN_SEPARATOR_STR }

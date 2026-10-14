@@ -1,0 +1,17 @@
+[package]
+name = "inferno_doctor"
+version = "0.1.0"
+edition = "2021"
+description = "Checks the setup of an Inferno virtual soundcard"
+
+[[bin]]
+name = "inferno-doctor"
+path = "src/main.rs"
+
+[dependencies]
+alsa-sys-all = { path = "../alsa-sys-all" }
+inferno_aoip = { path = "../inferno_aoip" }
+usrvclock = { path = "../usrvclock-rs" }
+libc = "0.2.153"
+netdev = "0.32.0"
+tokio = { version = "1.36.0", features = ["rt", "time", "sync", "macros"] }
