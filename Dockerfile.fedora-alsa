@@ -18,7 +18,9 @@ FROM fedora:42
 
 RUN dnf install -y alsa-lib
 
-# TODO: what if not 64?
-COPY --from=builder /out/libasound_module_pcm_inferno.so /usr/lib64/alsa-lib/
-
-COPY alsa_pcm_inferno/asoundrc /etc/asound.conf
+# installed like users do (install.sh finds alsa-lib's plugin directory); also tests the installer
+COPY install.sh /opt/inferno/
+COPY alsa_pcm_inferno/asoundrc /opt/inferno/alsa_pcm_inferno/
+COPY os_integration /opt/inferno/os_integration
+COPY --from=builder /out/libasound_module_pcm_inferno.so /opt/inferno/
+RUN /opt/inferno/install.sh --prebuilt /opt/inferno/libasound_module_pcm_inferno.so

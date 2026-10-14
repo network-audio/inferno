@@ -1,0 +1,17 @@
+# Statime (teodly's fork, branch inferno-dev) configured as the media clock source for Inferno.
+# install.sh installs it as /etc/statime/inferno.toml with the interface filled in.
+loglevel = "info" # trace, debug, info, warn or error
+
+sdo-id = 0
+domain = 0
+priority1 = 251 # Dante hardware devices use 249 in PTPv2
+virtual-system-clock = true
+virtual-system-clock-base = "monotonic_raw"
+# the usrvclock socket Inferno reads the clock from (its CLOCK_PATH, default /tmp/ptp-usrvclock)
+usrvclock-export = true
+
+[[port]]
+interface = "@INTERFACE@" # the network interface connected to the Dante network
+network-mode = "ipv4"
+hardware-clock = "auto"
+protocol-version = "PTPv1"

@@ -1,0 +1,19 @@
+# The PTP daemon providing Inferno's media clock. install.sh installs it as
+# /etc/systemd/system/inferno-statime.service.
+[Unit]
+Description=Statime PTP clock for Inferno (Dante)
+Documentation=https://gitlab.com/lumifaza/inferno
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=@STATIME@ -c /etc/statime/inferno.toml
+Restart=on-failure
+RestartSec=5
+# As root: the daemon sends clock updates to sockets that applications create in /tmp with their own
+# user's permissions. The usrvclock socket must be in the /tmp applications see, so no PrivateTmp.
+PrivateTmp=no
+
+[Install]
+WantedBy=multi-user.target
