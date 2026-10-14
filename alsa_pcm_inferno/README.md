@@ -63,7 +63,7 @@ Tested with [Ardour](https://ardour.org/) 8.12 (ALSA backend; tests ran headless
 
 # Quirks
 
-* No matter whether the app does only capture, only playback or both, Inferno will always emulate both capture and playback device (unless number of channels is set to 0). If the app isn't playing audio, Dante devices receiving from Inferno will report broken stream (🚫 in Dante Controller) because, to save CPU, transmitting thread is not run at all then.
+* No matter whether the app does only capture, only playback or both, Inferno will always emulate both capture and playback device (unless number of channels is set to 0).
 * By default, only a single process can run Inferno because it listens on UDP sockets. To overcome this limitation, specify `INFERNO_ALT_PORT` which will be used as a start of the range of ports. Also specify `INFERNO_PROCESS_ID` and `INFERNO_NAME` (see [main README](../README.md#configuration) for details) to avoid non-unique identifiers (Dante Controller may suffer from double vision in such cases).
   * It is needed when using `alsa_in` and `alsa_out` together with JACK, because these are separate processes.
   * On the other hand, it is not needed when adding a single capture and a single playback device to PipeWire graph, because Inferno looks like a regular ALSA soundcard to PipeWire and it is handled within the PipeWire server itself.
