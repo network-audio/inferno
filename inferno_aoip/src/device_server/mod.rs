@@ -272,6 +272,7 @@ impl DeviceServer {
   /// Transmits from buffers owned by the caller (e.g. ALSA mmap areas), addressed relative to `anchor`.
   /// The stream may be paused (silence is sent) and re-anchored any number of times
   /// without restarting the transmitter.
+  /// Transmits from the given buffers. If already transmitting, switches to them without interrupting flows.
   pub async fn transmit_from_external_buffer(
     &mut self,
     tx_channels_buffers: Vec<ExternalBufferParameters<Sample>>,
@@ -283,7 +284,14 @@ impl DeviceServer {
       tx_channels_buffers.iter().map(|par| ring_buffer::wrap_external_source(par, 0)).collect();
     let rbs = rb_outputs.iter().map(|rbo| rbo.shared().clone()).collect_vec();
     *self.tx_peaks_supplier.write().unwrap() = Box::new(move || peaks_of_buffers(&rbs));
-    self.transmit(anchor, rb_outputs, current_timestamp, on_transfer).await;
+    if self.tx_shutdown_todo.is_some() {
+      // already transmitting: switch sources, keeping the flows (and receivers' subscriptions)
+      if let Some(flows_tx) = self.flows_tx.lock().await.as_ref() {
+        flows_tx.set_sources(rb_outputs, anchor, current_timestamp, on_transfer).await;
+      }
+    } else {
+      self.transmit(anchor, rb_outputs, current_timestamp, on_transfer).await;
+    }
   }
   async fn transmit<P: ProxyToSamplesBuffer + Send + Sync + 'static>(
     &mut self,

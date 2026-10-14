@@ -69,6 +69,20 @@ impl Flow {
   }
 }
 
+struct NewSources {
+  /// `Vec<RBOutput<Sample, P>>` of the transmitter's own buffer type (the command type isn't generic)
+  sources: Box<dyn std::any::Any + Send>,
+  anchor: StreamAnchor,
+  current_timestamp: Arc<AtomicUsize>,
+  on_transfer: Option<TransferNotifier>,
+}
+
+impl std::fmt::Debug for NewSources {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("NewSources").finish_non_exhaustive()
+  }
+}
+
 #[derive(Debug)]
 enum Command {
   NoOp,
@@ -85,6 +99,8 @@ enum Command {
   RemoveFlow {
     index: usize,
   },
+  /// Switch to other sources without touching the flows.
+  SetSources(NewSources),
   SetChannels {
     index: usize,
     channel_indices: Vec<Option<usize>>,
@@ -111,7 +127,7 @@ struct FlowsTransmitterInternal<P: ProxyToSamplesBuffer> {
   //callback: SamplesRequestCallback,
 }
 
-impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
+impl<P: ProxyToSamplesBuffer + 'static> FlowsTransmitterInternal<P> {
   #[inline(always)]
   fn should_dither(&self, output_bit_depth: u8) -> bool {
     self.tx_source_bit_depth > output_bit_depth
@@ -119,6 +135,14 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
 
   fn now(&self) -> Option<LongClock> {
     self.clock.now_in_timebase(self.sample_rate as u64)
+  }
+
+  fn publish_latency(&self) {
+    // a sample at buffer position p is sent at media time start_time+p+send_latency, stamped earlier
+    // by clock_offset; receivers play it out after (at least) the latency we advertise to them
+    self.anchor.set_network_latency_samples(
+      (self.max_lag_samples as LongClockDiff + self.clock_offset_samples).max(0) as usize,
+    );
   }
 
   fn apply_anchor(&mut self) {
@@ -263,12 +287,11 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
     let process_events_interval = (sample_rate / 30) as Clock;
     let mut dither_rng = SmallRng::from_rng(rand::thread_rng()).unwrap();
 
-    // a sample at buffer position p is sent at media time start_time+p+send_latency, stamped earlier
-    // by clock_offset; receivers play it out after (at least) the latency we advertise to them
-    self.anchor.set_network_latency_samples(
-      (self.max_lag_samples as LongClockDiff + self.clock_offset_samples).max(0) as usize,
-    );
+    self.publish_latency();
 
+    // the clock may not be available yet right after start: wait for it, complain only if it doesn't come
+    let waiting_since = std::time::Instant::now();
+    let mut next_complaint = waiting_since + Duration::from_secs(2);
     let now = loop {
       self.clock_recv.update();
       if let Some(clkovl) = self.clock_recv.get() {
@@ -286,8 +309,11 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
       if let Some(now) = now_opt {
         break now;
       } else {
-        error!("clock unavailable, can't transmit. is the PTP daemon running? (@init)");
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        if std::time::Instant::now() >= next_complaint {
+          error!("clock unavailable, can't transmit. is the PTP daemon running? (@init)");
+          next_complaint += Duration::from_secs(1);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
       }
     };
     let mut next_on_transfer = now as Clock;
@@ -447,6 +473,21 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
             flow.expired.store(false, Ordering::Release);
           }
         }
+        Command::SetSources(NewSources { sources, anchor, current_timestamp, on_transfer }) => {
+          match sources.downcast::<Vec<RBOutput<Sample, P>>>() {
+            Ok(sources) => {
+              // TODO is freeing memory in realtime thread safe???
+              self.channels_sources = *sources;
+              self.anchor = anchor;
+              // apply (and activate) the new anchor in the next transmission
+              self.start_time = None;
+              self.current_timestamp = current_timestamp;
+              self.on_transfer = on_transfer;
+              self.publish_latency();
+            }
+            Err(_) => error!("BUG: transmitter sources of a different buffer type"),
+          }
+        }
         Command::NoOp => {}
       }
     }
@@ -474,6 +515,28 @@ impl FlowInfo {
   }
 }
 
+impl FlowsTransmitter {
+  /// Switches the running transmitter to other sources (e.g. another application buffer), keeping its flows.
+  pub async fn set_sources<P: ProxyToSamplesBuffer + Send + Sync + 'static>(
+    &self,
+    sources: Vec<RBOutput<Sample, P>>,
+    anchor: StreamAnchor,
+    current_timestamp: Arc<AtomicUsize>,
+    on_transfer: Option<TransferNotifier>,
+  ) {
+    self
+      .commands_sender
+      .send(Command::SetSources(NewSources {
+        sources: Box::new(sources),
+        anchor,
+        current_timestamp,
+        on_transfer,
+      }))
+      .await
+      .log_and_forget();
+  }
+}
+
 pub struct FlowsTransmitter {
   self_info: Arc<DeviceInfo>,
   flow_seq_id: AtomicU32,
@@ -488,7 +551,7 @@ fn split_handle(h: FlowHandle) -> (u32, u16) {
 }
 
 impl FlowsTransmitter {
-  async fn run<P: ProxyToSamplesBuffer>(
+  async fn run<P: ProxyToSamplesBuffer + 'static>(
     rx: mpsc::Receiver<Command>,
     tx_source_bit_depth: u8,
     clock_recv: RealTimeBoxReceiver<Option<ClockOverlay>>,
