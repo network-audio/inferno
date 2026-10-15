@@ -279,25 +279,7 @@ impl<'s> Multicaster<'s> {
 
   async fn send_clock_stats(&mut self) {
     let freq_offset = self.get_freq_offset_ppb();
-    let required_prefix = format!("clock-stats.{}0000", hex::encode(self.self_info.mac_address.octets()));
-    let mut master_clock = None;
-    if let Ok(readdir) = std::fs::read_dir("/tmp") {
-      for entry in readdir {
-        if let Ok(entry) = entry {
-          if entry.file_name().to_string_lossy().starts_with(&required_prefix) {
-            if let Ok(content) = std::fs::read_to_string(entry.path()) {
-              let content = content.trim_ascii();
-              if content.len() >= 12 {
-                if let Ok(master_id) = hex::decode(&content[0..16]) {
-                  master_clock = Some(master_id);
-                  break;
-                }
-              }
-            }
-          }
-        }
-      }
-    }
+    let master_clock = read_clock_leader(Path::new("/tmp"), &self.self_info.mac_address.octets());
     let has_clock = self.clock.read().unwrap().get_overlay().is_some();
     let content = clock_status_content(
       &self.self_info.mac_address.octets(),
@@ -560,6 +542,26 @@ fn clock_status_content(
 }
 
 /// Heartbeat record 0x8002 with metering peaks, padded to a multiple of 4 bytes. Nothing if there are no peaks.
+/// The clock identity of the PTP leader our PTP daemon follows, as exported by teodly's Statime fork
+/// (statime/src/port/bmca.rs): it writes the leader's clock identity and port number (hex) to
+/// `<dir>/clock-stats.<own clock identity><own port number>`, its clock identity being the MAC address of its
+/// interface followed by 2 zero bytes. Other PTP daemons don't export it.
+fn read_clock_leader(dir: &Path, mac: &[u8; 6]) -> Option<Vec<u8>> {
+  let prefix = format!("clock-stats.{}0000", hex::encode(mac));
+  for entry in std::fs::read_dir(dir).ok()?.flatten() {
+    if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+      continue;
+    }
+    let Ok(content) = std::fs::read_to_string(entry.path()) else {
+      continue;
+    };
+    if let Some(leader) = content.trim_ascii().get(0..16).and_then(|id| hex::decode(id).ok()) {
+      return Some(leader);
+    }
+  }
+  None
+}
+
 /// Per receive flow: packets dropped because they arrived after their playout time, cumulative.
 fn write_late_packets_record(bytes: &mut ByteBuffer, ctr: u16, late_packets: &[u32]) {
   if late_packets.is_empty() {
@@ -735,6 +737,28 @@ mod tests {
 
   /// Late packets record of a real device heartbeat (2 flows), as controllers parse it: count, first flow index,
   /// offset of the per-flow cumulative counters.
+  /// As written by teodly's Statime fork; invalid content (e.g. too short) is ignored instead of panicking.
+  #[test]
+  fn clock_leader_is_read_from_statime_export() {
+    let dir = std::env::temp_dir().join(format!("inferno-clock-leader-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+    assert_eq!(read_clock_leader(&dir, &mac), None, "nothing exported");
+
+    // another device's export, and an invalid one of ours
+    std::fs::write(dir.join("clock-stats.0a0b0c0d0e0f00000001"), "00112233445566770001").unwrap();
+    std::fs::write(dir.join("clock-stats.02112233445500000002"), "0011223344556").unwrap();
+    assert_eq!(read_clock_leader(&dir, &mac), None);
+
+    std::fs::write(
+      dir.join("clock-stats.02112233445500000001"),
+      "001dc1fffe5036 8b0001".replace(' ', ""),
+    )
+    .unwrap();
+    assert_eq!(read_clock_leader(&dir, &mac), Some(vec![0x00, 0x1d, 0xc1, 0xff, 0xfe, 0x50, 0x36, 0x8b]));
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
   #[test]
   fn late_packets_record_layout_matches_real_device() {
     let mut bytes = ByteBuffer::new();
