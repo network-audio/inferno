@@ -1811,3 +1811,29 @@ fn device_on_ports_in_use_fails_with_an_error() {
         "first device stopped delivering audio"
     );
 }
+
+/// T20: a device whose ALSA arguments default to "" (so that ALSA can list it, e.g. in `aplay -L`) opens
+/// without arguments: empty settings are unset, the environment and defaults apply.
+#[test]
+fn device_with_empty_default_arguments_opens() {
+    init_test_env();
+    let ids = TestIds {
+        base_port: 41000,
+        base_pid: 41,
+        tag: "emptyargs",
+        latency_ns: LATENCY_NS,
+    };
+    let _clock = ClockServer::start(ids.clock_path());
+    let config = plugin_config(&ids, "plug-emptyargs").replace(
+        "pcm.dut {\n  type inferno\n",
+        "pcm.dut {\n  type inferno\n  @args.SAMPLE_RATE { type string default \"\" }\n  @args.RX_LATENCY_NS { type string default \"\" }\n",
+    )
+    .replace(&format!(r#"SAMPLE_RATE "{SAMPLE_RATE}""#), "SAMPLE_RATE $SAMPLE_RATE")
+    .replace(&format!(r#"RX_LATENCY_NS "{}""#, ids.latency_ns), "RX_LATENCY_NS $RX_LATENCY_NS");
+    assert!(
+        config.contains("SAMPLE_RATE $SAMPLE_RATE")
+            && config.contains("RX_LATENCY_NS $RX_LATENCY_NS")
+    );
+    let pcm = Pcm::open(&config, SND_PCM_STREAM_CAPTURE, 85_333);
+    pcm.prepare();
+}

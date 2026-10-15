@@ -5,7 +5,7 @@
 # How to use
 
 1. Follow the [Quick start](../README.md#quick-start): `./install.sh` builds and installs the plugin and defines the ALSA device `inferno` (from [`asoundrc`](asoundrc), as `/etc/alsa/conf.d/50-inferno.conf`), and a clock daemon must be running. `inferno-doctor` checks the setup.
-2. In the application there should be a place where usually device name is entered, e.g. `hw:1`. Enter `inferno` there (or the name of your own `pcm` device of type `inferno`). The device isn't listed by `aplay -L`, but opening it by name works.
+2. In the application there should be a place where usually device name is entered, e.g. `hw:1`. Enter `inferno` there (or the name of your own `pcm` device of type `inferno`); `aplay -L` lists it.
 
 Making Dante<->analog converter, or Dante<->Dante bridge, or Dante<->AES67 bridge, at a fraction of the price of an off-the-shelf device, using an SBC and PipeWire, is left as an exercise for the reader.
 

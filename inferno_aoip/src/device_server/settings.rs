@@ -137,7 +137,6 @@ fn create_self_info(
 
   // TODO make hostname and sample rate configurable from DC
   let friendly_hostname = match settings.get("NAME") {
-    Some(name) if name.trim().is_empty() => return Err(invalid("NAME", name, "must not be empty")),
     Some(name) => truncate_utf8(name, 31).to_owned(),
     None => format!("{} {}", truncate_utf8(app_name, 22), hex::encode(my_ipv4.octets())),
   };
@@ -292,12 +291,18 @@ impl Settings {
   }
 
   /// `config` with keys in upper case, completed by `INFERNO_*` environment variables (config wins).
+  /// Empty values count as unset, e.g. ALSA device arguments defaulting to "" when not given.
   pub fn merged_config(config: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    let mut config: BTreeMap<String, String> =
-      config.iter().map(|(k, v)| (k.to_ascii_uppercase(), v.clone())).collect();
+    let mut config: BTreeMap<String, String> = config
+      .iter()
+      .filter(|(_, v)| !v.trim().is_empty())
+      .map(|(k, v)| (k.to_ascii_uppercase(), v.clone()))
+      .collect();
     env::vars().for_each(|(env_key, env_value)| {
       if let Some(key) = env_key.strip_prefix("INFERNO_") {
-        config.entry(key.to_ascii_uppercase()).or_insert(env_value);
+        if !env_value.trim().is_empty() {
+          config.entry(key.to_ascii_uppercase()).or_insert(env_value);
+        }
       }
     });
     config
@@ -358,7 +363,16 @@ mod tests {
     assert_eq!(error_key(&[("RX_CHANNELS", "two")]), "RX_CHANNELS");
     assert_eq!(error_key(&[("TX_SOURCE_BIT_DEPTH", "20")]), "TX_SOURCE_BIT_DEPTH");
     assert_eq!(error_key(&[("USE_SAFE_CLOCK", "maybe")]), "USE_SAFE_CLOCK");
-    assert_eq!(error_key(&[("NAME", " ")]), "NAME");
+  }
+
+  /// e.g. ALSA arguments defaulting to "" when not given
+  #[test]
+  fn empty_values_are_unset() {
+    let s = settings(&[("NAME", " "), ("SAMPLE_RATE", ""), ("ALT_PORT", ""), ("DEVICE_ID", "")]).unwrap();
+    assert_eq!(s.self_info.sample_rate, 48000);
+    assert!(s.self_info.friendly_hostname.starts_with("app "), "{}", s.self_info.friendly_hostname);
+    let merged = Settings::merged_config(&[("RX_CHANNELS".to_string(), "".to_string())].into());
+    assert!(!merged.contains_key("RX_CHANNELS"), "{merged:?}");
   }
 
   #[test]

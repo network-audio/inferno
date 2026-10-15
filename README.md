@@ -330,6 +330,7 @@ If you want to contribute but can't code or don't know where to start because th
 * invalid settings fail opening the device with a message naming the setting, instead of crashing the application; misspelt settings are warned about; the ALSA plugin's own settings also work as `INFERNO_*` variables
 * a missing clock is reported, with what is wrong at `CLOCK_PATH`; a device that can't get its network ports (e.g. used by another device) fails to start with an error naming them, instead of running invisible to controllers
 * the ALSA plugin and Inferno2pipe log at `info` by default (was `debug`)
+* the `inferno` ALSA device is listed by `aplay -L` and in applications' device lists: its arguments default to empty, and empty settings count as unset
 * receive channels are silenced when their flow is removed (unsubscribed, transmitter gone) even if the flow's socket is removed first, instead of keeping the last audio; no more "BUG: still have N channels" error
 * draining playback (e.g. aplay at the end of a file) is no longer logged as an xrun
 * RX channels are listed even without a running receiver (playback-only devices weren't usable from netaudio 0.4)
