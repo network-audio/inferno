@@ -237,6 +237,56 @@ pub struct Settings {
   pub clock_path: Option<PathBuf>,
   pub use_safe_clock: bool,
   pub tx_source_bit_depth: u8,
+  /// What Inferno may choose itself when the standard ports are in use (by another device on this host):
+  /// the ports (ALT_PORT not set), the process ID (PROCESS_ID and DEVICE_ID not set), the name (NAME not set)
+  pub auto_identity: AutoIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AutoIdentity {
+  pub ports: bool,
+  pub process_id: bool,
+  pub name: bool,
+}
+
+/// First port of the blocks of 4 ports chosen when the standard ones are in use. Clear of Dante's ports
+/// (incl. unicast audio at 14336-14591) and of Linux's ephemeral ports (32768-60999).
+pub(crate) const AUTO_PORTS_BASE: u16 = 20000;
+/// Blocks are 10 ports apart, like the README recommends for ALT_PORT.
+pub(crate) const AUTO_PORTS_STEP: u16 = 10;
+pub(crate) const AUTO_PORTS_BLOCKS: u16 = 100;
+
+impl AutoIdentity {
+  /// The device on the `block`th automatic port block: its ports and, if allowed, a process ID (so its device
+  /// ID differs from the standard ports' device) and a name (so it differs from another device of this
+  /// application).
+  pub(crate) fn apply(&self, info: &mut DeviceInfo, block: u16) {
+    let base = AUTO_PORTS_BASE + block * AUTO_PORTS_STEP;
+    info.arc_port = base;
+    info.cmc_port = base + 1;
+    info.flows_control_port = base + 2;
+    info.info_request_port = base + 3;
+    if self.process_id {
+      let process_id = block + 1;
+      info.process_id = process_id;
+      info.factory_device_id[6..8].copy_from_slice(&process_id.to_be_bytes());
+      let prefix = info.factory_hostname.rsplit_once('-').map_or("", |(prefix, _)| prefix).to_owned();
+      info.factory_hostname = format!("{prefix}-{}", hex::encode(info.factory_device_id));
+      if self.name {
+        let suffix = format!(" {process_id}");
+        info.friendly_hostname =
+          format!("{}{suffix}", truncate_utf8(&info.friendly_hostname, 31 - suffix.len()));
+      }
+    }
+  }
+}
+
+/// The automatic port block a device starts looking at: from its name, so that it gets the same ports (and
+/// device ID, and so its saved state) each time.
+pub(crate) fn first_auto_block(name: &str) -> u16 {
+  // FNV-1a: stable across runs and builds, unlike std's hasher
+  let hash = name.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+  (hash % AUTO_PORTS_BLOCKS as u64) as u16
 }
 
 impl Settings {
@@ -271,6 +321,11 @@ impl Settings {
       return Err(invalid("TX_SOURCE_BIT_DEPTH", &tx_source_bit_depth.to_string(), bit_depth_error));
     }
 
+    let auto_identity = AutoIdentity {
+      ports: !config.contains_key("ALT_PORT"),
+      process_id: !config.contains_key("PROCESS_ID") && !config.contains_key("DEVICE_ID"),
+      name: !config.contains_key("NAME"),
+    };
     let mut result = Self {
       self_info,
       tx_latency_ns: parse(&config, "TX_LATENCY_NS", "must be a latency in nanoseconds, e.g. 10000000")?
@@ -278,6 +333,7 @@ impl Settings {
       clock_path: config.get("CLOCK_PATH").map(PathBuf::from),
       use_safe_clock,
       tx_source_bit_depth,
+      auto_identity,
     };
 
     // the following should be harmless, as the application still has the chance to overwrite it
@@ -373,6 +429,40 @@ mod tests {
     assert!(s.self_info.friendly_hostname.starts_with("app "), "{}", s.self_info.friendly_hostname);
     let merged = Settings::merged_config(&[("RX_CHANNELS".to_string(), "".to_string())].into());
     assert!(!merged.contains_key("RX_CHANNELS"), "{merged:?}");
+  }
+
+  #[test]
+  fn automatic_identity_changes_only_what_was_not_set() {
+    let s = settings(&[]).unwrap();
+    assert_eq!(s.auto_identity, AutoIdentity { ports: true, process_id: true, name: true });
+    let mut info = s.self_info.clone();
+    s.auto_identity.apply(&mut info, 7);
+    assert_eq!((info.arc_port, info.info_request_port), (20070, 20073));
+    assert_eq!(info.process_id, 8);
+    assert_eq!(&info.factory_device_id[6..8], &[0, 8]);
+    assert!(
+      info.factory_hostname.ends_with(&hex::encode(info.factory_device_id)),
+      "{}",
+      info.factory_hostname
+    );
+    assert!(info.friendly_hostname.ends_with(" 8") && info.friendly_hostname.len() <= 31);
+
+    let s = settings(&[("NAME", "studio"), ("PROCESS_ID", "3")]).unwrap();
+    assert_eq!(s.auto_identity, AutoIdentity { ports: true, process_id: false, name: false });
+    let mut info = s.self_info.clone();
+    s.auto_identity.apply(&mut info, 7);
+    assert_eq!((info.arc_port, info.process_id, info.friendly_hostname.as_str()), (20070, 3, "studio"));
+    assert!(!settings(&[("ALT_PORT", "5000")]).unwrap().auto_identity.ports);
+    assert!(!settings(&[("DEVICE_ID", "0011223344556677")]).unwrap().auto_identity.process_id);
+  }
+
+  #[test]
+  fn automatic_port_block_is_stable_per_name() {
+    assert_eq!(first_auto_block("PipeWire 7f000001"), first_auto_block("PipeWire 7f000001"));
+    assert!(first_auto_block("a") < AUTO_PORTS_BLOCKS);
+    let blocks: std::collections::BTreeSet<u16> =
+      (0..50).map(|i| first_auto_block(&format!("app {i}"))).collect();
+    assert!(blocks.len() > 25, "names should spread over the blocks: {blocks:?}");
   }
 
   #[test]

@@ -69,6 +69,27 @@ pub struct TransferNotifier {
   pub max_interval_samples: Clock,
 }
 
+/// Listens on the device's 4 ports: ARC, CMC, flows control, device info.
+async fn listen_on_device_ports(
+  info: &DeviceInfo,
+  shutdown: &broadcast_queue::Sender<()>,
+) -> Result<[UdpSocketWrapper; 4], StartError> {
+  let ip = info.ip_address;
+  let mut sockets = Vec::with_capacity(4);
+  for (service, port) in [
+    ("ARC (routing control)", info.arc_port),
+    ("CMC (control and monitoring)", info.cmc_port),
+    ("flows control", info.flows_control_port),
+    ("device info", info.info_request_port),
+  ] {
+    let socket = UdpSocketWrapper::bind(Some(ip), port, shutdown.subscribe())
+      .await
+      .map_err(|source| StartError { service, addr: SocketAddrV4::new(ip, port), source })?;
+    sockets.push(socket);
+  }
+  Ok(sockets.try_into().unwrap_or_else(|_| unreachable!()))
+}
+
 /// The device couldn't listen on one of its network ports.
 #[derive(Debug)]
 pub struct StartError {
@@ -82,7 +103,8 @@ impl std::fmt::Display for StartError {
     write!(
       f,
       "can't listen on UDP {} for {}: {}. Is another Inferno device (or Dante software) using it? Each device \
-       on a host needs its own ports: give them ALT_PORT values at least 10 apart.",
+       on a host needs its own ports: give them ALT_PORT values at least 10 apart, or leave ALT_PORT unset to \
+       have free ports picked.",
       self.addr, self.service, self.source
     )
   }
@@ -132,27 +154,49 @@ impl DeviceServer {
   }
 
   /// Starts the device. Fails if it can't listen on its network ports (e.g. used by another device).
+  /// If the standard ports are in use (by another device on this host), and the settings let Inferno choose
+  /// (see `Settings::auto_identity`), it picks free ports, and a process ID and name to be a separate device.
   pub async fn try_start(settings: settings::Settings) -> Result<Self, StartError> {
-    let self_info = Arc::new(settings.self_info);
+    let mut info = settings.self_info;
     let ref_instant = Instant::now();
 
     // before anything else is started, so that nothing needs to be undone on failure
     let (shutdown_send, _) = broadcast_queue::channel(16);
-    let ip = self_info.ip_address;
-    let listen = |service: &'static str, port: u16| {
-      let shutdown = shutdown_send.subscribe();
-      async move {
-        UdpSocketWrapper::bind(Some(ip), port, shutdown).await.map_err(|source| StartError {
-          service,
-          addr: SocketAddrV4::new(ip, port),
-          source,
-        })
-      }
-    };
-    let arc_socket = listen("ARC (routing control)", self_info.arc_port).await?;
-    let cmc_socket = listen("CMC (control and monitoring)", self_info.cmc_port).await?;
-    let flows_control_socket = listen("flows control", self_info.flows_control_port).await?;
-    let info_socket = listen("device info", self_info.info_request_port).await?;
+    let [arc_socket, cmc_socket, flows_control_socket, info_socket] =
+      match listen_on_device_ports(&info, &shutdown_send).await {
+        Ok(sockets) => sockets,
+        Err(e) if e.source.kind() == std::io::ErrorKind::AddrInUse && settings.auto_identity.ports => {
+          let standard = (info.arc_port, info.process_id);
+          debug!("standard ports in use: {e}");
+          let first = settings::first_auto_block(&info.friendly_hostname);
+          let mut found = None;
+          for i in 0..settings::AUTO_PORTS_BLOCKS {
+            let mut candidate = info.clone();
+            settings.auto_identity.apply(&mut candidate, (first + i) % settings::AUTO_PORTS_BLOCKS);
+            if let Ok(sockets) = listen_on_device_ports(&candidate, &shutdown_send).await {
+              found = Some((candidate, sockets));
+              break;
+            }
+          }
+          let Some((candidate, sockets)) = found else {
+            return Err(e);
+          };
+          info = candidate;
+          info!(
+          "UDP {} is in use (another device on this host?): this device uses ports {}-{}, PROCESS_ID {} \
+             (instead of {}) and name {:?}. Set ALT_PORT (and PROCESS_ID, NAME) to choose them.",
+          e.addr,
+          info.arc_port,
+          info.info_request_port,
+          info.process_id,
+          standard.1,
+          info.friendly_hostname
+        );
+          sockets
+        }
+        Err(e) => return Err(e),
+      };
+    let self_info = Arc::new(info);
 
     let state_storage = Arc::new(StateStorage::new(&self_info));
     let tx_multicasts_by_channel: Arc<RwLock<BTreeMap<usize, PointerToMulticast>>> = Default::default();

@@ -231,10 +231,18 @@ fn check_ports(report: &mut Report, settings: &Settings) {
         .join(", ");
     if busy.is_empty() {
         report.ok(format!("UDP ports {all} on {} are free", info.ip_address));
+    } else if settings.auto_identity.ports {
+        report.ok(format!(
+            "UDP {} in use on {} (this device open right now, or another device): ALT_PORT isn't set, so a \
+             further device picks free ports itself",
+            busy.join(", "),
+            info.ip_address
+        ));
     } else {
         report.warn(format!(
-            "UDP {} in use on {}: fine if this device is open in an application right now; \
-             otherwise another device uses them, give each device its own ALT_PORT (at least 10 apart)",
+            "UDP {} in use on {}: fine if this device is open in an application right now; otherwise \
+             another device uses them: give each device its own ALT_PORT (at least 10 apart), or leave \
+             ALT_PORT unset to have free ports picked",
             busy.join(", "),
             info.ip_address
         ));
