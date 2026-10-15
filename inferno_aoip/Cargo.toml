@@ -31,6 +31,7 @@ thiserror = "1.0.57"
 thread-priority = "0.15"
 atomicbox = "0.4.0"
 mio = { version = "1.0.2", features = ["net", "os-ext", "os-poll"] }
+socket2 = "0.6"
 bool_vec = "0.2.1"
 bytemuck = "1.17.1"
 usrvclock = { path = "../usrvclock-rs" }

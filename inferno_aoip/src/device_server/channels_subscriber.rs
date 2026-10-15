@@ -769,20 +769,19 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
       // Create flows for multicast receivers:
       // TODO make DC display warning when removing multicast flow from the transmitter
       for (bundle_full_name, advbundle) in &bundles {
-        let socket = match mio::net::UdpSocket::bind(advbundle.media_addr) {
-          Ok(socket) => socket,
-          Err(e) => {
-            error!("failed to bind to socket {:?} for multicast media: {e:?}", advbundle.media_addr);
+        let group = match advbundle.media_addr {
+          std::net::SocketAddr::V4(group) => group,
+          other => {
+            error!("multicast media address {other} is not IPv4, can't receive it");
             continue;
           }
         };
-        let mcast_ipv4 = match advbundle.media_addr.ip() {
-          std::net::IpAddr::V4(ip) => ip,
-          _ => panic!("media multicast address is not ipv4"),
-        };
-        if let Err(e) = socket.join_multicast_v4(&mcast_ipv4, &self.self_info.ip_address) {
-          error!("failed to join multicast group {:?}: {e:?}", advbundle.media_addr.ip());
-          continue;
+        let socket = match crate::net_utils::multicast_receiver(group, self.self_info.ip_address) {
+          Ok(socket) => mio::net::UdpSocket::from_std(socket),
+          Err(e) => {
+            error!("failed to receive multicast media from {group}: {e:?}");
+            continue;
+          }
         };
         let flow_index = match flows_locked.iter().position(|o| o.is_none()) {
           Some(i) => i,

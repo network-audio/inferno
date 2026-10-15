@@ -920,6 +920,7 @@ dependencies = [
  "rand",
  "searchfire",
  "serde",
+ "socket2 0.6.3",
  "thiserror",
  "thread-priority",
  "tokio",

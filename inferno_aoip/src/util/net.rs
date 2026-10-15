@@ -1,6 +1,6 @@
 use log::{error, info};
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use tokio::{net::UdpSocket, select, sync::broadcast::Receiver};
 
 pub const MTU: usize = 1500;
@@ -104,4 +104,59 @@ pub fn create_mio_udp_socket(self_ip: Ipv4Addr) -> std::io::Result<(mio::net::Ud
   let socket = mio::net::UdpSocket::bind(SocketAddr::new(IpAddr::V4(self_ip), 0))?;
   let port = socket.local_addr()?.port();
   return Ok((socket, port));
+}
+
+/// A non-blocking socket receiving multicast group `group` on the interface with address `interface_ip`.
+/// Other sockets on this host (other devices, other software) can receive the same group and port too.
+pub fn multicast_receiver(
+  group: SocketAddrV4,
+  interface_ip: Ipv4Addr,
+) -> std::io::Result<std::net::UdpSocket> {
+  use socket2::{Domain, Socket, Type};
+  let socket = Socket::new(Domain::IPV4, Type::DGRAM, None)?;
+  // each receiver gets a copy of the group's packets
+  socket.set_reuse_address(true)?;
+  // bound to the group address: only this group's packets, not other groups' on the same port
+  socket.bind(&group.into())?;
+  socket.join_multicast_v4(group.ip(), &interface_ip)?;
+  socket.set_nonblocking(true)?;
+  Ok(socket.into())
+}
+
+#[cfg(test)]
+mod multicast_tests {
+  use super::*;
+  use std::time::{Duration, Instant};
+
+  /// Several devices (or other software) on one host receive the same multicast flow.
+  #[test]
+  fn two_receivers_of_one_multicast_group_on_one_host() {
+    let group = SocketAddrV4::new(Ipv4Addr::new(239, 255, 77, 1), 4321);
+    let lo = Ipv4Addr::LOCALHOST;
+    let a = multicast_receiver(group, lo).expect("first receiver");
+    let b = multicast_receiver(group, lo).expect("second receiver of the same group and port");
+
+    let sender = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None).unwrap();
+    sender.bind(&SocketAddrV4::new(lo, 0).into()).unwrap();
+    sender.set_multicast_if_v4(&lo).unwrap();
+    sender.set_multicast_loop_v4(true).unwrap();
+    sender.send_to(b"media", &group.into()).unwrap();
+
+    for (name, socket) in [("first", &a), ("second", &b)] {
+      let mut buf = [0u8; 16];
+      let deadline = Instant::now() + Duration::from_secs(2);
+      loop {
+        match socket.recv(&mut buf) {
+          Ok(n) => {
+            assert_eq!(&buf[..n], b"media");
+            break;
+          }
+          Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => {
+            std::thread::sleep(Duration::from_millis(10));
+          }
+          Err(e) => panic!("{name} receiver got nothing: {e}"),
+        }
+      }
+    }
+  }
 }
