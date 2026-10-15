@@ -72,34 +72,91 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
   &s[..end]
 }
 
+/// A network interface, as far as choosing the device's address goes.
+struct InterfaceCandidate<'a> {
+  name: &'a str,
+  usable: bool, // up and not loopback
+  ipv4: Vec<Ipv4Addr>,
+}
+
+/// The device's address when BIND_IP isn't set: the IPv4 default route's address if there is one, otherwise
+/// (e.g. a Dante network without a gateway, internet over IPv6 only) an IPv4 address of an interface,
+/// routable ones before link-local ones (169.254.x.x, which Dante devices use without DHCP). Returns a
+/// warning when it had to choose between several interfaces.
+fn default_ipv4(
+  default_route: Option<IpAddr>,
+  interfaces: &[InterfaceCandidate],
+) -> Result<(Ipv4Addr, Option<String>), String> {
+  if let Some(IpAddr::V4(ip)) = default_route {
+    return Ok((ip, None));
+  }
+  let mut candidates: Vec<(&str, Ipv4Addr)> = interfaces
+    .iter()
+    .filter(|iface| iface.usable)
+    .flat_map(|iface| iface.ipv4.iter().map(move |ip| (iface.name, *ip)))
+    .collect();
+  // stable: keeps the interfaces' order otherwise
+  candidates.sort_by_key(|(_, ip)| ip.is_link_local());
+  let Some(&(name, ip)) = candidates.first() else {
+    return Err(
+      "no network interface has an IPv4 address: Dante, and so Inferno, uses IPv4 (IPv6 isn't supported by \
+       Dante devices)"
+        .to_owned(),
+    );
+  };
+  let mut names: Vec<&str> = candidates.iter().map(|(name, _)| *name).collect();
+  names.dedup();
+  let warning = (names.len() > 1).then(|| {
+    format!(
+      "no IPv4 default route, using {ip} of {name} (of {}): set BIND_IP to the interface connected to the \
+       Dante network",
+      names.join(", ")
+    )
+  });
+  Ok((ip, warning))
+}
+
 fn bind_ip(
   settings: &BTreeMap<String, String>,
   interfaces: &[netdev::Interface],
 ) -> Result<Ipv4Addr, SettingsError> {
   let Some(value) = settings.get("BIND_IP") else {
-    return match local_ip_address::local_ip() {
-      Ok(IpAddr::V4(a)) => Ok(a),
-      Ok(other) => Err(SettingsError {
-        key: "BIND_IP",
-        value: None,
-        problem: format!("the default route uses {other}, which is not IPv4; set BIND_IP"),
-      }),
-      Err(e) => Err(SettingsError {
-        key: "BIND_IP",
-        value: None,
-        problem: format!("cannot determine the local IP address ({e}); set BIND_IP"),
-      }),
+    let candidates: Vec<InterfaceCandidate> = interfaces
+      .iter()
+      .map(|iface| InterfaceCandidate {
+        name: &iface.name,
+        usable: iface.is_up() && !iface.is_loopback(),
+        ipv4: iface.ipv4.iter().map(|net| net.addr()).collect(),
+      })
+      .collect();
+    return match default_ipv4(local_ip_address::local_ip().ok(), &candidates) {
+      Ok((ip, warning)) => {
+        if let Some(warning) = warning {
+          log::warn!("{warning}");
+        }
+        Ok(ip)
+      }
+      Err(problem) => Err(SettingsError { key: "BIND_IP", value: None, problem }),
     };
   };
   if let Ok(ip) = value.parse() {
     return Ok(ip);
   }
+  if value.parse::<std::net::Ipv6Addr>().is_ok() {
+    return Err(invalid(
+      "BIND_IP",
+      value,
+      "an IPv6 address: Dante, and so Inferno, uses IPv4; give an IPv4 address or the network interface's name",
+    ));
+  }
   match interfaces.iter().find(|iface| &iface.name == value) {
-    Some(iface) => iface
-      .ipv4
-      .first()
-      .map(|net| net.addr())
-      .ok_or_else(|| invalid("BIND_IP", value, "this network interface has no IPv4 address")),
+    Some(iface) => iface.ipv4.first().map(|net| net.addr()).ok_or_else(|| {
+      invalid(
+        "BIND_IP",
+        value,
+        "this network interface has no IPv4 address (Dante, and so Inferno, uses IPv4)",
+      )
+    }),
     None => {
       let names = interfaces.iter().map(|iface| iface.name.as_str()).collect::<Vec<_>>().join(", ");
       Err(invalid(
@@ -463,6 +520,56 @@ mod tests {
     let blocks: std::collections::BTreeSet<u16> =
       (0..50).map(|i| first_auto_block(&format!("app {i}"))).collect();
     assert!(blocks.len() > 25, "names should spread over the blocks: {blocks:?}");
+  }
+
+  fn iface<'a>(name: &'a str, usable: bool, ipv4: &[[u8; 4]]) -> InterfaceCandidate<'a> {
+    InterfaceCandidate { name, usable, ipv4: ipv4.iter().map(|&o| Ipv4Addr::from(o)).collect() }
+  }
+
+  #[test]
+  fn default_address_is_the_ipv4_default_routes() {
+    let ifaces = [iface("eth0", true, &[[192, 168, 1, 5]]), iface("dante0", true, &[[10, 0, 0, 5]])];
+    let route = Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)));
+    assert_eq!(default_ipv4(route, &ifaces).unwrap(), (Ipv4Addr::new(192, 168, 1, 5), None));
+  }
+
+  /// e.g. internet over IPv6 only, the Dante network on its own interface without a gateway
+  #[test]
+  fn without_ipv4_default_route_an_ipv4_interface_is_used() {
+    let ipv6_route = Some(IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)));
+    for route in [None, ipv6_route] {
+      let ifaces = [
+        iface("lo", false, &[[127, 0, 0, 1]]),
+        iface("wlan0", true, &[]),
+        iface("dante0", true, &[[10, 0, 0, 5]]),
+      ];
+      assert_eq!(
+        default_ipv4(route, &ifaces).unwrap(),
+        (Ipv4Addr::new(10, 0, 0, 5), None),
+        "route {route:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn routable_addresses_go_before_link_local_ones_and_a_choice_is_warned_about() {
+    let ifaces = [iface("eth1", true, &[[169, 254, 3, 4]]), iface("eth0", true, &[[10, 0, 0, 5]])];
+    let (ip, warning) = default_ipv4(None, &ifaces).unwrap();
+    assert_eq!(ip, Ipv4Addr::new(10, 0, 0, 5));
+    let warning = warning.expect("a choice between interfaces must be warned about");
+    assert!(warning.contains("BIND_IP") && warning.contains("eth1"), "{warning}");
+    // link-local only (Dante devices without DHCP) works, an interface down doesn't count
+    let ifaces = [iface("eth1", true, &[[169, 254, 3, 4]]), iface("eth2", false, &[[10, 1, 1, 1]])];
+    assert_eq!(default_ipv4(None, &ifaces).unwrap(), (Ipv4Addr::new(169, 254, 3, 4), None));
+  }
+
+  #[test]
+  fn no_ipv4_at_all_says_that_dante_uses_ipv4() {
+    let e = default_ipv4(None, &[iface("eth0", true, &[])]).unwrap_err();
+    assert!(e.contains("IPv4"), "{e}");
+    assert_eq!(error_key(&[("BIND_IP", "fe80::1")]), "BIND_IP");
+    let e = settings(&[("BIND_IP", "2001:db8::1")]).err().unwrap().to_string();
+    assert!(e.contains("IPv6") && e.contains("IPv4"), "{e}");
   }
 
   #[test]

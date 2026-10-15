@@ -84,6 +84,8 @@ For capturing to a file without an audio stack, see [`Inferno2pipe`](inferno2pip
 
 **Firewall:** allow incoming UDP 4440, 8800, 4455 and 8700 (or `ALT_PORT` to `ALT_PORT+3`), 5353 (mDNS), 4321 (multicast audio), 319 and 320 (PTP), and audio flows from transmitters (their ports are chosen by the operating system, so can't be known beforehand).
 
+**IPv4 and IPv6:** Dante devices use IPv4 only, and so does Inferno (Dante's protocols carry IPv4 addresses). It works on dual-stack hosts and networks: IPv6 is ignored. Without `BIND_IP`, it uses the address of the IPv4 default route or, if there is none (e.g. a Dante network without a gateway, internet over IPv6 only), an IPv4 address of an interface, link-local 169.254.x.x addresses last; with several interfaces to choose from, set `BIND_IP`.
+
 **Security frameworks:** seccomp, SELinux and similar must not block clock-related syscalls. For PipeWire run by systemd, `install.sh --pipewire` installs the needed override ([`os_integration/pipewire/systemd_allow_clock.conf`](os_integration/pipewire/systemd_allow_clock.conf), as `~/.config/systemd/user/pipewire.service.d/inferno-clock.conf`).
 
 **Several devices on one computer** (e.g. PipeWire and another application each opening `inferno`): the first one uses the standard ports. A further one, if `ALT_PORT` isn't set, picks free ports (from 20000-20999) and, if `PROCESS_ID`/`DEVICE_ID` and `NAME` aren't set, a process ID and a name with it appended, so that it is a separate device. It picks the same ones each time it starts (they depend on its name), so its saved state is kept. To choose them yourself, set `NAME`, `PROCESS_ID` and `ALT_PORT` (at least 10 apart), see [Settings](#settings). PCMs with the same device ID in one application are one device.
@@ -241,7 +243,7 @@ The ALSA configuration wins over environment variables. Names are case-insensiti
 
 ## Settings
 All settings have default values. In a simple setup you should be able to start without specifying any parameters.
-* `BIND_IP` - which local IP to bind to. Specifying it may be necessary if you have multiple network interfaces. Alternatively, network interface name may be specified, in that case the first address belonging to the interface will be used.
+* `BIND_IP` - which local IPv4 address to bind to. Specifying it may be necessary if you have multiple network interfaces. Alternatively, network interface name may be specified, in that case the first IPv4 address belonging to the interface will be used. Defaults to the address of the IPv4 default route or, without one, an interface's IPv4 address (see [IPv4 and IPv6](#quick-start)).
 * `DEVICE_ID` - 16 hexadecimal digits (8 bytes) used as a device ID. Dante devices usually use MAC address padded with zeros. Inferno uses `0000<IP address>0000` by default. Device ID is the storage key when saving state.
 * `NAME` - name of advertised device. If unspecified, name based on app name and IP address will be generated. May be removed in future versions when it becomes settable from DC and so stored in a configuration file.
 * `SAMPLE_RATE` - sample rate this device will operate on
@@ -331,6 +333,7 @@ If you want to contribute but can't code or don't know where to start because th
 * a missing clock is reported, with what is wrong at `CLOCK_PATH`; a device that can't get its network ports (e.g. used by another device) fails to start with an error naming them, instead of running invisible to controllers
 * the ALSA plugin and Inferno2pipe log at `info` by default (was `debug`)
 * several devices on one computer without configuring them: a device whose standard ports are in use picks free ports, a process ID and a name, the same ones each time; multicast flows can be received by several devices (or other software) on one host; a PCM merged into a device with other settings (same device ID in one process) is warned about
+* dual-stack hosts: without an IPv4 default route (e.g. internet over IPv6 only), the device uses an interface's IPv4 address instead of failing to start; an IPv6 `BIND_IP` gets an explanation (Dante uses IPv4)
 * the `inferno` ALSA device is listed by `aplay -L` and in applications' device lists: its arguments default to empty, and empty settings count as unset
 * receive channels are silenced when their flow is removed (unsubscribed, transmitter gone) even if the flow's socket is removed first, instead of keeping the last audio; no more "BUG: still have N channels" error
 * draining playback (e.g. aplay at the end of a file) is no longer logged as an xrun
