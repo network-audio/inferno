@@ -47,6 +47,52 @@ struct InfernoInstance {
     playing: bool,
     /// set if the device server failed to start (its thread then ends)
     start_error: Arc<Mutex<Option<String>>>,
+    /// settings the device was started with, see `device_settings`
+    settings: Vec<(&'static str, String)>,
+}
+
+/// The settings of a device that the PCMs sharing it (same device ID in one process) should agree on.
+fn device_settings(settings: &Settings) -> Vec<(&'static str, String)> {
+    let info = &settings.self_info;
+    vec![
+        ("name", info.friendly_hostname.clone()),
+        ("IP address", info.ip_address.to_string()),
+        ("RX channels", info.rx_channels.len().to_string()),
+        ("TX channels", info.tx_channels.len().to_string()),
+        ("sample rate", info.sample_rate.to_string()),
+        ("RX latency", format!("{} ns", info.latency_ns)),
+        ("TX latency", format!("{} ns", settings.tx_latency_ns)),
+        (
+            "TX source bit depth",
+            settings.tx_source_bit_depth.to_string(),
+        ),
+        ("ports", format!("{}..", info.arc_port)),
+        ("clock", format!("{:?}", settings.clock_path)),
+    ]
+}
+
+/// Warns if this PCM's settings differ from those of the device it shares (they don't apply).
+fn warn_if_settings_differ(instance: &InfernoInstance, settings: &Settings) {
+    let differences: Vec<String> = instance
+        .settings
+        .iter()
+        .zip(device_settings(settings))
+        .filter(|((_, device), (_, this))| device != this)
+        .map(|((key, device), (_, this))| format!("{key} {device} (this PCM: {this})"))
+        .collect();
+    if !differences.is_empty() {
+        warn!(
+            "this PCM shares device {} with a PCM already open in this process, whose settings apply: {}. \
+             To make it a separate device, give it its own PROCESS_ID (or DEVICE_ID), NAME and ALT_PORT.",
+            settings
+                .self_info
+                .factory_device_id
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            differences.join(", ")
+        );
+    }
 }
 
 const PLUGIN_NAME: [u8; 23] = *b"Inferno virtual device\0";
@@ -120,6 +166,7 @@ fn device_thread_failed(instance: &Mutex<InfernoInstance>, settings: &Settings) 
 }
 
 fn get_or_create_instance(settings: &Settings) -> Arc<Mutex<InfernoInstance>> {
+    let shared_settings = device_settings(settings);
     let mut instances_locked = global_instances.write().unwrap();
     let entry = instances_locked.entry(settings.self_info.factory_device_id);
     entry
@@ -242,6 +289,7 @@ fn get_or_create_instance(settings: &Settings) -> Arc<Mutex<InfernoInstance>> {
                 capturing: false.into(),
                 playing: false.into(),
                 start_error,
+                settings: shared_settings,
             }))
         })
         .clone()
@@ -306,6 +354,8 @@ struct MyIOPlug {
     //config: BTreeMap<String, String>,
     ref_time: Instant,
     use_flows_clock: bool,
+    /// whether this PCM's settings were compared with those of the device it shares (once, on first prepare)
+    shared_settings_checked: bool,
     /// capture: per channel, how far the running receiver has written (frames since start_time)
     capture_written: Arc<Vec<AtomicUsize>>,
     stream_info: Arc<StreamInfo>,
@@ -347,45 +397,44 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
 
     // TODO may be non-monotonic in edge cases (switching between clocks)
     // TODO rethink int sizes here
-    let mut ptr: snd_pcm_sframes_t = if let (true, Some(flows_ptr)) =
-        (this.use_flows_clock, flows_ptr)
-    {
-        flows_ptr
-    } else {
-        //println!("using own clock");
-        // ... but fall back to system clock when not transmitting/receiving right now
-        if let Some(clock_receiver) = &mut this.clock_receiver {
-            if clock_receiver.update() {
-                if let Some(overlay) = clock_receiver.get() {
-                    this.media_clock.update_overlay(*overlay);
+    let mut ptr: snd_pcm_sframes_t =
+        if let (true, Some(flows_ptr)) = (this.use_flows_clock, flows_ptr) {
+            flows_ptr
+        } else {
+            //println!("using own clock");
+            // ... but fall back to system clock when not transmitting/receiving right now
+            if let Some(clock_receiver) = &mut this.clock_receiver {
+                if clock_receiver.update() {
+                    if let Some(overlay) = clock_receiver.get() {
+                        this.media_clock.update_overlay(*overlay);
+                    }
                 }
             }
-        }
-        // here we must use long now_in_timebase (not wrapping) because boundary may be not power-of-2
-        // TODO: optimize by setting plugin_pointer callback depending on whether boundary is power-of-2
-        let now_samples_opt = this.media_clock.now_in_timebase((*io).rate as u64);
-        if now_samples_opt.is_some() && this.start_time.is_none() {
-            /*warn!("warning: setting start_time in plugin_pointer, not plugin_start");
-            this.start_time = Some(now_samples_opt.unwrap() as usize);
-            if let Some(start_time_tx) = this.start_time_tx.take() {
-                if let Err(e) = start_time_tx.send(now_samples_opt.unwrap()) {
-                    error!("failed to send start timestamp: {e}. tx/rx will not work.");
-                }
+            // here we must use long now_in_timebase (not wrapping) because boundary may be not power-of-2
+            // TODO: optimize by setting plugin_pointer callback depending on whether boundary is power-of-2
+            let now_samples_opt = this.media_clock.now_in_timebase((*io).rate as u64);
+            if now_samples_opt.is_some() && this.start_time.is_none() {
+                /*warn!("warning: setting start_time in plugin_pointer, not plugin_start");
+                this.start_time = Some(now_samples_opt.unwrap() as usize);
+                if let Some(start_time_tx) = this.start_time_tx.take() {
+                    if let Err(e) = start_time_tx.send(now_samples_opt.unwrap()) {
+                        error!("failed to send start timestamp: {e}. tx/rx will not work.");
+                    }
+                } else {
+                    error!("failed to send start timestamp: start_time_tx already used, BUG");
+                }*/
+                // the stream is prepared but not started yet (e.g. the application fills the buffer first)
+                trace!("plugin_pointer before the stream started, returning 0");
+            }
+            if now_samples_opt.is_some() && this.start_time.is_some() {
+                (now_samples_opt.unwrap() as usize).wrapping_sub(this.start_time.unwrap())
+                    as snd_pcm_sframes_t
             } else {
-                error!("failed to send start timestamp: start_time_tx already used, BUG");
-            }*/
-            // the stream is prepared but not started yet (e.g. the application fills the buffer first)
-            trace!("plugin_pointer before the stream started, returning 0");
-        }
-        if now_samples_opt.is_some() && this.start_time.is_some() {
-            (now_samples_opt.unwrap() as usize).wrapping_sub(this.start_time.unwrap())
-                as snd_pcm_sframes_t
-        } else {
-            //log::debug!("clock not ready... {} {}", now_samples_opt.is_some(), this.start_time.is_some());
-            0
-        }
-        //now_samples_opt.map(|now_samples| now_samples.wrapping_sub(this.start_time.unwrap())).unwrap_or(0) as i64
-    };
+                //log::debug!("clock not ready... {} {}", now_samples_opt.is_some(), this.start_time.is_some());
+                0
+            }
+            //now_samples_opt.map(|now_samples| now_samples.wrapping_sub(this.start_time.unwrap())).unwrap_or(0) as i64
+        };
     if let (SND_PCM_STREAM_PLAYBACK, Some(flows_ptr)) = ((*io).stream, flows_ptr) {
         // The transmitter reads a packet once its first sample is due, so when its thread wakes up
         // late, the media clock is already past samples it hasn't read. Never report those as
@@ -641,6 +690,10 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
     this.anchor.pause();
 
     let inferno_instance = get_or_create_instance(&this.settings);
+    if !this.shared_settings_checked {
+        this.shared_settings_checked = true;
+        warn_if_settings_differ(&inferno_instance.lock().unwrap(), &this.settings);
+    }
     let running = is_running(&inferno_instance.lock().unwrap(), (*io).stream);
     if running && this.active_buffers.as_ref() == Some(&buffers_signature) {
         // Restarting the PCM (transport stop/start, xrun recovery): keep the receiver/transmitter,
@@ -996,6 +1049,7 @@ unsafe extern "C" fn plugin_define(
         settings,
         ref_time: Instant::now(),
         use_flows_clock,
+        shared_settings_checked: false,
         capture_written: Arc::new(vec![]),
         stream_info: StreamInfo::new(std::ptr::null()), // set below, when io's address is known
         anchor: StreamAnchor::new_paused_guarding(buffers_valid.clone()),

@@ -1837,3 +1837,52 @@ fn device_with_empty_default_arguments_opens() {
     let pcm = Pcm::open(&config, SND_PCM_STREAM_CAPTURE, 85_333);
     pcm.prepare();
 }
+
+/// T21: PCMs with the same device ID in one process share one device, which has the settings of the first
+/// one opened. A PCM with different settings gets a warning saying which ones, once; identical PCMs (e.g.
+/// PipeWire's sink and source of one device) don't.
+#[test]
+fn pcm_merged_into_a_device_with_other_settings_is_warned_about() {
+    init_test_env();
+    let ids = TestIds {
+        base_port: 42000,
+        base_pid: 42,
+        tag: "merge",
+        latency_ns: LATENCY_NS,
+    };
+    let _clock = ClockServer::start(ids.clock_path());
+    let config = plugin_config(&ids, "plug-merge");
+    let first = Pcm::open(&config, SND_PCM_STREAM_CAPTURE, 85_333);
+    first.prepare();
+
+    let (_same, log) = with_stderr_captured(|| {
+        let pcm = Pcm::open(&config, SND_PCM_STREAM_PLAYBACK, 85_333);
+        pcm.prepare();
+        pcm
+    });
+    let warnings: Vec<&str> = log.lines().filter(|l| l.contains("WARN")).collect();
+    assert!(
+        warnings.is_empty(),
+        "identical settings warned about: {warnings:?}"
+    );
+
+    let other = config.replace(
+        &format!(r#"RX_CHANNELS "{CHANNELS}""#),
+        r#"RX_CHANNELS "8""#,
+    );
+    let (_other, log) = with_stderr_captured(|| {
+        let pcm = Pcm::open(&other, SND_PCM_STREAM_PLAYBACK, 85_333);
+        pcm.prepare();
+        pcm.prepare();
+        pcm
+    });
+    let warnings: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("WARN") && l.contains("RX channels"))
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        1,
+        "expected one warning naming the different setting: {log}"
+    );
+}
