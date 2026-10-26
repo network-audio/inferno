@@ -9,9 +9,8 @@ use inferno_aoip::device_server::Settings;
 const TEMPLATE: &str = "\
 # Inferno ASIO driver settings: KEY=VALUE, one per line. Restart the audio application \
                         after changing them.
-# All settings: https://github.com/stakach/inferno#configuration\
+# All settings: https://github.com/stakach/inferno#configuration#\
                         
-#
 # Name of the device on the Dante network (default: the application's name)
 #NAME=My DAW
 # Channels

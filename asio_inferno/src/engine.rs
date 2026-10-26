@@ -79,6 +79,8 @@ struct Running {
 pub struct Engine {
   sample_rate: u32,
   period: usize,
+  /// how late (frames) buffer switches may be caught up on without losing captured audio
+  max_lateness: usize,
   capture: Option<Stream>,
   playback: Option<Stream>,
   capture_rings: Rings,
@@ -131,15 +133,15 @@ impl Engine {
     };
     let info = &settings.self_info;
     let (rx, tx) = (info.rx_channels.len(), info.tx_channels.len());
-    let frames = ring_frames(
-      period,
-      info
-        .latency_samples()
-        .max(settings.tx_latency_ns as usize * info.sample_rate as usize / 1_000_000_000),
-    );
+    let latency = info
+      .latency_samples()
+      .max(settings.tx_latency_ns as usize * info.sample_rate as usize / 1_000_000_000);
+    let frames = ring_frames(period, latency);
     let mut engine = Self {
       sample_rate: info.sample_rate,
       period,
+      // the receiver writes up to the latency ahead: a late switch may still read the rest of the ring
+      max_lateness: frames - latency - 2 * period,
       capture: None,
       playback: None,
       capture_rings: rings(rx, frames),
@@ -227,6 +229,7 @@ impl Engine {
     let worker = Worker {
       sample_rate: self.sample_rate,
       period: self.period,
+      max_lateness: self.max_lateness,
       start_time,
       clock_source,
       capture_rings: self.capture_rings.clone(),
@@ -283,6 +286,7 @@ fn signature(rings: &Rings, period: usize) -> BuffersSignature {
 struct Worker {
   sample_rate: u32,
   period: usize,
+  max_lateness: usize,
   start_time: Clock,
   clock_source: Arc<dyn ClockSource>,
   capture_rings: Rings,
@@ -320,16 +324,21 @@ impl Worker {
         timer.sleep(remaining.saturating_sub(Duration::from_micros(300)).max(Duration::from_micros(100)));
         continue;
       }
-      if position > due + 2 * n as isize {
-        // the host (or this thread) stalled: skip to the current period
+      // Late (this thread or the host stalled): catch up switch by switch, the capture ring still holds the
+      // audio; outputs for the missed time are lost. Skip ahead only if the receiver overwrote it.
+      if position > due + n as isize {
         late_switches += 1;
-        if late_switches.is_power_of_two() {
+        let skip = position - due > self.max_lateness as isize;
+        if late_switches.is_power_of_two() || skip {
           warn!(
-            "buffer switch late by {} frames ({late_switches} times so far), skipping ahead",
-            position - due
+            "buffer switch late by {} frames ({late_switches} times so far), {}",
+            position - due,
+            if skip { "skipping ahead: captured audio lost" } else { "catching up" }
           );
         }
-        k = position as usize / n - 1;
+        if skip {
+          k = position as usize / n - 1;
+        }
       }
       let half = k % 2;
       let mask_c = self.capture_rings.first().map(|r| r.len() - 1).unwrap_or(0);

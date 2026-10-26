@@ -48,13 +48,19 @@ struct TestHost {
   switches: Arc<AtomicU64>,
   last_position: Arc<AtomicU64>,
   positions_ok: Arc<AtomicBool>,
+  /// stall (like an overloaded host) once, at this switch
+  stall_at: Option<u64>,
 }
 
 impl Host for TestHost {
   fn buffer_switch(&mut self, index: usize, position: u64, _system_time_ns: u64) {
     let n = self.switches.fetch_add(1, Ordering::Relaxed);
     let last = self.last_position.swap(position, Ordering::Relaxed);
-    if n > 0 && position <= last {
+    if self.stall_at == Some(n) {
+      std::thread::sleep(Duration::from_millis(30));
+    }
+    // consecutive periods: late switches are caught up, not skipped
+    if n > 0 && position != last + self.period as u64 {
       self.positions_ok.store(false, Ordering::Relaxed);
     }
     for (ch, halves) in self.outputs.iter().enumerate() {
@@ -92,6 +98,7 @@ async fn host_output_is_transmitted_on_time() {
     switches: switches.clone(),
     last_position: Arc::new(AtomicU64::new(0)),
     positions_ok: positions_ok.clone(),
+    stall_at: None,
   };
   let started = Instant::now();
   engine.start(Box::new(host)).unwrap();
@@ -153,4 +160,33 @@ async fn host_output_is_transmitted_on_time() {
     matched.load(Ordering::Relaxed) >= 2 * RATE as usize,
     "a second of both channels received exactly"
   );
+}
+
+#[test]
+fn a_stalled_host_gets_the_missed_switches() {
+  let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).try_init();
+  let clock: Arc<dyn ClockSource> = Arc::new(FreeRunningClockSource::new());
+  let mut engine =
+    Engine::new_with_clock(settings("asio_engine_stall", 23, 9800, 2, 2), PERIOD, Some(clock)).unwrap();
+  let switches = Arc::new(AtomicU64::new(0));
+  let positions_ok = Arc::new(AtomicBool::new(true));
+  let host = TestHost {
+    outputs: (0..2).map(|ch| [0, 1].map(|h| engine.output_buffer(ch, h).unwrap() as usize)).collect(),
+    period: PERIOD,
+    switches: switches.clone(),
+    last_position: Arc::new(AtomicU64::new(0)),
+    positions_ok: positions_ok.clone(),
+    // 30 ms: about 11 periods
+    stall_at: Some(100),
+  };
+  let started = Instant::now();
+  engine.start(Box::new(host)).unwrap();
+  std::thread::sleep(Duration::from_secs(1));
+  let elapsed = started.elapsed().as_secs_f64();
+  let switched = switches.load(Ordering::Relaxed);
+  drop(engine);
+  let expected = elapsed * RATE as f64 / PERIOD as f64;
+  println!("{switched} switches in {elapsed:.2} s (expected {expected:.0})");
+  assert!(positions_ok.load(Ordering::Relaxed), "no period skipped");
+  assert!((switched as f64 - expected).abs() < expected * 0.05, "the missed switches were caught up");
 }
