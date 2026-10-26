@@ -117,7 +117,11 @@ pub fn multicast_receiver(
   // each receiver gets a copy of the group's packets
   socket.set_reuse_address(true)?;
   // bound to the group address: only this group's packets, not other groups' on the same port
+  #[cfg(not(windows))]
   socket.bind(&group.into())?;
+  // Windows can't bind to a multicast address: it receives other joined groups' packets on this port too
+  #[cfg(windows)]
+  socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, group.port()).into())?;
   socket.join_multicast_v4(group.ip(), &interface_ip)?;
   socket.set_nonblocking(true)?;
   Ok(socket.into())

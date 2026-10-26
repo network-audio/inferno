@@ -47,7 +47,7 @@ fn start_clock_server(path: &str, running: Arc<AtomicBool>) -> std::thread::Join
   let path = path.to_string();
   std::thread::spawn(move || {
     let mut server = usrvclock::Server::new(path.into()).unwrap();
-    let overlay = usrvclock::ClockOverlay { clock_id: 1i64, last_sync: 0, shift: 0, freq_scale: 0.0 };
+    let overlay = usrvclock::ClockOverlay { clock_id: inferno_aoip::clock::MONOTONIC_CLOCK_ID, last_sync: 0, shift: 0, freq_scale: 0.0 };
     while running.load(Ordering::Relaxed) {
       server.send(overlay);
       std::thread::sleep(Duration::from_millis(100));
