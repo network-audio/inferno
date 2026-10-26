@@ -6,11 +6,12 @@ use std::{collections::BTreeMap, io::Write, path::PathBuf, sync::Once};
 
 use inferno_aoip::device_server::Settings;
 
+// not reformatted: rustfmt's string wrapping would change the text
+#[rustfmt::skip]
 const TEMPLATE: &str = "\
-# Inferno ASIO driver settings: KEY=VALUE, one per line. Restart the audio application \
-                        after changing them.
-# All settings: https://github.com/stakach/inferno#configuration#\
-                        
+# Inferno ASIO driver settings: KEY=VALUE, one per line. Restart the audio application after changing them.
+# All settings: https://github.com/stakach/inferno#configuration
+#
 # Name of the device on the Dante network (default: the application's name)
 #NAME=My DAW
 # Channels
@@ -125,5 +126,7 @@ mod tests {
   #[test]
   fn template_is_all_comments() {
     assert!(parse_config(TEMPLATE).is_empty());
+    assert!(TEMPLATE.lines().all(|l| l.starts_with('#')), "{TEMPLATE}");
+    assert!(TEMPLATE.contains("#configuration\n#\n# Name"), "{TEMPLATE}");
   }
 }
