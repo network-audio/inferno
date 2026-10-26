@@ -1,0 +1,14 @@
+[package]
+name = "pipe2inferno"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+inferno_aoip = { path = "../inferno_aoip" }
+log = "0.4"
+
+[dependencies.tokio]
+version = "1.36"
+features = [ "signal" ]

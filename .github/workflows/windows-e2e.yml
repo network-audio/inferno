@@ -1,0 +1,43 @@
+name: Windows end-to-end
+
+on:
+  push:
+    branches: [dev, windows-e2e]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  pipe-to-pipe:
+    # Pipe2inferno -> Inferno2pipe on one Windows host, routed with netaudio (see test/windows_e2e)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: cargo build -p pipe2inferno -p inferno2pipe
+      - run: pip install netaudio
+      - name: Give the host an address per device
+        # netaudio 0.4 keys devices by IP. SkipAsSource: the runner's own traffic keeps its address.
+        shell: pwsh
+        run: |
+          $adapter = Get-NetAdapter | Where-Object Status -eq Up | Sort-Object ifIndex | Select-Object -First 1
+          "adapter: $($adapter.Name) ($($adapter.InterfaceDescription))"
+          foreach ($ip in "10.213.77.1", "10.213.77.2") {
+            New-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress $ip -PrefixLength 24 -SkipAsSource $true | Out-Null
+          }
+          Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 | Format-Table IPAddress, PrefixOrigin, SkipAsSource
+          Get-NetUDPEndpoint -LocalPort 5353 -ErrorAction SilentlyContinue | Format-Table LocalAddress, OwningProcess
+      - run: python test/windows_e2e/run_e2e.py --bin-dir target/debug --tx-ip 10.213.77.1 --rx-ip 10.213.77.2 --out-dir e2e-out
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-e2e-logs
+          path: e2e-out/*.log
