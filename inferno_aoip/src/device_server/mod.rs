@@ -146,6 +146,8 @@ pub struct DeviceServer {
   rx_shutdown_todo: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
   /// receiver into external buffers, if running: its flows receiver and buffers, to switch them
   external_rx: Option<ExternalReceiver>,
+  /// the audio threads' sleeps and timeouts are short
+  _timer_resolution: crate::util::os::TimerResolution,
 }
 
 struct ExternalReceiver {
@@ -328,6 +330,7 @@ impl DeviceServer {
       rx_shutdown_todo: None,
       external_rx: None,
       tx_shutdown_todo: None,
+      _timer_resolution: crate::util::os::TimerResolution::fine(),
     })
   }
 

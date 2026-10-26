@@ -32,6 +32,31 @@ pub fn set_current_thread_realtime(_priority_hint: u8) -> Result<(), Error> {
   thread_priority::set_current_thread_priority(thread_priority::ThreadPriority::Max)
 }
 
+/// Fine timer resolution (1 ms, process-wide) while it lives. On Windows, sleeps and timeouts of the audio
+/// threads are otherwise rounded up to the default 15.6 ms tick. Nothing to do elsewhere.
+pub struct TimerResolution(());
+
+impl TimerResolution {
+  pub fn fine() -> Self {
+    #[cfg(windows)]
+    // safety: no preconditions; undone in drop
+    unsafe {
+      windows_sys::Win32::Media::timeBeginPeriod(1);
+    }
+    Self(())
+  }
+}
+
+impl Drop for TimerResolution {
+  fn drop(&mut self) {
+    #[cfg(windows)]
+    // safety: matches timeBeginPeriod in fine()
+    unsafe {
+      windows_sys::Win32::Media::timeEndPeriod(1);
+    }
+  }
+}
+
 #[cfg(all(test, target_family = "unix"))]
 mod tests {
   use super::fifo_priority;
