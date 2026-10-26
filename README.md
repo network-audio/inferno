@@ -188,7 +188,7 @@ This project is dual licensed under the GPLv3-or-later and AGPLv3-or-later. You 
 * `alsa_pcm_inferno` - virtual soundcard for ALSA. **Start here if you've ever dreamed of Dante Virtual Soundcard for Linux**
 * `searchfire` - fork of [Searchlight](https://github.com/WilliamVenner/searchlight) mDNS crate, modified for compatibility with Dante's mDNS
 
-`inferno_aoip`, `inferno_driver_core`, `inferno2pipe` and `pipe2inferno` build for Linux, macOS and Windows; the ALSA plugin and `inferno-doctor` are Linux-only. The media clock comes from a `ClockSource` (`inferno_aoip::clock`): on Unix the default is a PTP daemon at `CLOCK_PATH` (see below). Elsewhere there's no PTP integration yet: a device follows the clock source given to `DeviceServer::try_start_with_clock` (or `Stream::with_clock_source`), otherwise the local clock, not synchronised to the network.
+`inferno_aoip`, `inferno_driver_core`, `inferno2pipe` and `pipe2inferno` build for Linux, macOS and Windows; the ALSA plugin and `inferno-doctor` are Linux-only. The media clock comes from a `ClockSource` (`inferno_aoip::clock`), chosen by [`CLOCK_SOURCE`](#settings): on Unix the default is a PTP daemon at `CLOCK_PATH` (see below), on Windows Inferno's own PTPv1 follower. Applications can also give a device their own with `DeviceServer::try_start_with_clock` (or `Stream::with_clock_source`).
 
 
 # Clocking options
@@ -258,6 +258,7 @@ All settings have default values. In a simple setup you should be able to start 
 * `RX_LATENCY_NS` - receive latency in nanoseconds, i.e. how much time to wait for media packets, relatively to PTP media clock. Equivalent to latency setting in Dante Controller. Defaults to 10ms. May be removed in future versions when it becomes settable from DC and so stored in a configuration file.
 * `TX_LATENCY_NS` - transmit latency in nanoseconds, i.e. receive latency that this device will demand from devices receiving from us. Equivalent to latency setting in Dante Virtual Soundcard. Defaults to 10ms.
 * `TX_SOURCE_BIT_DEPTH` - bit depth of the audio applications transmit (16, 24 or 32, default 32). When it's higher than the bit depth sent over the network (24 bits), the transmitted audio is dithered. Set it to 24 for bit-exact transmission of 24-bit audio.
+* `CLOCK_SOURCE` - where the media clock comes from: `usrvclock` (a PTP daemon such as Statime at `CLOCK_PATH`; the default on Linux and macOS), `ptpv1` (Inferno's own PTPv1 follower on the `BIND_IP` interface, UDP 319/320; the default on Windows) or `free-running` (the local clock, not synchronised to the network: only for devices on one host). The PTPv1 follower timestamps in software and needs a PTPv1 leader on the network (a Dante device); on Windows, allow UDP 319 and 320 through the firewall.
 * `CLOCK_PATH` - path to either [usrvclock](https://gitlab.com/lumifaza/usrvclock) socket (default `/tmp/ptp-usrvclock`, where Statime creates it), or PTP device. If the latter, make sure [you are allowed](https://gitlab.freedesktop.org/pipewire/pipewire/-/blob/78642cc53bd84c2ad529f2175cc50a658d1e52c0/src/daemon/90-pipewire-aes67-ptp.rules) to read it. Also, write permissions are required if you want to see actual frequency offset in DC. (the clock is never adjusted from within Inferno, but the syscall to read the frequency requires write access)
 * `USE_SAFE_CLOCK` - not supported yet, must be `false` (the default).
 
@@ -347,6 +348,7 @@ If you want to contribute but can't code or don't know where to start because th
 * portability: `inferno_aoip` builds for macOS and Windows. The media clock comes from a `ClockSource` (usrvclock/Statime by default on Unix), and applications can give a device their own with `DeviceServer::try_start_with_clock`
 * new `inferno_driver_core` crate: the shared device and stream lifecycle, moved out of the ALSA plugin, to build drivers for other audio APIs on
 * new `pipe2inferno`: transmits audio from a file or pipe
+* PTPv1 follower built in (`CLOCK_SOURCE=ptpv1`, the default on Windows): follows the clock of a Dante network without a PTP daemon. Tested against a simulated leader on Linux, macOS and Windows, and in the Windows end-to-end test
 * Windows: receiving multicast flows works (sockets can't be bound to a multicast address there); end-to-end test in CI (`test/windows_e2e`): Pipe2inferno to Inferno2pipe routed with netaudio, bit-exact
 * a device that can't listen on its address gets a hint matching the cause (address in use, or not an address of this host)
 

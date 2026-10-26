@@ -6,6 +6,7 @@ use std::{
   sync::{Arc, RwLock},
 };
 
+use crate::clock::ClockSourceKind;
 use netdev::mac::MacAddr;
 
 use crate::device_info::{Channel, DeviceInfo};
@@ -27,6 +28,7 @@ pub const KEYS: &[&str] = &[
   "RX_LATENCY_NS",
   "TX_LATENCY_NS",
   "TX_SOURCE_BIT_DEPTH",
+  "CLOCK_SOURCE",
   "CLOCK_PATH",
   "USE_SAFE_CLOCK",
 ];
@@ -291,6 +293,7 @@ fn create_self_info(
 pub struct Settings {
   pub self_info: DeviceInfo,
   pub tx_latency_ns: u32,
+  pub clock_source: ClockSourceKind,
   pub clock_path: Option<PathBuf>,
   pub use_safe_clock: bool,
   pub tx_source_bit_depth: u8,
@@ -378,6 +381,15 @@ impl Settings {
       return Err(invalid("TX_SOURCE_BIT_DEPTH", &tx_source_bit_depth.to_string(), bit_depth_error));
     }
 
+    let clock_source = match config.get("CLOCK_SOURCE") {
+      None => ClockSourceKind::platform_default(),
+      Some(name) => ClockSourceKind::from_name(name).ok_or_else(|| {
+        let available: Vec<&str> =
+          ClockSourceKind::NAMES.iter().copied().filter(|n| ClockSourceKind::from_name(n).is_some()).collect();
+        invalid("CLOCK_SOURCE", name, &format!("must be one of: {}", available.join(", ")))
+      })?,
+    };
+
     let auto_identity = AutoIdentity {
       ports: !config.contains_key("ALT_PORT"),
       process_id: !config.contains_key("PROCESS_ID") && !config.contains_key("DEVICE_ID"),
@@ -387,6 +399,7 @@ impl Settings {
       self_info,
       tx_latency_ns: parse(&config, "TX_LATENCY_NS", "must be a latency in nanoseconds, e.g. 10000000")?
         .unwrap_or(10_000_000),
+      clock_source,
       clock_path: config.get("CLOCK_PATH").map(PathBuf::from),
       use_safe_clock,
       tx_source_bit_depth,
@@ -455,6 +468,16 @@ mod tests {
   }
   fn error_key(pairs: &[(&str, &str)]) -> &'static str {
     settings(pairs).err().expect("accepted invalid settings").key
+  }
+
+  #[test]
+  fn clock_source_is_chosen_by_name() {
+    assert_eq!(settings(&[]).unwrap().clock_source, ClockSourceKind::platform_default());
+    assert_eq!(settings(&[("CLOCK_SOURCE", "ptpv1")]).unwrap().clock_source, ClockSourceKind::Ptpv1);
+    assert_eq!(settings(&[("CLOCK_SOURCE", "free-running")]).unwrap().clock_source, ClockSourceKind::FreeRunning);
+    let e = settings(&[("CLOCK_SOURCE", "gps")]).err().unwrap();
+    assert_eq!(e.key, "CLOCK_SOURCE");
+    assert!(e.to_string().contains("ptpv1"), "{e}");
   }
 
   #[test]

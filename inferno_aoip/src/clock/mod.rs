@@ -5,14 +5,16 @@
 //! without a system call to the PTP daemon, on the real-time threads.
 //!
 //! On Unix, the default source is a PTP daemon (Statime) speaking the usrvclock protocol, see
-//! [`UsrvClockSource`]. Other platforms (or applications with their own PTP implementation) supply a
-//! source to [`crate::device_server::DeviceServer::try_start_with_clock`].
+//! [`UsrvClockSource`]. Elsewhere it's Inferno's own PTPv1 follower, see [`ptpv1`]. The setting
+//! `CLOCK_SOURCE` chooses ([`ClockSourceKind`]), and applications with their own PTP implementation can
+//! supply a source to [`crate::device_server::DeviceServer::try_start_with_clock`].
 
-use std::{path::PathBuf, sync::Arc};
+use std::{net::Ipv4Addr, path::PathBuf, sync::Arc};
 
 use futures::future::BoxFuture;
 use tokio::sync::watch;
 
+pub mod ptpv1;
 #[cfg(unix)]
 mod usrvclock_source;
 #[cfg(unix)]
@@ -169,26 +171,67 @@ impl ClockSource for FreeRunningClockSource {
   }
 }
 
-/// The clock source a device uses unless given one: the PTP daemon at `clock_path` (`CLOCK_PATH`) on Unix.
-/// Must be called inside a tokio runtime.
-#[cfg(unix)]
-pub fn default_clock_source(clock_path: Option<PathBuf>) -> Arc<dyn ClockSource> {
-  Arc::new(UsrvClockSource::start(clock_path))
+/// Where a device's media clock comes from (setting `CLOCK_SOURCE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClockSourceKind {
+  /// a PTP daemon (Statime) at `CLOCK_PATH`, via the usrvclock protocol (Unix)
+  Usrvclock,
+  /// Inferno's own PTPv1 follower (see [`ptpv1`]) on the device's interface
+  Ptpv1,
+  /// the local clock, not synchronised to the network (see [`FreeRunningClockSource`])
+  FreeRunning,
 }
 
-/// The clock source a device uses unless given one. There's no PTP daemon integration on this platform
-/// yet, so it's the free-running local clock: give the device a [`ClockSource`] to synchronise it.
-#[cfg(not(unix))]
-pub fn default_clock_source(clock_path: Option<PathBuf>) -> Arc<dyn ClockSource> {
-  use log::warn;
-  if clock_path.is_some() {
-    warn!("CLOCK_PATH is not supported on this platform, ignoring it");
+impl ClockSourceKind {
+  /// The setting's values.
+  pub const NAMES: &'static [&'static str] = &["usrvclock", "ptpv1", "free-running"];
+
+  /// Unix: a PTP daemon (Statime). Elsewhere: Inferno's own PTPv1 follower.
+  pub fn platform_default() -> Self {
+    if cfg!(unix) {
+      Self::Usrvclock
+    } else {
+      Self::Ptpv1
+    }
   }
-  warn!(
-    "no PTP clock source on this platform: using the local clock, not synchronised to the Dante \
-     network. Audio exchanged with other devices will drift."
-  );
-  Arc::new(FreeRunningClockSource::new())
+
+  pub fn from_name(name: &str) -> Option<Self> {
+    match name {
+      "usrvclock" if cfg!(unix) => Some(Self::Usrvclock),
+      "ptpv1" => Some(Self::Ptpv1),
+      "free-running" => Some(Self::FreeRunning),
+      _ => None,
+    }
+  }
+}
+
+/// Starts the clock source of `kind` for a device on the interface with address `interface` and MAC address
+/// `mac`. Must be called inside a tokio runtime.
+pub fn start_clock_source(
+  kind: ClockSourceKind,
+  clock_path: Option<PathBuf>,
+  interface: Ipv4Addr,
+  mac: [u8; 6],
+) -> std::io::Result<Arc<dyn ClockSource>> {
+  if clock_path.is_some() && kind != ClockSourceKind::Usrvclock {
+    log::warn!("CLOCK_PATH only applies to CLOCK_SOURCE=usrvclock, ignoring it");
+  }
+  Ok(match kind {
+    #[cfg(unix)]
+    ClockSourceKind::Usrvclock => Arc::new(UsrvClockSource::start(clock_path)),
+    #[cfg(not(unix))]
+    ClockSourceKind::Usrvclock => {
+      return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "usrvclock needs Unix"))
+    }
+    ClockSourceKind::Ptpv1 => Arc::new(ptpv1::Ptpv1ClockSource::start(ptpv1::Ptpv1Config::new(interface, mac))?),
+    ClockSourceKind::FreeRunning => {
+      log::warn!(
+        "CLOCK_SOURCE=free-running: the local clock, not synchronised to the network. Audio exchanged with \
+         devices on other hosts will drift."
+      );
+      Arc::new(FreeRunningClockSource::new())
+    }
+  })
 }
 
 #[cfg(test)]

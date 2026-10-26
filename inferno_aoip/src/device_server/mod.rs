@@ -1,5 +1,5 @@
 use crate::mdns_client::{MdnsClient, PointerToMulticast};
-use crate::clock::{default_clock_source, ClockSource};
+use crate::clock::{start_clock_source, ClockSource};
 use crate::media_clock::{async_clock_receiver_to_realtime, make_shared_media_clock};
 use crate::net_utils::UdpSocketWrapper;
 use crate::ring_buffer::{
@@ -160,7 +160,7 @@ impl DeviceServer {
     Self::try_start(settings).await.unwrap_or_else(|e| panic!("{e}"))
   }
 
-  /// Starts the device with the platform's default clock source (see `clock::default_clock_source`).
+  /// Starts the device with the clock source of its settings (`CLOCK_SOURCE`, see `clock::ClockSourceKind`).
   /// Fails if it can't listen on its network ports (e.g. used by another device).
   /// If the standard ports are in use (by another device on this host), and the settings let Inferno choose
   /// (see `Settings::auto_identity`), it picks free ports, and a process ID and name to be a separate device.
@@ -233,7 +233,20 @@ impl DeviceServer {
     let (mcast_tx, mcast_rx) = mpsc::channel(100);
 
     let owns_clock_source = clock_source.is_none();
-    let clock_source = clock_source.unwrap_or_else(|| default_clock_source(settings.clock_path.clone()));
+    let clock_source = match clock_source {
+      Some(source) => source,
+      None => start_clock_source(
+        settings.clock_source,
+        settings.clock_path.clone(),
+        self_info.ip_address,
+        self_info.mac_address.octets(),
+      )
+      .map_err(|source| StartError {
+        service: "PTP clock",
+        addr: SocketAddrV4::new(self_info.ip_address, crate::clock::ptpv1::EVENT_PORT),
+        source,
+      })?,
+    };
     info!("clock: {}", clock_source.description());
     let shared_media_clock = make_shared_media_clock(&clock_source, settings.use_safe_clock).await;
 

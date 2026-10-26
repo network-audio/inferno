@@ -15,7 +15,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use inferno_aoip::clock::FreeRunningClockSource;
+use inferno_aoip::clock::ptpv1::test_leader::{TestLeader, TestLeaderConfig};
+use inferno_aoip::clock::ptpv1::{Ptpv1ClockSource, Ptpv1Config};
+use inferno_aoip::clock::{ClockSource, FreeRunningClockSource};
 use inferno_aoip::device_server::{
   AtomicSample, DeviceServer, ExternalBufferParameters, MediaClock, Sample, Settings, StreamAnchor,
   TransferNotifier,
@@ -146,6 +148,32 @@ async fn test_loopback_trx_with_given_clock_source() {
   let rx_settings = make_settings("test_rx_given_clock", 4, 9300, 2, 0, None);
   let tx_server = DeviceServer::try_start_with_clock(tx_settings, clock.clone()).await.unwrap();
   let rx_server = DeviceServer::try_start_with_clock(rx_settings, clock).await.unwrap();
+  loopback(tx_server, rx_server).await;
+}
+
+/// Each device follows a (simulated) PTPv1 leader with its own follower, like devices in separate processes:
+/// their clocks agree only as well as PTP synchronises them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_loopback_trx_with_ptpv1_clock() {
+  let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).try_init();
+
+  let lo = Ipv4Addr::LOCALHOST;
+  let (event_port, general_port) = (31930, 31931);
+  let mut leader_config = TestLeaderConfig::new(lo);
+  leader_config.event_port = event_port;
+  leader_config.general_port = general_port;
+  let _leader = TestLeader::start(leader_config).unwrap();
+  let follower = |uuid_last: u8| -> Arc<dyn ClockSource> {
+    let mut config = Ptpv1Config::new(lo, [0x02, 0, 0, 0, 0, uuid_last]);
+    config.event_port = event_port;
+    config.general_port = general_port;
+    Arc::new(Ptpv1ClockSource::start(config).unwrap())
+  };
+
+  let tx_settings = make_settings("test_tx_ptpv1", 5, 9400, 0, 2, None);
+  let rx_settings = make_settings("test_rx_ptpv1", 6, 9500, 2, 0, None);
+  let tx_server = DeviceServer::try_start_with_clock(tx_settings, follower(1)).await.unwrap();
+  let rx_server = DeviceServer::try_start_with_clock(rx_settings, follower(2)).await.unwrap();
   loopback(tx_server, rx_server).await;
 }
 

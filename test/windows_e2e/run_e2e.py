@@ -2,8 +2,8 @@
 routed with netaudio like the Linux Docker test (test/dockerized_trx). Exits with the test result.
 
 Both devices run on this host, on their own IP addresses (netaudio 0.4 keys devices by IP): pass two
-addresses assigned to this host. They follow the local clock, the same performance counter in every process
-on the host, so they're in sync without PTP.
+addresses assigned to this host. Each follows the clock of a simulated PTPv1 leader (the
+`ptpv1_test_leader` example) with its own PTPv1 follower, Inferno's default clock source on Windows.
 
 Usage: python run_e2e.py --bin-dir target/debug --tx-ip 10.213.77.1 --rx-ip 10.213.77.2 --out-dir e2e-out
 """
@@ -141,6 +141,10 @@ def main():
     source = write_source(source_path)
     log(f"source: {SOURCE_SECONDS} s, {CHANNELS} channels")
 
+    leader_log = open(out / "leader.log", "w")
+    leader = subprocess.Popen(
+        [args.bin_dir / "examples" / f"ptpv1_test_leader{exe}", args.tx_ip],
+        env=dict(os.environ, RUST_LOG="info"), stdout=leader_log, stderr=subprocess.STDOUT)
     tx_log = open(out / "tx.log", "w")
     rx_log = open(out / "rx.log", "w")
     tx = subprocess.Popen(
@@ -156,6 +160,12 @@ def main():
             log("❌ devices not discovered in time")
             return 1
         log(f"✅ devices discovered ({time.time() - start:.0f} s)")
+        for name in ("tx.log", "rx.log"):
+            device_log = (out / name).read_text(errors="replace")
+            if "clock available from PTPv1" not in device_log:
+                log(f"❌ {name}: the device doesn't follow the PTPv1 leader")
+                return 1
+        log("✅ both devices follow the PTPv1 leader")
 
         code, output = netaudio("subscription", "add", "--tx", TX_NAME, "--rx", RX_NAME)
         log(output)
@@ -184,14 +194,15 @@ def main():
         result = 0
         return 0
     finally:
-        for process in (tx, rx):
+        for process in (tx, rx, leader):
             if process.poll() is None:
                 process.kill()
                 process.wait()
         tx_log.close()
         rx_log.close()
+        leader_log.close()
         if result != 0:
-            for name in ("tx.log", "rx.log"):
+            for name in ("leader.log", "tx.log", "rx.log"):
                 log(f"----- {name} (last lines)")
                 log("\n".join((out / name).read_text(errors="replace").splitlines()[-60:]))
 
