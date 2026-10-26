@@ -57,6 +57,8 @@ def device_env(name, ip, process_id):
         "INFERNO_SAMPLE_RATE": str(SAMPLE_RATE),
         "INFERNO_RX_LATENCY_NS": str(LATENCY_NS),
         "INFERNO_TX_LATENCY_NS": str(LATENCY_NS),
+        # the source is 24-bit: transmit it bit-exact, not dithered
+        "INFERNO_TX_SOURCE_BIT_DEPTH": "24",
         "RUST_LOG": env.get("RUST_LOG", "info"),
     })
     return env
