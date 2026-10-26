@@ -37,7 +37,10 @@ jobs:
         run: |
           if ("${{ matrix.network }}" -eq "loopback-adapter") {
             choco install devcon.portable --yes --no-progress | Out-Null
-            devcon install "$env:windir\inf\netloop.inf" "*msloop"
+            $devcon = Get-ChildItem "$env:ChocolateyInstall\lib\devcon.portable" -Recurse -Filter "devcon*64*.exe" |
+              Select-Object -First 1
+            "devcon: $($devcon.FullName)"
+            & $devcon.FullName install "$env:windir\inf\netloop.inf" "*msloop"
             Start-Sleep -Seconds 5
             $adapter = Get-NetAdapter | Where-Object InterfaceDescription -like "*KM-TEST Loopback*" | Select-Object -First 1
             "adapter: $($adapter.Name) ($($adapter.InterfaceDescription)), index $($adapter.ifIndex)"

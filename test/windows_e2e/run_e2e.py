@@ -120,6 +120,8 @@ def compare(source, recording_path):
 
 
 def main():
+    # the Windows console's code page can't print ✅/❌
+    sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser()
     parser.add_argument("--bin-dir", type=Path, required=True)
     parser.add_argument("--tx-ip", required=True)
