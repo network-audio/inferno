@@ -12,6 +12,13 @@ env:
 jobs:
   pipe-to-pipe:
     # Pipe2inferno -> Inferno2pipe on one Windows host, routed with netaudio (see test/windows_e2e)
+    strategy:
+      fail-fast: false
+      matrix:
+        # netaudio 0.4 keys devices by IP: give each device its own on a loopback adapter, or let them share
+        # the runner's (netaudio then lists and subscribes them, but skips their status probes). The runner's
+        # own adapter mustn't be changed: that cuts the runner off.
+        network: [loopback-adapter, shared-ip]
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -24,36 +31,36 @@ jobs:
           python-version: "3.13"
       - run: cargo build -p pipe2inferno -p inferno2pipe
       - run: pip install netaudio
-      - name: Give the host an address per device
-        # netaudio 0.4 keys devices by IP. SkipAsSource: the runner's own traffic keeps its address. If the
-        # adapter doesn't take extra addresses, both devices share the runner's (netaudio lists and subscribes
-        # them, but skips their status probes).
+      - name: Device addresses
+        timeout-minutes: 5
         shell: pwsh
         run: |
-          Get-NetIPConfiguration | Format-List InterfaceAlias, InterfaceIndex, IPv4Address, IPv4DefaultGateway
-          # the adapter of the IPv4 default route
-          $route = Get-NetRoute -DestinationPrefix 0.0.0.0/0 | Sort-Object RouteMetric | Select-Object -First 1
-          $adapter = Get-NetAdapter -InterfaceIndex $route.ifIndex
-          "adapter: $($adapter.Name) ($($adapter.InterfaceDescription)), index $($adapter.ifIndex)"
-          $ips = @("10.213.77.1", "10.213.77.2")
-          try {
+          if ("${{ matrix.network }}" -eq "loopback-adapter") {
+            choco install devcon.portable --yes --no-progress | Out-Null
+            devcon install "$env:windir\inf\netloop.inf" "*msloop"
+            Start-Sleep -Seconds 5
+            $adapter = Get-NetAdapter | Where-Object InterfaceDescription -like "*KM-TEST Loopback*" | Select-Object -First 1
+            "adapter: $($adapter.Name) ($($adapter.InterfaceDescription)), index $($adapter.ifIndex)"
+            $ips = @("10.213.77.1", "10.213.77.2")
             foreach ($ip in $ips) {
-              New-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress $ip -PrefixLength 24 `
-                -SkipAsSource $true -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+              New-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress $ip -PrefixLength 24 -ErrorAction Stop | Out-Null
             }
-          } catch {
-            "can't add addresses ($_), both devices use the runner's address"
+          } else {
+            $route = Get-NetRoute -DestinationPrefix 0.0.0.0/0 | Sort-Object RouteMetric | Select-Object -First 1
+            $adapter = Get-NetAdapter -InterfaceIndex $route.ifIndex
+            "adapter: $($adapter.Name) ($($adapter.InterfaceDescription)), index $($adapter.ifIndex)"
             $own = (Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -AddressState Preferred |
               Select-Object -First 1).IPAddress
             $ips = @($own, $own)
           }
           "TX_IP=$($ips[0])" >> $env:GITHUB_ENV
           "RX_IP=$($ips[1])" >> $env:GITHUB_ENV
-          Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 | Format-Table IPAddress, PrefixOrigin, SkipAsSource
+          Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 | Format-Table IPAddress, PrefixOrigin
           Get-NetUDPEndpoint -LocalPort 5353 -ErrorAction SilentlyContinue | Format-Table LocalAddress, OwningProcess
-      - run: python test/windows_e2e/run_e2e.py --bin-dir target/debug --tx-ip ${{ env.TX_IP }} --rx-ip ${{ env.RX_IP }} --out-dir e2e-out
+      - timeout-minutes: 10
+        run: python test/windows_e2e/run_e2e.py --bin-dir target/debug --tx-ip ${{ env.TX_IP }} --rx-ip ${{ env.RX_IP }} --out-dir e2e-out
       - if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-e2e-logs
+          name: windows-e2e-logs-${{ matrix.network }}
           path: e2e-out/*.log
