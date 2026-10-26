@@ -76,4 +76,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows-e2e-logs-${{ matrix.network }}
-          path: e2e-out/*.log
+          path: |
+            e2e-out/*.log
+            e2e-out/recording.raw

@@ -98,6 +98,8 @@ def compare(source, recording_path):
         offset = source_bytes.find(window.tobytes(), offset + 1)
     if offset < 0:
         log(f"recorded audio (from frame {first}) not found in the source")
+        log("first recorded frames: " + " ".join(f"{v & 0xffffffff:08x}" for v in recording[:16 * CHANNELS]))
+        log("first source frames:   " + " ".join(f"{v & 0xffffffff:08x}" for v in source[:16 * CHANNELS]))
         return 0
     source_frame = offset // (4 * CHANNELS)
     log(f"recording frame {first} is source frame {source_frame}")
