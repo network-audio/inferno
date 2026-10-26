@@ -36,5 +36,5 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build -p inferno_aoip -p inferno_driver_core -p inferno2pipe --all-targets
+      - run: cargo build -p inferno_aoip -p inferno_driver_core -p inferno2pipe -p pipe2inferno --all-targets
       - run: cargo test -p inferno_aoip -p inferno_driver_core -- --test-threads=1
