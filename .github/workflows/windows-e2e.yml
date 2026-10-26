@@ -30,8 +30,11 @@ jobs:
         # them, but skips their status probes).
         shell: pwsh
         run: |
-          $adapter = Get-NetAdapter | Where-Object Status -eq Up | Sort-Object ifIndex | Select-Object -First 1
-          "adapter: $($adapter.Name) ($($adapter.InterfaceDescription))"
+          Get-NetIPConfiguration | Format-List InterfaceAlias, InterfaceIndex, IPv4Address, IPv4DefaultGateway
+          # the adapter of the IPv4 default route
+          $route = Get-NetRoute -DestinationPrefix 0.0.0.0/0 | Sort-Object RouteMetric | Select-Object -First 1
+          $adapter = Get-NetAdapter -InterfaceIndex $route.ifIndex
+          "adapter: $($adapter.Name) ($($adapter.InterfaceDescription)), index $($adapter.ifIndex)"
           $ips = @("10.213.77.1", "10.213.77.2")
           try {
             foreach ($ip in $ips) {
@@ -40,7 +43,8 @@ jobs:
             }
           } catch {
             "can't add addresses ($_), both devices use the runner's address"
-            $own = (Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 | Select-Object -First 1).IPAddress
+            $own = (Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -AddressState Preferred |
+              Select-Object -First 1).IPAddress
             $ips = @($own, $own)
           }
           "TX_IP=$($ips[0])" >> $env:GITHUB_ENV
