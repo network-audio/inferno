@@ -60,7 +60,8 @@ pub fn load_settings() -> Result<Settings, String> {
     Err(e) => return Err(format!("can't read {}: {e}", path.display())),
   };
   let config = Settings::merged_config(&file);
-  let unknown = Settings::unknown_keys(&config, &[]);
+  // INFERNO_ASIO_CONFIG (the file's path) isn't a device setting
+  let unknown = Settings::unknown_keys(&config, &["ASIO_CONFIG"]);
   if !unknown.is_empty() {
     log::warn!(
       "ignoring unknown settings (misspelt?) in {} or the environment: {}",
