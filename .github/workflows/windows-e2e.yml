@@ -31,7 +31,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: cargo build -p pipe2inferno -p inferno2pipe --example ptpv1_test_leader
+      - run: cargo build -p pipe2inferno -p inferno2pipe && cargo build -p inferno_aoip --example ptpv1_test_leader
       - run: pip install netaudio
       - name: Device addresses
         timeout-minutes: 5

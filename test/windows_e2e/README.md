@@ -16,5 +16,6 @@ runner off from GitHub.
 
 Run it yourself (Python 3, `pip install netaudio`, two addresses of this host):
 
-    cargo build -p pipe2inferno -p inferno2pipe --example ptpv1_test_leader
+    cargo build -p pipe2inferno -p inferno2pipe
+    cargo build -p inferno_aoip --example ptpv1_test_leader
     python test/windows_e2e/run_e2e.py --bin-dir target/debug --tx-ip <address> --rx-ip <address> --out-dir e2e-out
