@@ -135,6 +135,7 @@ async fn main() {
     settings.make_rx_channels(0);
     settings.make_tx_channels(ch_count);
     let sample_rate = settings.self_info.sample_rate;
+    let tx_latency_ns = settings.tx_latency_ns;
 
     let input: Box<dyn Read + Send> = if args.input == "-" {
         Box::new(std::io::stdin())
@@ -174,25 +175,46 @@ async fn main() {
         })
         .collect();
     let anchor = StreamAnchor::new_paused();
+    // the transmitter's position: unused, the input is read along the media clock (the stream runs whether
+    // anyone receives it or not, and the transmitter reports no position without flows)
     let tx_position = Arc::new(AtomicUsize::new(usize::MAX));
-    server.transmit_from_external_buffer(buffers, anchor.clone(), tx_position.clone(), None).await;
+    server.transmit_from_external_buffer(buffers, anchor.clone(), tx_position, None).await;
     anchor.start(start_time);
     info!("transmitting {ch_count} channels");
 
+    // a frame at position p is transmitted at media time start_time + p + latency
+    let latency_frames = (tx_latency_ns as u64 * sample_rate as u64 / 1_000_000_000) as usize;
+    let mut clock_rx = server.get_realtime_clock_receiver();
     let (done_tx, done_rx) = oneshot::channel();
     let feeder_thread = std::thread::spawn(move || {
+        let mut media_clock = MediaClock::new(false);
         loop {
-            let current = tx_position.load(Ordering::Acquire);
-            let position = if current == usize::MAX { 0 } else { current.wrapping_sub(start_time) };
+            if clock_rx.update() {
+                if let Some(overlay) = clock_rx.get() {
+                    media_clock.update_overlay(*overlay);
+                }
+            }
+            let Some(now) = media_clock.wrapping_now_in_timebase(sample_rate as u64) else {
+                std::thread::sleep(FEED_INTERVAL);
+                continue;
+            };
+            // the stream's position now: what the transmitter reads later, after its latency
+            let Ok(position) = usize::try_from((now as usize).wrapping_sub(start_time) as isize) else {
+                // the clock stepped back before the start
+                std::thread::sleep(FEED_INTERVAL);
+                continue;
+            };
             if input_ended {
                 // until everything read has been transmitted
-                if position >= written.load(Ordering::Acquire) {
+                if position >= written.load(Ordering::Acquire) + latency_frames {
                     break;
                 }
             } else {
-                let ahead = written.load(Ordering::Acquire).saturating_sub(position);
-                if ahead < READ_AHEAD_FRAMES {
-                    input_ended = !feeder.feed(READ_AHEAD_FRAMES - ahead);
+                // after a stall, catch up at once: the position may have run far ahead of the input
+                let target = position + READ_AHEAD_FRAMES;
+                while !input_ended && written.load(Ordering::Acquire) < target {
+                    let frames = (target - written.load(Ordering::Acquire)).min(READ_AHEAD_FRAMES);
+                    input_ended = !feeder.feed(frames);
                     if input_ended {
                         info!("end of input");
                     }
