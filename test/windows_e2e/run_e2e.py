@@ -256,14 +256,15 @@ def asio_scenario(args, procs, exe):
     if procs.exited():
         log(f"❌ a device exited early: {procs.exited()}")
         return False
+    # the recorder first: once the host stops, the driver transmits silence
+    rx.kill()
+    rx.wait()
     stop_file.write_text("stop")
     try:
         code = asio.wait(timeout=30)
     except subprocess.TimeoutExpired:
         log("❌ the ASIO host didn't stop")
         return False
-    rx.kill()
-    rx.wait()
     log((out / "asio_host.log").read_text(errors="replace"))
     if code != 0:
         log(f"❌ the ASIO host failed ({code})")
