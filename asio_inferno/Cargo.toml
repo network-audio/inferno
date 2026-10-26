@@ -1,0 +1,35 @@
+[package]
+name = "asio_inferno"
+description = "ASIO driver for Windows: an Inferno (Dante) virtual soundcard for DAWs"
+authors = ["Teo <teodly@lumifaza.org>"]
+license = "GPL-3.0-or-later OR AGPL-3.0-or-later"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "inferno_asio"
+# the DLL loaded by ASIO hosts, and a library for tests
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+inferno_aoip = { path = "../inferno_aoip" }
+inferno_driver_core = { path = "../inferno_driver_core" }
+env_logger = "0.11"
+log = "0.4.20"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_Media",
+  "Win32_Security",
+  "Win32_System_Com",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Registry",
+  "Win32_System_SystemServices",
+  "Win32_System_Threading",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tokio = { version = "1.36", features = ["macros", "rt-multi-thread"] }

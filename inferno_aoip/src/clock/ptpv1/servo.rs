@@ -8,8 +8,10 @@ use crate::clock::{ClockOverlay, MONOTONIC_CLOCK_ID};
 
 /// Sync measurements in the fit.
 const WINDOW: usize = 64;
-/// Sync measurements before the clock is published.
-const MIN_SAMPLES: usize = 16;
+/// Sync measurements for outlier rejection, and before the clock is published...
+const MIN_SAMPLES: usize = 4;
+/// ...spanning at least this long (leaders send 1 to 8 Syncs per second).
+const MIN_SPAN_NS: i64 = 1_500_000_000;
 const DELAY_WINDOW: usize = 8;
 /// A measurement this far off the fit is an outlier, or the leader's clock stepped.
 const STEP_THRESHOLD_NS: i64 = 1_000_000;
@@ -161,7 +163,8 @@ impl Servo {
   /// The leader's time over the local monotonic clock, once there are enough measurements.
   pub fn overlay(&self) -> Option<ClockOverlay> {
     let fit = self.fit?;
-    if self.samples.len() < MIN_SAMPLES {
+    let span = self.samples.back()?.0.wrapping_sub(self.samples.front()?.0);
+    if self.samples.len() < MIN_SAMPLES || span < MIN_SPAN_NS {
       return None;
     }
     Some(ClockOverlay {
@@ -203,11 +206,19 @@ mod tests {
 
   #[test]
   fn not_published_before_enough_measurements() {
+    // 8 Syncs per second: published once they span 1.5 s
     let mut servo = Servo::new();
-    feed(&mut servo, 0, (MIN_SAMPLES - 1) as i64, 0);
+    feed(&mut servo, 0, 12, 0);
     assert!(servo.overlay().is_none());
-    feed(&mut servo, MIN_SAMPLES as i64, 1, 0);
+    feed(&mut servo, 12, 1, 0);
     assert!(servo.overlay().is_some());
+    // 1 Sync per second: 4 of them are enough
+    let mut servo = Servo::new();
+    for i in 0..4 {
+      let local = 1_000_000_000 + i * 1_000_000_000;
+      servo.add_sync(local, leader_at(local) - DELAY);
+      assert_eq!(servo.overlay().is_some(), i == 3, "after {} Syncs", i + 1);
+    }
   }
 
   #[test]

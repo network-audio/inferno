@@ -8,6 +8,7 @@ members = [
     "pipe2inferno",
     "inferno_driver_core",
     "alsa_pcm_inferno",
+    "asio_inferno",
     "inferno_doctor",
 ]
 

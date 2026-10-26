@@ -185,10 +185,11 @@ This project is dual licensed under the GPLv3-or-later and AGPLv3-or-later. You 
 * `inferno2pipe` - capture audio, writing interleaved 32-bit integer samples into an Unix named pipe (or a raw file). Helper script for recording to more convenient format is also provided. **Start here if you want to use Inferno for capturing audio without setting up whole audio stack**
 * `inferno_driver_core` - platform-neutral core of virtual soundcard drivers: the device shared by an application's streams, and the stream lifecycle (prepare, start, stop, restart without dropping flows, waiting for the clock). **Start here if you want to write a driver for another audio API** (CoreAudio, Windows): translate its callbacks to a `Stream`'s, like `alsa_pcm_inferno` does
 * `pipe2inferno` - the opposite of `inferno2pipe`: transmits interleaved 32-bit integer samples from a file or a pipe (`-` for stdin). For testing, and for sending audio without an audio stack
+* `asio_inferno` - ASIO driver: a virtual soundcard for Windows DAWs and other ASIO hosts (experimental, see [its README](asio_inferno/README.md))
 * `alsa_pcm_inferno` - virtual soundcard for ALSA. **Start here if you've ever dreamed of Dante Virtual Soundcard for Linux**
 * `searchfire` - fork of [Searchlight](https://github.com/WilliamVenner/searchlight) mDNS crate, modified for compatibility with Dante's mDNS
 
-`inferno_aoip`, `inferno_driver_core`, `inferno2pipe` and `pipe2inferno` build for Linux, macOS and Windows; the ALSA plugin and `inferno-doctor` are Linux-only. The media clock comes from a `ClockSource` (`inferno_aoip::clock`), chosen by [`CLOCK_SOURCE`](#settings): on Unix the default is a PTP daemon at `CLOCK_PATH` (see below), on Windows Inferno's own PTPv1 follower. Applications can also give a device their own with `DeviceServer::try_start_with_clock` (or `Stream::with_clock_source`).
+`inferno_aoip`, `inferno_driver_core`, `inferno2pipe` and `pipe2inferno` build for Linux, macOS and Windows; the ALSA plugin and `inferno-doctor` are Linux-only, the ASIO driver Windows-only. The media clock comes from a `ClockSource` (`inferno_aoip::clock`), chosen by [`CLOCK_SOURCE`](#settings): on Unix the default is a PTP daemon at `CLOCK_PATH` (see below), on Windows Inferno's own PTPv1 follower. Applications can also give a device their own with `DeviceServer::try_start_with_clock` (or `Stream::with_clock_source`).
 
 
 # Clocking options
@@ -348,6 +349,7 @@ If you want to contribute but can't code or don't know where to start because th
 * portability: `inferno_aoip` builds for macOS and Windows. The media clock comes from a `ClockSource` (usrvclock/Statime by default on Unix), and applications can give a device their own with `DeviceServer::try_start_with_clock`
 * new `inferno_driver_core` crate: the shared device and stream lifecycle, moved out of the ALSA plugin, to build drivers for other audio APIs on
 * new `pipe2inferno`: transmits audio from a file or pipe
+* new ASIO driver for Windows (`asio_inferno`, experimental): tested in CI with a minimal ASIO host, Pipe2inferno -> driver inputs and driver outputs -> Inferno2pipe, bit-exact
 * PTPv1 follower built in (`CLOCK_SOURCE=ptpv1`, the default on Windows): follows the clock of a Dante network without a PTP daemon. Tested against a simulated leader on Linux, macOS and Windows, and in the Windows end-to-end test
 * Windows: receiving multicast flows works (sockets can't be bound to a multicast address there); end-to-end test in CI (`test/windows_e2e`): Pipe2inferno to Inferno2pipe routed with netaudio, bit-exact
 * a device that can't listen on its address gets a hint matching the cause (address in use, or not an address of this host)

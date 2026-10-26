@@ -1,11 +1,16 @@
-"""End-to-end test of Inferno on Windows: Pipe2inferno transmits a known signal, Inferno2pipe receives it,
-routed with netaudio like the Linux Docker test (test/dockerized_trx). Exits with the test result.
+"""End-to-end tests of Inferno on Windows, routed with netaudio like the Linux Docker test
+(test/dockerized_trx). Recordings must match their sources exactly. Exits with the test result.
 
-Both devices run on this host, on their own IP addresses (netaudio 0.4 keys devices by IP): pass two
-addresses assigned to this host. Each follows the clock of a simulated PTPv1 leader (the
-`ptpv1_test_leader` example) with its own PTPv1 follower, Inferno's default clock source on Windows.
+Scenarios:
+* pipe: Pipe2inferno transmits a known signal, Inferno2pipe receives it
+* asio: the ASIO driver, in a minimal ASIO host (the `asio_host` example): Pipe2inferno -> driver inputs,
+  recorded by the host; the host plays another signal to the driver outputs -> Inferno2pipe
 
-Usage: python run_e2e.py --bin-dir target/debug --tx-ip 10.213.77.1 --rx-ip 10.213.77.2 --out-dir e2e-out
+Devices run on this host, each on an IP address of its own if given several (netaudio 0.4 keys devices by
+IP). Each follows the clock of a simulated PTPv1 leader (the `ptpv1_test_leader` example) with its own
+PTPv1 follower, Inferno's default clock source on Windows.
+
+Usage: python run_e2e.py --scenario pipe --bin-dir target/debug --ips 10.213.77.1,10.213.77.2,10.213.77.3 --out-dir e2e-out
 """
 
 import argparse
@@ -27,17 +32,18 @@ DISCOVERY_TIMEOUT = 120
 LATENCY_NS = 40_000_000
 TX_NAME = "wine2etx"
 RX_NAME = "wine2erx"
+ASIO_NAME = "wine2easio"
 
 
 def log(message):
     print(message, flush=True)
 
 
-def write_source(path):
+def write_source(path, seed=1234):
     """Interleaved native-endian s32: pseudo-random 24-bit values (Dante carries 24 bits), so that any
     window of the source is unique and a recording can be aligned to it exactly."""
     count = SOURCE_SECONDS * SAMPLE_RATE * CHANNELS
-    random_bytes = random.Random(1234).randbytes(3 * count)
+    random_bytes = random.Random(seed).randbytes(3 * count)
     # little-endian s32 with the low byte zero (x86 and ARM Windows are little-endian)
     data = bytearray(4 * count)
     for i in range(3):
@@ -69,12 +75,12 @@ def netaudio(*args, timeout=90):
     return result.returncode, result.stdout + result.stderr
 
 
-def wait_for_devices(deadline):
+def wait_for_devices(names, deadline):
     while True:
         code, out = netaudio("device", "list")
-        found = [name for name in (TX_NAME, RX_NAME) if name in out]
+        found = [name for name in names if name in out]
         log(f"netaudio device list (exit {code}): found {found}")
-        if len(found) == 2:
+        if len(found) == len(names):
             return True
         if time.time() > deadline:
             log(out)
@@ -123,88 +129,171 @@ def compare(source, recording_path):
     return matching if mismatches == 0 else 0
 
 
+class Processes:
+    """Child processes with their logs in the output directory, killed at the end."""
+
+    def __init__(self, out):
+        self.out = out
+        self.processes = {}
+
+    def start(self, name, command, env):
+        log_file = open(self.out / f"{name}.log", "w")
+        self.processes[name] = (subprocess.Popen(command, env=env, stdout=log_file, stderr=subprocess.STDOUT), log_file)
+        return self.processes[name][0]
+
+    def exited(self):
+        return {name: p.poll() for name, (p, _) in self.processes.items() if p.poll() is not None}
+
+    def stop(self, failed):
+        for process, log_file in self.processes.values():
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            log_file.close()
+        if failed:
+            for name in self.processes:
+                log(f"----- {name}.log (last lines)")
+                log("\n".join((self.out / f"{name}.log").read_text(errors="replace").splitlines()[-60:]))
+
+
+def subscribe(tx, rx):
+    code, output = netaudio("subscription", "add", "--tx", tx, "--rx", rx)
+    log(output)
+    if code != 0:
+        log(f"❌ subscription {tx} -> {rx} failed")
+        return False
+    return True
+
+
+def check_subscribed(rx_names):
+    code, output = netaudio("subscription", "list")
+    log(output)
+    for rx in rx_names:
+        subscribed = [line for line in output.splitlines() if rx in line and "Subscribed" in line]
+        if len(subscribed) < CHANNELS:
+            log(f"❌ expected {CHANNELS} subscribed channels of {rx}")
+            return False
+    return True
+
+
+def check_clock(log_paths):
+    for path in log_paths:
+        if "clock available from PTPv1" not in path.read_text(errors="replace"):
+            log(f"❌ {path.name}: the device doesn't follow the PTPv1 leader")
+            return False
+    log("✅ all devices follow the PTPv1 leader")
+    return True
+
+
+def check_recording(source, path, what):
+    matching = compare(source, path)
+    if matching < MIN_MATCHING_SECONDS * SAMPLE_RATE:
+        log(f"❌ {what}: less than {MIN_MATCHING_SECONDS} s of the recording matches the source exactly")
+        return False
+    log(f"✅ {what}: {matching / SAMPLE_RATE:.1f} s of audio received exactly as transmitted")
+    return True
+
+
+def pipe_scenario(args, procs, exe):
+    out = args.out_dir
+    source = write_source(out / "source.raw")
+    recording = out / "recording.raw"
+    procs.start("tx", [args.bin_dir / f"pipe2inferno{exe}", "-c", str(CHANNELS), "-i", out / "source.raw"],
+                device_env(TX_NAME, args.ips[0], 1))
+    rx = procs.start("rx", [args.bin_dir / f"inferno2pipe{exe}", "-c", str(CHANNELS), "-o", recording],
+                     device_env(RX_NAME, args.ips[1 % len(args.ips)], 2))
+    start = time.time()
+    if not wait_for_devices([TX_NAME, RX_NAME], start + DISCOVERY_TIMEOUT):
+        log("❌ devices not discovered in time")
+        return False
+    log(f"✅ devices discovered ({time.time() - start:.0f} s)")
+    if not check_clock([out / "tx.log", out / "rx.log"]):
+        return False
+    if not subscribe(TX_NAME, RX_NAME) or not check_subscribed([RX_NAME]):
+        return False
+    log("✅ subscribed")
+    time.sleep(RECORD_SECONDS)
+    if procs.exited():
+        log(f"❌ a device exited early: {procs.exited()}")
+        return False
+    rx.kill()
+    rx.wait()
+    return check_recording(source, recording, "Pipe2inferno -> Inferno2pipe")
+
+
+def asio_scenario(args, procs, exe):
+    out = args.out_dir
+    ip = lambda i: args.ips[i % len(args.ips)]
+    to_asio = write_source(out / "to_asio.raw", seed=1234)
+    from_asio = write_source(out / "from_asio.raw", seed=5678)
+    asio_recording = out / "asio_recording.raw"
+    rx_recording = out / "rx_recording.raw"
+    stop_file = out / "stop-asio-host"
+    procs.start("tx", [args.bin_dir / f"pipe2inferno{exe}", "-c", str(CHANNELS), "-i", out / "to_asio.raw"],
+                device_env(TX_NAME, ip(0), 1))
+    # the driver logs to its temporary directory: the output directory here
+    asio_env = dict(device_env(ASIO_NAME, ip(1), 3), TMP=str(out), TEMP=str(out),
+                    INFERNO_ASIO_CONFIG=str(out / "no-config-file"),
+                    INFERNO_RX_CHANNELS=str(CHANNELS), INFERNO_TX_CHANNELS=str(CHANNELS))
+    asio = procs.start("asio_host", [args.bin_dir / "examples" / f"asio_host{exe}", args.bin_dir / "inferno_asio.dll",
+                                     "--play", out / "from_asio.raw", "--record", asio_recording,
+                                     "--buffer", "256", "--seconds", "300", "--until-file", stop_file], asio_env)
+    rx = procs.start("rx", [args.bin_dir / f"inferno2pipe{exe}", "-c", str(CHANNELS), "-o", rx_recording],
+                     device_env(RX_NAME, ip(2), 2))
+    start = time.time()
+    if not wait_for_devices([TX_NAME, ASIO_NAME, RX_NAME], start + DISCOVERY_TIMEOUT):
+        log("❌ devices not discovered in time")
+        return False
+    log(f"✅ devices discovered ({time.time() - start:.0f} s)")
+    if not check_clock([out / "tx.log", out / "rx.log", out / "inferno_asio.log"]):
+        return False
+    if not subscribe(TX_NAME, ASIO_NAME) or not subscribe(ASIO_NAME, RX_NAME):
+        return False
+    if not check_subscribed([ASIO_NAME, RX_NAME]):
+        return False
+    log("✅ subscribed")
+    time.sleep(RECORD_SECONDS)
+    if procs.exited():
+        log(f"❌ a device exited early: {procs.exited()}")
+        return False
+    stop_file.write_text("stop")
+    try:
+        code = asio.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        log("❌ the ASIO host didn't stop")
+        return False
+    rx.kill()
+    rx.wait()
+    log((out / "asio_host.log").read_text(errors="replace"))
+    if code != 0:
+        log(f"❌ the ASIO host failed ({code})")
+        return False
+    ok = check_recording(to_asio, asio_recording, "Pipe2inferno -> ASIO driver inputs")
+    return check_recording(from_asio, rx_recording, "ASIO driver outputs -> Inferno2pipe") and ok
+
+
 def main():
     # the Windows console's code page can't print ✅/❌
     sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser()
+    parser.add_argument("--scenario", choices=["pipe", "asio"], default="pipe")
     parser.add_argument("--bin-dir", type=Path, required=True)
-    parser.add_argument("--tx-ip", required=True)
-    parser.add_argument("--rx-ip", required=True)
+    parser.add_argument("--ips", required=True, help="comma-separated addresses of this host for the devices")
     parser.add_argument("--out-dir", type=Path, required=True)
     args = parser.parse_args()
-    out = args.out_dir
-    out.mkdir(parents=True, exist_ok=True)
+    args.ips = args.ips.split(",")
+    args.out_dir.mkdir(parents=True, exist_ok=True)
     exe = ".exe" if sys.platform == "win32" else ""
 
-    source_path = out / "source.raw"
-    recording_path = out / "recording.raw"
-    source = write_source(source_path)
-    log(f"source: {SOURCE_SECONDS} s, {CHANNELS} channels")
-
-    leader_log = open(out / "leader.log", "w")
-    leader = subprocess.Popen(
-        [args.bin_dir / "examples" / f"ptpv1_test_leader{exe}", args.tx_ip],
-        env=dict(os.environ, RUST_LOG="info"), stdout=leader_log, stderr=subprocess.STDOUT)
-    tx_log = open(out / "tx.log", "w")
-    rx_log = open(out / "rx.log", "w")
-    tx = subprocess.Popen(
-        [args.bin_dir / f"pipe2inferno{exe}", "-c", str(CHANNELS), "-i", source_path],
-        env=device_env(TX_NAME, args.tx_ip, 1), stdout=tx_log, stderr=subprocess.STDOUT)
-    rx = subprocess.Popen(
-        [args.bin_dir / f"inferno2pipe{exe}", "-c", str(CHANNELS), "-o", recording_path],
-        env=device_env(RX_NAME, args.rx_ip, 2), stdout=rx_log, stderr=subprocess.STDOUT)
-    result = 1
+    procs = Processes(args.out_dir)
+    procs.start("leader", [args.bin_dir / "examples" / f"ptpv1_test_leader{exe}", args.ips[0]],
+                dict(os.environ, RUST_LOG="info"))
+    ok = False
     try:
-        start = time.time()
-        if not wait_for_devices(start + DISCOVERY_TIMEOUT):
-            log("❌ devices not discovered in time")
-            return 1
-        log(f"✅ devices discovered ({time.time() - start:.0f} s)")
-        for name in ("tx.log", "rx.log"):
-            device_log = (out / name).read_text(errors="replace")
-            if "clock available from PTPv1" not in device_log:
-                log(f"❌ {name}: the device doesn't follow the PTPv1 leader")
-                return 1
-        log("✅ both devices follow the PTPv1 leader")
-
-        code, output = netaudio("subscription", "add", "--tx", TX_NAME, "--rx", RX_NAME)
-        log(output)
-        if code != 0:
-            log("❌ subscription add failed")
-            return 1
-        code, output = netaudio("subscription", "list")
-        log(output)
-        subscribed = [line for line in output.splitlines() if RX_NAME in line and "Subscribed" in line]
-        if len(subscribed) < CHANNELS:
-            log(f"❌ expected {CHANNELS} subscribed channels")
-            return 1
-        log("✅ subscribed")
-
-        time.sleep(RECORD_SECONDS)
-        if tx.poll() is not None or rx.poll() is not None:
-            log(f"❌ a device exited early: tx {tx.poll()}, rx {rx.poll()}")
-            return 1
-        rx.kill()
-        rx.wait()
-        matching = compare(source, recording_path)
-        if matching < MIN_MATCHING_SECONDS * SAMPLE_RATE:
-            log(f"❌ less than {MIN_MATCHING_SECONDS} s of the recording matches the source exactly")
-            return 1
-        log(f"✅ {matching / SAMPLE_RATE:.1f} s of audio received exactly as transmitted")
-        result = 0
-        return 0
+        ok = (pipe_scenario if args.scenario == "pipe" else asio_scenario)(args, procs, exe)
+        return 0 if ok else 1
     finally:
-        for process in (tx, rx, leader):
-            if process.poll() is None:
-                process.kill()
-                process.wait()
-        tx_log.close()
-        rx_log.close()
-        leader_log.close()
-        if result != 0:
-            for name in ("leader.log", "tx.log", "rx.log"):
-                log(f"----- {name} (last lines)")
-                log("\n".join((out / name).read_text(errors="replace").splitlines()[-60:]))
+        procs.stop(failed=not ok)
 
 
 if __name__ == "__main__":

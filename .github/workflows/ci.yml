@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [dev]
+    branches: [dev, windows-e2e]
   pull_request:
 
 env:
@@ -36,5 +36,5 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build -p inferno_aoip -p inferno_driver_core -p inferno2pipe -p pipe2inferno --all-targets
-      - run: cargo test -p inferno_aoip -p inferno_driver_core -- --test-threads=1
+      - run: cargo build -p inferno_aoip -p inferno_driver_core -p inferno2pipe -p pipe2inferno -p asio_inferno --all-targets --examples
+      - run: cargo test -p inferno_aoip -p inferno_driver_core -p asio_inferno -- --test-threads=1

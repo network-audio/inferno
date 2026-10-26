@@ -29,7 +29,8 @@ use crate::{
 };
 
 /// How long `Stream::prepare` waits for the clock.
-const CLOCK_WAIT: Duration = Duration::from_secs(5);
+/// (a PTPv1 follower publishes the clock after 1.5-4 s of Syncs)
+const CLOCK_WAIT: Duration = Duration::from_secs(8);
 const CLOCK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Identifies what a running receiver/transmitter was started with: the memory it is bound to,
@@ -220,6 +221,29 @@ impl Stream {
       waited += CLOCK_POLL_INTERVAL;
     }
     Ok(())
+  }
+
+  /// Media clock time (in samples, wrapping), once the clock is available.
+  pub fn media_now(&mut self, sample_rate: u64) -> Option<Clock> {
+    self.update_clock();
+    self.media_clock.wrapping_now_in_timebase(sample_rate)
+  }
+
+  /// Starts the prepared stream with position 0 at media clock time `start_time`, e.g. to start several
+  /// streams in lockstep. Returns false if it's already started.
+  pub fn start_at(&mut self, start_time: Clock) -> bool {
+    if self.start_time.is_some() {
+      return false;
+    }
+    self.start_time = Some(start_time);
+    // the receiver/transmitter marks the buffer valid once it addresses it according to start_time
+    self.anchor.start(start_time);
+    true
+  }
+
+  /// The source of the device's clock, once prepared.
+  pub fn clock_source(&self) -> Option<Arc<dyn ClockSource>> {
+    self.clock.as_ref().map(|c| c.source.clone())
   }
 
   /// Starts the prepared stream now: its position 0 is the current media clock time.
