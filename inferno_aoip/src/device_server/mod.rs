@@ -100,13 +100,18 @@ pub struct StartError {
 
 impl std::fmt::Display for StartError {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    write!(
-      f,
-      "can't listen on UDP {} for {}: {}. Is another Inferno device (or Dante software) using it? Each device \
-       on a host needs its own ports: give them ALT_PORT values at least 10 apart, or leave ALT_PORT unset to \
-       have free ports picked.",
-      self.addr, self.service, self.source
-    )
+    write!(f, "can't listen on UDP {} for {}: {}.", self.addr, self.service, self.source)?;
+    match self.source.kind() {
+      std::io::ErrorKind::AddrInUse => write!(
+        f,
+        " Is another Inferno device (or Dante software) using it? Each device on a host needs its own ports: \
+         give them ALT_PORT values at least 10 apart, or leave ALT_PORT unset to have free ports picked."
+      ),
+      std::io::ErrorKind::AddrNotAvailable => {
+        write!(f, " Is {} an address of this host (BIND_IP), and is its interface up?", self.addr.ip())
+      }
+      _ => Ok(()),
+    }
   }
 }
 

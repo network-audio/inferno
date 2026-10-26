@@ -8,6 +8,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # netaudio prints characters the Windows console code page doesn't have
+  PYTHONUTF8: "1"
 
 jobs:
   pipe-to-pipe:
@@ -48,6 +50,14 @@ jobs:
             foreach ($ip in $ips) {
               New-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress $ip -PrefixLength 24 -ErrorAction Stop | Out-Null
             }
+            # usable once duplicate address detection is done and the adapter is up
+            $deadline = (Get-Date).AddSeconds(60)
+            while ((Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 |
+                Where-Object { $_.IPAddress -in $ips -and $_.AddressState -eq "Preferred" }).Count -lt 2) {
+              if ((Get-Date) -gt $deadline) { throw "addresses not usable" }
+              Start-Sleep -Seconds 1
+            }
+            Get-NetAdapter -InterfaceIndex $adapter.ifIndex | Format-Table Name, Status, MediaConnectionState
           } else {
             $route = Get-NetRoute -DestinationPrefix 0.0.0.0/0 | Sort-Object RouteMetric | Select-Object -First 1
             $adapter = Get-NetAdapter -InterfaceIndex $route.ifIndex
@@ -58,7 +68,7 @@ jobs:
           }
           "TX_IP=$($ips[0])" >> $env:GITHUB_ENV
           "RX_IP=$($ips[1])" >> $env:GITHUB_ENV
-          Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 | Format-Table IPAddress, PrefixOrigin
+          Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 | Format-Table IPAddress, PrefixOrigin, AddressState
           Get-NetUDPEndpoint -LocalPort 5353 -ErrorAction SilentlyContinue | Format-Table LocalAddress, OwningProcess
       - timeout-minutes: 10
         run: python test/windows_e2e/run_e2e.py --bin-dir target/debug --tx-ip ${{ env.TX_IP }} --rx-ip ${{ env.RX_IP }} --out-dir e2e-out
