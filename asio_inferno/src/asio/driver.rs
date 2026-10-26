@@ -277,7 +277,9 @@ unsafe extern "system" fn get_latencies(
   let period = state.engine.as_ref().map(|e| e.period() as c_long).unwrap_or(PREFERRED_BUFFER);
   let info = &settings.self_info;
   let tx_latency = (settings.tx_latency_ns as u64 * info.sample_rate as u64 / 1_000_000_000) as c_long;
-  // inputs: a period, plus the network latency; outputs: written 2 periods ahead of being due
+  // inputs: a period, plus the network latency; outputs: the outputs of the switch at position p are
+  // transmitted at p + 2 periods (so the host has one period to return), then played out after the receiver's
+  // latency, at least the one this device demands
   if !input.is_null() {
     *input = period + info.latency_samples() as c_long;
   }

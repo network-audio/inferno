@@ -95,7 +95,9 @@ def compare(source, recording_path):
     recording.frombytes(recording_path.read_bytes()[: (recording_path.stat().st_size // 4) * 4])
     frames = len(recording) // CHANNELS
     log(f"recorded {frames} frames ({frames / SAMPLE_RATE:.1f} s)")
-    first = next((i for i in range(frames) if recording[i * CHANNELS] != 0), None)
+    # channels may start a packet apart (each subscription starts on a packet of its own): from where all have
+    first = next((i for i in range(frames)
+                  if all(recording[i * CHANNELS + c] != 0 for c in range(CHANNELS))), None)
     if first is None:
         log("recording is silent")
         return 0

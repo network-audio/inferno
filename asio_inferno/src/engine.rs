@@ -308,6 +308,7 @@ impl Worker {
     let mut clock = MediaClock::new(false);
     let mut k: usize = 0;
     let mut late_switches = 0u64;
+    let mut lost_outputs = 0u64;
     while !self.stop.load(Ordering::Acquire) {
       if let Some(overlay) = *clock_rx.borrow_and_update() {
         clock.update_overlay(overlay);
@@ -361,6 +362,19 @@ impl Worker {
         }
       }
       self.playback_written.store(out_start + n, Ordering::Release);
+      // the transmitter reads a position as soon as it's due: outputs written after that went out as silence
+      if let Some(now) = clock.wrapping_now_in_timebase(rate) {
+        let overdue = now.wrapping_sub(self.start_time) as isize - out_start as isize;
+        if overdue > 0 && !self.playback_rings.is_empty() {
+          lost_outputs += 1;
+          if lost_outputs.is_power_of_two() {
+            warn!(
+              "buffer switch finished {overdue} frames after its outputs were due: they went out as \
+               silence ({lost_outputs} times so far; the host must return within a period)"
+            );
+          }
+        }
+      }
       k += 1;
     }
   }

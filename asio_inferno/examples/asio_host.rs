@@ -282,7 +282,8 @@ mod host {
         outputs: outputs as usize,
         play: play.as_ref().map(read_samples).unwrap_or_default(),
         play_frame: 0,
-        record: vec![],
+        // allocated up front: growing it in the callback (copying it all) once made a switch late
+        record: Vec::with_capacity((seconds as usize + 1) * rate as usize * inputs as usize),
         switches: 0,
         last_position: None,
         position_errors: 0,
