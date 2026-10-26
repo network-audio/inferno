@@ -1,7 +1,6 @@
 use crate::mdns_client::{MdnsClient, PointerToMulticast};
-use crate::media_clock::{
-  async_clock_receiver_to_realtime, make_shared_media_clock, start_clock_receiver, ClockReceiver,
-};
+use crate::clock::{default_clock_source, ClockSource};
+use crate::media_clock::{async_clock_receiver_to_realtime, make_shared_media_clock};
 use crate::net_utils::UdpSocketWrapper;
 use crate::ring_buffer::{
   self, ExternalBuffer, OwnedBuffer, ProxyToBuffer, ProxyToSamplesBuffer, RBOutput,
@@ -46,9 +45,10 @@ mod stream_anchor;
 pub(crate) mod tx_multicasts;
 
 pub use crate::common::{Clock, ClockDiff, Sample};
-pub use crate::media_clock::{
-  clock_path_or_default, diagnose_missing_clock, MediaClock, RealTimeClockReceiver,
-};
+#[cfg(unix)]
+pub use crate::clock::{clock_path_or_default, diagnose_missing_clock};
+pub use crate::clock::{ClockOverlay, FreeRunningClockSource};
+pub use crate::media_clock::{MediaClock, RealTimeClockReceiver};
 pub use crate::ring_buffer::{
   new_owned, ExternalBufferParameters, PositionReportDestination, RBInput, WrittenFrom,
 };
@@ -120,7 +120,9 @@ pub struct DeviceServer {
   pub self_info: Arc<DeviceInfo>,
   ref_instant: Instant,
   state_storage: Arc<StateStorage>,
-  clock_receiver: ClockReceiver,
+  clock_source: Arc<dyn ClockSource>,
+  /// whether the device created `clock_source` (and stops it on shutdown)
+  owns_clock_source: bool,
   shared_media_clock: Arc<RwLock<MediaClock>>,
   mdns_client: Arc<MdnsClient>,
   mdns_server: Arc<DeviceMDNSResponder>,
@@ -153,10 +155,27 @@ impl DeviceServer {
     Self::try_start(settings).await.unwrap_or_else(|e| panic!("{e}"))
   }
 
-  /// Starts the device. Fails if it can't listen on its network ports (e.g. used by another device).
+  /// Starts the device with the platform's default clock source (see `clock::default_clock_source`).
+  /// Fails if it can't listen on its network ports (e.g. used by another device).
   /// If the standard ports are in use (by another device on this host), and the settings let Inferno choose
   /// (see `Settings::auto_identity`), it picks free ports, and a process ID and name to be a separate device.
   pub async fn try_start(settings: settings::Settings) -> Result<Self, StartError> {
+    Self::try_start_inner(settings, None).await
+  }
+
+  /// Like `try_start`, but following the media clock from `clock_source` (which `settings.clock_path`
+  /// doesn't affect then). The source isn't stopped on shutdown: it may be shared by several devices.
+  pub async fn try_start_with_clock(
+    settings: settings::Settings,
+    clock_source: Arc<dyn ClockSource>,
+  ) -> Result<Self, StartError> {
+    Self::try_start_inner(settings, Some(clock_source)).await
+  }
+
+  async fn try_start_inner(
+    settings: settings::Settings,
+    clock_source: Option<Arc<dyn ClockSource>>,
+  ) -> Result<Self, StartError> {
     let mut info = settings.self_info;
     let ref_instant = Instant::now();
 
@@ -208,11 +227,10 @@ impl DeviceServer {
     let mdns_client = Arc::new(crate::mdns_client::MdnsClient::new(self_info.clone()));
     let (mcast_tx, mcast_rx) = mpsc::channel(100);
 
-    let clock_path = clock_path_or_default(&settings.clock_path);
-    info!("clock: {}", clock_path.display());
-    let clock_receiver = start_clock_receiver(settings.clock_path.clone());
-    let shared_media_clock =
-      make_shared_media_clock(&clock_receiver, settings.use_safe_clock, clock_path).await;
+    let owns_clock_source = clock_source.is_none();
+    let clock_source = clock_source.unwrap_or_else(|| default_clock_source(settings.clock_path.clone()));
+    info!("clock: {}", clock_source.description());
+    let shared_media_clock = make_shared_media_clock(&clock_source, settings.use_safe_clock).await;
 
     let mut tasks = vec![];
 
@@ -271,7 +289,8 @@ impl DeviceServer {
       self_info,
       ref_instant,
       state_storage,
-      clock_receiver,
+      clock_source,
+      owns_clock_source,
       shared_media_clock,
       mdns_client,
       mdns_server,
@@ -432,7 +451,7 @@ impl DeviceServer {
     current_timestamp: Arc<AtomicUsize>,
     on_transfer: Option<TransferNotifier>,
   ) {
-    let clock_rx = self.clock_receiver.subscribe();
+    let clock_rx = self.clock_source.subscribe();
 
     let (flows_tx_handle, flows_tx_thread) = flows_tx::FlowsTransmitter::start(
       self.self_info.clone(),
@@ -519,9 +538,14 @@ impl DeviceServer {
     }
   }
 
+  /// The source of this device's media clock.
+  pub fn clock_source(&self) -> Arc<dyn ClockSource> {
+    self.clock_source.clone()
+  }
+
   pub fn get_realtime_clock_receiver(&self) -> RealTimeClockReceiver {
     async_clock_receiver_to_realtime(
-      self.clock_receiver.subscribe(),
+      self.clock_source.subscribe(),
       self.shared_media_clock.read().unwrap().get_overlay().clone(),
     )
   }
@@ -535,7 +559,9 @@ impl DeviceServer {
       todo.await;
     }
     self.shutdown_todo.await;
-    self.clock_receiver.stop().await.unwrap();
+    if self.owns_clock_source {
+      self.clock_source.shutdown().await;
+    }
     info!("shutdown ok");
   }
 }

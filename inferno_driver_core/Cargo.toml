@@ -1,0 +1,17 @@
+[package]
+name = "inferno_driver_core"
+description = "Platform-neutral core of Inferno virtual soundcard drivers: shared devices and stream lifecycle"
+authors = ["Teo <teodly@lumifaza.org>"]
+license = "GPL-3.0-or-later OR AGPL-3.0-or-later"
+version = "0.5.0"
+edition = "2021"
+
+[dependencies]
+inferno_aoip = { path = "../inferno_aoip" }
+futures-util = "0.3.30"
+lazy_static = "1.5.0"
+log = "0.4.20"
+tokio = { version = "1.36.0", features = ["sync"] }
+
+[dev-dependencies]
+env_logger = "0.11"

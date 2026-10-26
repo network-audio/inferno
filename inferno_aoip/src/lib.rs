@@ -91,6 +91,7 @@
 //! * Dual licensed under GPLv3-or-later and AGPLv3-or-later
 //!
 
+pub mod clock;
 mod common;
 pub mod device_info;
 pub mod device_server;

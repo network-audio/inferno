@@ -3,6 +3,8 @@
 //! When the last channel of a flow is unsubscribed, or the transmitter disappears, the flow and its socket are
 //! removed. The channels' buffers must then be filled with silence, not keep the last audio.
 
+#![cfg(unix)] // fake usrvclock server
+
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

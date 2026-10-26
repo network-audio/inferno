@@ -21,7 +21,7 @@ use itertools::Itertools;
 use mio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
-use usrvclock::ClockOverlay;
+use crate::clock::ClockOverlay;
 
 pub const MAX_FLOWS: usize = 32;
 const WAKE_TOKEN: mio::Token = mio::Token(MAX_FLOWS);
@@ -824,7 +824,7 @@ mod tests {
       Settings::new("flows_rx_test", "flows_rx_test", Some(std::net::Ipv4Addr::LOCALHOST), &config);
     settings.make_rx_channels(1);
     let overlay =
-      ClockOverlay { clock_id: 1 /* CLOCK_MONOTONIC */, last_sync: 0, shift: 0, freq_scale: 0.0 };
+      ClockOverlay::monotonic();
     let (clock_tx, clock_rx) = real_time_box_channel::channel(Box::new(None));
     clock_tx.send(Box::new(Some(overlay)));
     let (rx, rx_thread) = FlowsReceiver::start(
@@ -872,7 +872,7 @@ mod tests {
       Settings::new("flows_rx_late", "flows_rx_late", Some(std::net::Ipv4Addr::LOCALHOST), &config);
     settings.make_rx_channels(2);
     let overlay =
-      ClockOverlay { clock_id: 1 /* CLOCK_MONOTONIC */, last_sync: 0, shift: 0, freq_scale: 0.0 };
+      ClockOverlay::monotonic();
     let (clock_tx, clock_rx) = real_time_box_channel::channel(Box::new(None));
     clock_tx.send(Box::new(Some(overlay)));
     let (rx, rx_thread) = FlowsReceiver::start(

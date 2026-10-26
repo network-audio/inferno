@@ -5,6 +5,7 @@ members = [
     "inferno_aoip",
     "searchfire",
     "inferno2pipe",
+    "inferno_driver_core",
     "alsa_pcm_inferno",
     "inferno_doctor",
 ]

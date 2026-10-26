@@ -2,15 +2,11 @@ extern crate alsa_sys_all;
 extern crate libc;
 use alsa_sys_all::*;
 
-use futures_util::FutureExt;
-use inferno_aoip::device_info::DeviceId;
 use inferno_aoip::device_server::{
-    clock_path_or_default, diagnose_missing_clock, AtomicSample, Clock, DeviceServer,
-    ExternalBufferParameters, MediaClock, PositionReportDestination, RealTimeClockReceiver, Sample,
-    Settings, StreamAnchor, TransferNotifier,
+    AtomicSample, Clock, ExternalBufferParameters, PositionReportDestination, Sample, Settings,
+    TransferNotifier,
 };
-use inferno_aoip::utils::run_future_in_new_thread;
-use itertools::Itertools;
+use inferno_driver_core::{BuffersSignature, DeviceError, Direction, Stream, StreamOptions};
 use lazy_static::lazy_static;
 use libc::{c_char, c_int, c_void, eventfd, EFD_CLOEXEC, EFD_NONBLOCK, EPIPE, POLLIN, POLLOUT};
 use log::{debug, error, trace, warn};
@@ -19,81 +15,8 @@ use std::ffi::CStr;
 use std::mem::zeroed;
 use std::num::Wrapping;
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot};
-
-struct StartArgs {
-    channels: Vec<ExternalBufferParameters<Sample>>,
-    anchor: StreamAnchor,
-    clock_rx_tx: oneshot::Sender<RealTimeClockReceiver>,
-    current_timestamp: Arc<AtomicUsize>,
-    on_transfer: Option<TransferNotifier>,
-}
-
-enum Command {
-    StartReceiver(StartArgs),
-    StartTransmitter(StartArgs),
-    StopReceiver,
-    StopTransmitter,
-    Shutdown,
-}
-
-struct InfernoInstance {
-    commands_sender: mpsc::Sender<Command>,
-    thread: JoinHandle<()>,
-    capturing: bool,
-    playing: bool,
-    /// set if the device server failed to start (its thread then ends)
-    start_error: Arc<Mutex<Option<String>>>,
-    /// settings the device was started with, see `device_settings`
-    settings: Vec<(&'static str, String)>,
-}
-
-/// The settings of a device that the PCMs sharing it (same device ID in one process) should agree on.
-fn device_settings(settings: &Settings) -> Vec<(&'static str, String)> {
-    let info = &settings.self_info;
-    vec![
-        ("name", info.friendly_hostname.clone()),
-        ("IP address", info.ip_address.to_string()),
-        ("RX channels", info.rx_channels.len().to_string()),
-        ("TX channels", info.tx_channels.len().to_string()),
-        ("sample rate", info.sample_rate.to_string()),
-        ("RX latency", format!("{} ns", info.latency_ns)),
-        ("TX latency", format!("{} ns", settings.tx_latency_ns)),
-        (
-            "TX source bit depth",
-            settings.tx_source_bit_depth.to_string(),
-        ),
-        ("ports", format!("{}..", info.arc_port)),
-        ("clock", format!("{:?}", settings.clock_path)),
-    ]
-}
-
-/// Warns if this PCM's settings differ from those of the device it shares (they don't apply).
-fn warn_if_settings_differ(instance: &InfernoInstance, settings: &Settings) {
-    let differences: Vec<String> = instance
-        .settings
-        .iter()
-        .zip(device_settings(settings))
-        .filter(|((_, device), (_, this))| device != this)
-        .map(|((key, device), (_, this))| format!("{key} {device} (this PCM: {this})"))
-        .collect();
-    if !differences.is_empty() {
-        warn!(
-            "this PCM shares device {} with a PCM already open in this process, whose settings apply: {}. \
-             To make it a separate device, give it its own PROCESS_ID (or DEVICE_ID), NAME and ALT_PORT.",
-            settings
-                .self_info
-                .factory_device_id
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>(),
-            differences.join(", ")
-        );
-    }
-}
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 const PLUGIN_NAME: [u8; 23] = *b"Inferno virtual device\0";
 
@@ -107,192 +30,24 @@ const PLUGIN_KEYS: &[&str] = &[
 ];
 
 lazy_static! {
-    static ref global_instances: RwLock<BTreeMap<DeviceId, Arc<Mutex<InfernoInstance>>>> =
-        RwLock::new(BTreeMap::new());
     static ref global_initialized: Mutex<bool> = false.into();
 }
 
-/// The transmitter of an Inferno instance (device server thread).
-#[derive(PartialEq)]
-enum Transmitter {
-    None,
-    /// sends silence
-    Silent,
-    /// serves the playback PCM
-    Pcm,
-}
-
-static SILENCE: AtomicSample = AtomicSample::new(0);
-
-/// Starts transmitting silence, or switches the running transmitter to it (keeping its flows).
-async fn transmit_silence(device_server: &mut DeviceServer, channels: usize) -> Transmitter {
-    // never valid and never started: the transmitter sends silence without touching the buffer
-    let valid = Arc::new(RwLock::new(false));
-    let anchor = StreamAnchor::new_paused_guarding(valid.clone());
-    let buffers = (0..channels)
-        .map(|_| unsafe { ExternalBufferParameters::new(&SILENCE, 1, 1, valid.clone(), None) })
-        .collect();
-    device_server
-        .transmit_from_external_buffer(buffers, anchor, Default::default(), None)
-        .await;
-    debug!("transmitting silence");
-    Transmitter::Silent
-}
-
-/// The device thread didn't take a request: it failed to start (already logged why), or has ended.
-/// The failed device is forgotten, so that a later attempt (e.g. after freeing its ports) starts it again.
-/// Call without holding `instance`'s lock (lock order: `global_instances`, then an instance).
-fn device_thread_failed(instance: &Mutex<InfernoInstance>, settings: &Settings) -> c_int {
-    let failed_to_start = instance
-        .lock()
-        .unwrap()
-        .start_error
-        .lock()
-        .unwrap()
-        .is_some();
-    if !failed_to_start {
-        error!("BUG: the Inferno thread has ended");
-        return -libc::EPIPE;
+fn direction_of(stream: snd_pcm_stream_t) -> Option<Direction> {
+    match stream {
+        SND_PCM_STREAM_CAPTURE => Some(Direction::Capture),
+        SND_PCM_STREAM_PLAYBACK => Some(Direction::Playback),
+        _ => None,
     }
-    let mut instances = global_instances.write().unwrap();
-    let id = &settings.self_info.factory_device_id;
-    if instances
-        .get(id)
-        .is_some_and(|entry| std::ptr::eq(Arc::as_ptr(entry), instance))
-    {
-        instances.remove(id);
-    }
-    -libc::EBUSY
 }
 
-fn get_or_create_instance(settings: &Settings) -> Arc<Mutex<InfernoInstance>> {
-    let shared_settings = device_settings(settings);
-    let mut instances_locked = global_instances.write().unwrap();
-    let entry = instances_locked.entry(settings.self_info.factory_device_id);
-    entry
-        .or_insert_with(|| {
-            //self_info.sample_rate = sample_rate;
-            // TODO make tx & rx channels based on (*io).channels
-            // this requires a complicated refactor to allow adding channels to the Dante network dynamically at any time, not just on DeviceServer start
-            // because we don't know beforehand whether the app will be capture&playback, playback-only or capture-only
-            // so we don't know whether we should wait for the second prepare call to gather all channels counts
-
-            //assert_eq!(self_info.sample_rate, sample_rate);
-
-            let (commands_sender, mut commands_rx) = mpsc::channel(16);
-
-            let settings = settings.clone();
-            let start_error: Arc<Mutex<Option<String>>> = Default::default();
-            let thread_start_error = start_error.clone();
-            let thread = run_future_in_new_thread("Inferno main", move || {
-                async move {
-                    let tx_channels = settings.self_info.tx_channels.len();
-                    let mut device_server = match DeviceServer::try_start(settings).await {
-                        Ok(device_server) => device_server,
-                        Err(e) => {
-                            error!("{e}");
-                            // reported by plugin_prepare; dropping commands_rx fails its requests
-                            *thread_start_error.lock().unwrap() = Some(e.to_string());
-                            return;
-                        }
-                    };
-                    // While the device exists, it transmits: from the playback PCM, or silence (e.g. for
-                    // capture-only applications), so that receivers don't see a broken stream.
-                    let mut tx = Transmitter::None;
-                    let mut receiving = false;
-                    loop {
-                        match commands_rx.recv().await {
-                            Some(command) => match command {
-                                Command::StartReceiver(StartArgs {
-                                    channels,
-                                    anchor,
-                                    clock_rx_tx,
-                                    current_timestamp,
-                                    on_transfer,
-                                }) => {
-                                    let _ = clock_rx_tx
-                                        .send(device_server.get_realtime_clock_receiver());
-                                    device_server
-                                        .receive_to_external_buffer(
-                                            channels,
-                                            anchor,
-                                            current_timestamp,
-                                            on_transfer,
-                                        )
-                                        .await;
-                                    receiving = true;
-                                    debug!("started receiver");
-                                    if tx == Transmitter::None && tx_channels > 0 {
-                                        tx =
-                                            transmit_silence(&mut device_server, tx_channels).await;
-                                    }
-                                }
-                                Command::StartTransmitter(StartArgs {
-                                    channels,
-                                    anchor,
-                                    clock_rx_tx,
-                                    current_timestamp,
-                                    on_transfer,
-                                }) => {
-                                    let _ = clock_rx_tx
-                                        .send(device_server.get_realtime_clock_receiver());
-                                    // switches a running (silent) transmitter, keeping its flows
-                                    tx = Transmitter::Pcm;
-                                    device_server
-                                        .transmit_from_external_buffer(
-                                            channels,
-                                            anchor,
-                                            current_timestamp,
-                                            on_transfer,
-                                        )
-                                        .await;
-                                    debug!("started transmitter");
-                                }
-                                Command::StopReceiver => {
-                                    device_server.stop_receiver().await;
-                                    receiving = false;
-                                    debug!("stopped receiver");
-                                    if tx == Transmitter::Silent {
-                                        device_server.stop_transmitter().await;
-                                        tx = Transmitter::None;
-                                        debug!("stopped transmitting silence");
-                                    }
-                                }
-                                Command::StopTransmitter => {
-                                    if receiving && tx_channels > 0 {
-                                        // keep the flows for the still capturing application
-                                        tx =
-                                            transmit_silence(&mut device_server, tx_channels).await;
-                                    } else {
-                                        device_server.stop_transmitter().await;
-                                        tx = Transmitter::None;
-                                        debug!("stopped transmitter");
-                                    }
-                                }
-                                Command::Shutdown => {
-                                    break;
-                                }
-                            },
-                            None => {
-                                break;
-                            }
-                        }
-                    }
-                    device_server.shutdown().await;
-                }
-                .boxed_local()
-            });
-
-            Arc::new(Mutex::new(InfernoInstance {
-                commands_sender,
-                thread,
-                capturing: false.into(),
-                playing: false.into(),
-                start_error,
-                settings: shared_settings,
-            }))
-        })
-        .clone()
+/// The error code to return to alsa-lib (already logged).
+fn error_code(e: &DeviceError) -> c_int {
+    match e {
+        DeviceError::StartFailed(_) => -libc::EBUSY,
+        DeviceError::ThreadEnded => -libc::EPIPE,
+        DeviceError::NoClock(_) => -libc::ETIMEDOUT,
+    }
 }
 
 /// Position bookkeeping, shared with the transmitter thread (see `written_from`).
@@ -337,37 +92,17 @@ impl StreamInfo {
     }
 }
 
-/// Identifies what a running receiver/transmitter was started with: the memory it is bound to,
-/// (address, length, stride) per channel, and the period size (wakeup interval).
-/// It only changes when the application changes hw_params.
-#[derive(PartialEq)]
-struct BuffersSignature {
-    areas: Vec<(usize, usize, usize)>,
-    period_size: snd_pcm_uframes_t,
-}
-
 #[repr(C)]
 struct MyIOPlug {
     io: snd_pcm_ioplug_t,
     callbacks: snd_pcm_ioplug_callback_t,
-    settings: Settings,
-    //config: BTreeMap<String, String>,
+    /// the device, its receiver/transmitter and the lifecycle of this PCM
+    stream: Stream,
     ref_time: Instant,
     use_flows_clock: bool,
-    /// whether this PCM's settings were compared with those of the device it shares (once, on first prepare)
-    shared_settings_checked: bool,
     /// capture: per channel, how far the running receiver has written (frames since start_time)
     capture_written: Arc<Vec<AtomicUsize>>,
     stream_info: Arc<StreamInfo>,
-    buffers_valid: Arc<RwLock<bool>>,
-    media_clock: MediaClock,
-    clock_receiver: Option<RealTimeClockReceiver>,
-    start_time: Option<Clock>,
-    /// shared with the receiver/transmitter serving this PCM
-    anchor: StreamAnchor,
-    /// buffers the running receiver/transmitter writes to/reads from, if any
-    active_buffers: Option<BuffersSignature>,
-    current_timestamp: Arc<AtomicUsize>,
     on_transfer_eventfd: libc::c_int,
     on_transfer_enabled: bool,
     last_transfer_buffer_offset: snd_pcm_uframes_t,
@@ -381,19 +116,11 @@ unsafe fn get_private<'a>(io: *mut snd_pcm_ioplug_t) -> &'a mut MyIOPlug {
 
 unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframes_t {
     let this = get_private(io);
-    let cur = this
-        .current_timestamp
-        .load(Ordering::SeqCst /*TODO: really needed?*/);
 
     // Position the transmitter/receiver has actually processed up to, if it's running.
     // It is important to use actual input/output clock here because sample precision is required.
     // Otherwise app may overwrite not-yet-sent samples or read not-yet-received ones.
-    let flows_ptr = match this.start_time {
-        Some(start_time) if cur != usize::MAX => {
-            Some(cur.wrapping_sub(start_time) as snd_pcm_sframes_t)
-        }
-        _ => None,
-    };
+    let flows_ptr = this.stream.flows_position().map(|p| p as snd_pcm_sframes_t);
 
     // TODO may be non-monotonic in edge cases (switching between clocks)
     // TODO rethink int sizes here
@@ -401,39 +128,16 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
         if let (true, Some(flows_ptr)) = (this.use_flows_clock, flows_ptr) {
             flows_ptr
         } else {
-            //println!("using own clock");
-            // ... but fall back to system clock when not transmitting/receiving right now
-            if let Some(clock_receiver) = &mut this.clock_receiver {
-                if clock_receiver.update() {
-                    if let Some(overlay) = clock_receiver.get() {
-                        this.media_clock.update_overlay(*overlay);
-                    }
+            // ... but fall back to the media clock when not transmitting/receiving right now
+            // TODO: optimize when boundary is power-of-2 (the position needn't be computed from the long clock)
+            match this.stream.clock_position((*io).rate as u64) {
+                Some(position) => position as snd_pcm_sframes_t,
+                None => {
+                    // the stream is prepared but not started yet (e.g. the application fills the buffer first)
+                    trace!("plugin_pointer before the stream started, returning 0");
+                    0
                 }
             }
-            // here we must use long now_in_timebase (not wrapping) because boundary may be not power-of-2
-            // TODO: optimize by setting plugin_pointer callback depending on whether boundary is power-of-2
-            let now_samples_opt = this.media_clock.now_in_timebase((*io).rate as u64);
-            if now_samples_opt.is_some() && this.start_time.is_none() {
-                /*warn!("warning: setting start_time in plugin_pointer, not plugin_start");
-                this.start_time = Some(now_samples_opt.unwrap() as usize);
-                if let Some(start_time_tx) = this.start_time_tx.take() {
-                    if let Err(e) = start_time_tx.send(now_samples_opt.unwrap()) {
-                        error!("failed to send start timestamp: {e}. tx/rx will not work.");
-                    }
-                } else {
-                    error!("failed to send start timestamp: start_time_tx already used, BUG");
-                }*/
-                // the stream is prepared but not started yet (e.g. the application fills the buffer first)
-                trace!("plugin_pointer before the stream started, returning 0");
-            }
-            if now_samples_opt.is_some() && this.start_time.is_some() {
-                (now_samples_opt.unwrap() as usize).wrapping_sub(this.start_time.unwrap())
-                    as snd_pcm_sframes_t
-            } else {
-                //log::debug!("clock not ready... {} {}", now_samples_opt.is_some(), this.start_time.is_some());
-                0
-            }
-            //now_samples_opt.map(|now_samples| now_samples.wrapping_sub(this.start_time.unwrap())).unwrap_or(0) as i64
         };
     if let (SND_PCM_STREAM_PLAYBACK, Some(flows_ptr)) = ((*io).stream, flows_ptr) {
         // The transmitter reads a packet once its first sample is due, so when its thread wakes up
@@ -541,29 +245,6 @@ fn get_app_name() -> Option<String> {
     )
 }
 
-fn is_running(common: &InfernoInstance, stream: snd_pcm_stream_t) -> bool {
-    match stream {
-        SND_PCM_STREAM_CAPTURE => common.capturing,
-        SND_PCM_STREAM_PLAYBACK => common.playing,
-        _ => false,
-    }
-}
-
-/// Stops the receiver or transmitter serving `stream`, if running. Returns false on failure.
-fn stop_stream(common: &mut InfernoInstance, stream: snd_pcm_stream_t) -> bool {
-    // TODO blocking_send inside mutex, risk of deadlock?
-    let (running, command) = match stream {
-        SND_PCM_STREAM_CAPTURE => (&mut common.capturing, Command::StopReceiver),
-        SND_PCM_STREAM_PLAYBACK => (&mut common.playing, Command::StopTransmitter),
-        _ => return false,
-    };
-    if !*running {
-        return true;
-    }
-    *running = false;
-    common.commands_sender.blocking_send(command).is_ok()
-}
-
 /// Refuses capture buffers which can't hold the network latency plus a period: the receiver writes one latency
 /// ahead of the hardware pointer, so it would overwrite samples before the application reads them.
 unsafe extern "C" fn plugin_hw_params(
@@ -572,7 +253,7 @@ unsafe extern "C" fn plugin_hw_params(
 ) -> c_int {
     let this = get_private(io);
     if (*io).stream == SND_PCM_STREAM_CAPTURE {
-        let latency = this.settings.self_info.latency_samples();
+        let latency = this.stream.settings().self_info.latency_samples();
         let (buffer, period) = ((*io).buffer_size as usize, (*io).period_size as usize);
         if buffer < latency + period {
             error!(
@@ -614,7 +295,7 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
     }
     debug!("period size: {}", (*io).period_size);
 
-    let buffers_signature = BuffersSignature {
+    let signature = BuffersSignature {
         areas: channels_areas
             .iter()
             .map(|area| {
@@ -625,7 +306,7 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
                 )
             })
             .collect(),
-        period_size: (*io).period_size,
+        period_size: (*io).period_size as usize,
     };
 
     // a running receiver keeps reporting to the table it was started with
@@ -643,7 +324,7 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
                 ((*io).buffer_size as usize) * channels_areas.len()
                     - ((area.first / bits_per_sample) as usize),
                 (area.step / bits_per_sample) as usize,
-                this.buffers_valid.clone(),
+                this.stream.buffers_valid(),
                 None,
             );
             if (*io).stream == SND_PCM_STREAM_PLAYBACK {
@@ -682,29 +363,25 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
         .boundary
         .store(boundary as usize, Ordering::Relaxed);
     this.stream_info.boundary_add.store(0, Ordering::Relaxed);
-    this.start_time = None;
-    // Pausing marks the buffer invalid, waiting for any access in progress: a receiver thread which hasn't
-    // noticed the pause yet mustn't write to it, we're going to clear it, and the application may even
-    // free it (hw_params is allowed in the PREPARED state). It becomes valid again once the
-    // receiver/transmitter has applied the start time set in plugin_start.
-    this.anchor.pause();
 
-    let inferno_instance = get_or_create_instance(&this.settings);
-    if !this.shared_settings_checked {
-        this.shared_settings_checked = true;
-        warn_if_settings_differ(&inferno_instance.lock().unwrap(), &this.settings);
-    }
-    let running = is_running(&inferno_instance.lock().unwrap(), (*io).stream);
-    if running && this.active_buffers.as_ref() == Some(&buffers_signature) {
-        // Restarting the PCM (transport stop/start, xrun recovery): keep the receiver/transmitter,
-        // its flows and subscriptions running, the stream will be re-anchored in plugin_start.
-        debug!("re-preparing running stream");
-    } else {
-        let r = start_stream(io, this, &inferno_instance, channels_buffers);
-        if r != 0 {
-            return r;
-        }
-        this.active_buffers = Some(buffers_signature);
+    let options = StreamOptions {
+        // playback always needs the transmitter's read position, see plugin_pointer
+        track_position: this.use_flows_clock || (*io).stream == SND_PCM_STREAM_PLAYBACK,
+        on_transfer: if this.on_transfer_enabled {
+            let efd = this.on_transfer_eventfd;
+            Some(TransferNotifier {
+                callback: Box::new(move || {
+                    libc::write(efd, [1u64].as_ptr() as *const c_void, 8);
+                }),
+                max_interval_samples: (*io).period_size.try_into().unwrap(),
+            })
+        } else {
+            None
+        },
+    };
+    // pauses the stream; keeps a receiver/transmitter already serving these buffers (PCM restart)
+    if let Err(e) = this.stream.prepare(signature, channels_buffers, options) {
+        return error_code(&e);
     }
     // the paused receiver doesn't write; positions of the next run start at 0
     for w in capture_written.iter() {
@@ -726,131 +403,12 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
     0
 }
 
-/// (Re)starts the receiver or transmitter serving this PCM, bound to the given buffers.
-unsafe fn start_stream(
-    io: *mut snd_pcm_ioplug_t,
-    this: &mut MyIOPlug,
-    inferno_instance: &Mutex<InfernoInstance>,
-    channels_buffers: Vec<ExternalBufferParameters<Sample>>,
-) -> c_int {
-    let (clock_rx_tx, clock_rx_rx) = oneshot::channel::<RealTimeClockReceiver>();
-    this.anchor = StreamAnchor::new_paused_guarding(this.buffers_valid.clone());
-    this.active_buffers = None;
-    {
-        let mut common = inferno_instance.lock().unwrap();
-        this.current_timestamp.store(usize::MAX, Ordering::SeqCst);
-        let args = StartArgs {
-            channels: channels_buffers,
-            anchor: this.anchor.clone(),
-            clock_rx_tx,
-            // playback always needs the transmitter's read position, see plugin_pointer
-            current_timestamp: if this.use_flows_clock || (*io).stream == SND_PCM_STREAM_PLAYBACK {
-                this.current_timestamp.clone()
-            } else {
-                Default::default()
-            },
-            on_transfer: if this.on_transfer_enabled {
-                let efd = this.on_transfer_eventfd;
-                Some(TransferNotifier {
-                    callback: Box::new(move || {
-                        libc::write(efd, [1u64].as_ptr() as *const c_void, 8);
-                    }),
-                    max_interval_samples: (*io).period_size.try_into().unwrap(),
-                })
-            } else {
-                None
-            },
-        };
-        // A running receiver/transmitter is switched to the new buffers, keeping its flows and
-        // subscriptions (see the device server thread).
-        let mut err = false;
-        match (*io).stream {
-            SND_PCM_STREAM_CAPTURE => {
-                err |= common
-                    .commands_sender
-                    .blocking_send(Command::StartReceiver(args))
-                    .is_err();
-                common.capturing = !err;
-            }
-            SND_PCM_STREAM_PLAYBACK => {
-                err |= common
-                    .commands_sender
-                    .blocking_send(Command::StartTransmitter(args))
-                    .is_err();
-                common.playing = !err;
-            }
-            _ => {
-                error!("unknown stream direction");
-                return -libc::EINVAL;
-            }
-        }
-        if err {
-            drop(common);
-            return device_thread_failed(inferno_instance, &this.settings);
-        }
-    }
-
-    this.clock_receiver = match clock_rx_rx.blocking_recv() {
-        Ok(clk) => Some(clk),
-        Err(_) => return device_thread_failed(inferno_instance, &this.settings),
-    };
-    if let Some(clock_receiver) = &mut this.clock_receiver {
-        let mut ctr = 0;
-        loop {
-            clock_receiver.update();
-            if let Some(overlay) = clock_receiver.get() {
-                this.media_clock.update_overlay(*overlay);
-            }
-            if this.media_clock.is_ready() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(250));
-            ctr += 1;
-            if ctr >= 20 {
-                let path = clock_path_or_default(&this.settings.clock_path);
-                error!(
-                    "no clock after 5 s, can't start the stream: {}",
-                    diagnose_missing_clock(&path)
-                );
-                return -libc::ETIMEDOUT;
-            }
-        }
-    }
-
-    0
-}
-
 unsafe extern "C" fn plugin_start(io: *mut snd_pcm_ioplug_t) -> c_int {
     let appl_ptr = (*io).appl_ptr as snd_pcm_sframes_t;
     debug!("plugin_start called with appl_ptr: {appl_ptr}");
     let this = get_private(io);
-
-    if let Some(clock_receiver) = &mut this.clock_receiver {
-        clock_receiver.update();
-        debug!("clock_receiver updated");
-        if let Some(overlay) = clock_receiver.get() {
-            this.media_clock.update_overlay(*overlay);
-            debug!("media_clock overlay updated");
-        } else {
-            warn!("no overlay for media_clock");
-        }
-    }
-    // start_time is used in:
-    // * flows_rx and flows_tx (via anchor) for calculating ringbuffer positions
-    // * plugin_pointer for calculating pointer
-    // all these calculations are wrapping so we can use wrapping clock
-    let now_samples_opt = this.media_clock.wrapping_now_in_timebase((*io).rate as u64);
-    if now_samples_opt.is_some() && this.start_time.is_none() {
-        let start_time = now_samples_opt.unwrap() as usize;
-        this.start_time = Some(start_time);
-        // the receiver/transmitter marks the buffer valid once it addresses it according to start_time
-        this.anchor.start(start_time);
-    } else {
-        warn!(
-            "can't set start_time in plugin_start: now_samples_opt: {:?}, start_time: {:?}",
-            now_samples_opt, this.start_time
-        );
-    }
+    // the receiver/transmitter marks the buffer valid once it addresses it according to the start time
+    this.stream.start((*io).rate as u64);
     if (*io).stream == SND_PCM_STREAM_PLAYBACK && this.on_transfer_enabled {
         libc::write(
             this.on_transfer_eventfd,
@@ -864,11 +422,9 @@ unsafe extern "C" fn plugin_start(io: *mut snd_pcm_ioplug_t) -> c_int {
 unsafe extern "C" fn plugin_stop(io: *mut snd_pcm_ioplug_t) -> c_int {
     debug!("plugin_stop called");
 
-    let this = get_private(io);
-    // Only pause: the receiver/transmitter, its flows and subscriptions keep running,
+    // Only pauses: the receiver/transmitter, its flows and subscriptions keep running,
     // so that the PCM can be restarted without a break in Dante connections.
-    // While paused, the buffer is invalid: the receiver doesn't touch it and the transmitter sends silence.
-    this.anchor.pause();
+    get_private(io).stream.stop();
 
     0
 }
@@ -889,7 +445,7 @@ unsafe extern "C" fn plugin_delay(
     };
     let this = get_private(io);
     *delayp =
-        buffered as snd_pcm_sframes_t + this.anchor.network_latency_samples() as snd_pcm_sframes_t;
+        buffered as snd_pcm_sframes_t + this.stream.network_latency_samples() as snd_pcm_sframes_t;
     0
 }
 
@@ -940,26 +496,8 @@ unsafe extern "C" fn plugin_transfer(
 unsafe extern "C" fn plugin_close(io: *mut snd_pcm_ioplug_t) -> c_int {
     debug!("plugin_close called");
     let this = get_private(io);
-    this.anchor.pause();
-    {
-        let mut instances_locked = global_instances.write().unwrap();
-        // TODO blocking_send inside mutex, risk of deadlock?
-        if let Some(common_mutex) = instances_locked
-            .get(&this.settings.self_info.factory_device_id)
-            .map(|a| a.clone())
-        {
-            let mut common = common_mutex.lock().unwrap();
-            if this.active_buffers.take().is_some() && !stop_stream(&mut common, (*io).stream) {
-                log::error!("BUG: error sending to Inferno thread");
-            }
-            if (!common.capturing) && (!common.playing) {
-                if let Err(e) = common.commands_sender.blocking_send(Command::Shutdown) {
-                    log::error!("BUG: send shutdown via channel failed: {e:?}");
-                }
-                instances_locked.remove(&this.settings.self_info.factory_device_id);
-            }
-        }
-    }
+    // stops the receiver/transmitter, and the device when no other PCM uses it
+    this.stream.close();
     libc::close(this.on_transfer_eventfd); // TODO: shouldn't this be in a different place?
 
     0
@@ -1020,6 +558,10 @@ unsafe extern "C" fn plugin_define(
             return -libc::EINVAL;
         }
     };
+    let Some(direction) = direction_of(stream) else {
+        error!("no stream specified, cannot continue");
+        return -libc::EINVAL;
+    };
     let disable_pollfd = config
         .get("DISABLE_POLLFD")
         .is_some_and(|v| v.trim() == "1");
@@ -1042,23 +584,14 @@ unsafe extern "C" fn plugin_define(
         ..zeroed()
     };
 
-    let buffers_valid = Arc::new(RwLock::new(false));
     let myio = Box::into_raw(Box::new(MyIOPlug {
         io: zeroed(),
         callbacks,
-        settings,
+        stream: Stream::new(direction, settings),
         ref_time: Instant::now(),
         use_flows_clock,
-        shared_settings_checked: false,
         capture_written: Arc::new(vec![]),
         stream_info: StreamInfo::new(std::ptr::null()), // set below, when io's address is known
-        anchor: StreamAnchor::new_paused_guarding(buffers_valid.clone()),
-        buffers_valid,
-        media_clock: MediaClock::new(false /* TODO */),
-        clock_receiver: None,
-        start_time: None,
-        active_buffers: None,
-        current_timestamp: Arc::new(AtomicUsize::new(usize::MAX)),
         on_transfer_eventfd: efd,
         on_transfer_enabled: !disable_pollfd,
         last_transfer_buffer_offset: 0,
@@ -1083,7 +616,7 @@ unsafe extern "C" fn plugin_define(
 
     io.private_data = myio as *mut _;
 
-    let self_info = &(*myio).settings.self_info;
+    let self_info = &(*myio).stream.settings().self_info;
 
     let r = snd_pcm_ioplug_create(io, name, stream, mode);
     if r < 0 {

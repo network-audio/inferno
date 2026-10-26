@@ -4,7 +4,8 @@
 //! - TX device transmits a deterministic ramp pattern on 2 channels
 //! - RX device receives and verifies the exact payload
 //!
-//! A fake usrvclock server provides the media clock.
+//! The media clock comes from a fake usrvclock server (Unix), or from a free-running clock source shared by
+//! both devices (any platform).
 
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -14,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use inferno_aoip::clock::FreeRunningClockSource;
 use inferno_aoip::device_server::{
   AtomicSample, DeviceServer, ExternalBufferParameters, MediaClock, Sample, Settings, StreamAnchor,
   TransferNotifier,
@@ -28,7 +30,7 @@ fn make_settings(
   alt_port: u16,
   rx_channels: usize,
   tx_channels: usize,
-  clock_path: &str,
+  clock_path: Option<&str>,
 ) -> Settings {
   let mut config = BTreeMap::new();
   config.insert("NAME".to_string(), name.to_string());
@@ -37,7 +39,9 @@ fn make_settings(
   config.insert("RX_CHANNELS".to_string(), rx_channels.to_string());
   config.insert("TX_CHANNELS".to_string(), tx_channels.to_string());
   config.insert("SAMPLE_RATE".to_string(), SAMPLE_RATE.to_string());
-  config.insert("CLOCK_PATH".to_string(), clock_path.to_string());
+  if let Some(clock_path) = clock_path {
+    config.insert("CLOCK_PATH".to_string(), clock_path.to_string());
+  }
   config.insert("BIND_IP".to_string(), "127.0.0.1".to_string());
 
   let mut settings = Settings::new(name, name, Some(Ipv4Addr::new(127, 0, 0, 1)), &config);
@@ -46,6 +50,7 @@ fn make_settings(
   settings
 }
 
+#[cfg(unix)]
 fn start_clock_server(path: &str, running: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
   let path = path.to_string();
   std::thread::spawn(move || {
@@ -107,6 +112,7 @@ fn find_samples_offset(a: &[AtomicSample], b: &[Sample]) -> Option<usize> {
   (0..a.len()).find(|&offset| compare_samples(a, offset, b))
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_loopback_trx() {
   let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).try_init();
@@ -118,12 +124,33 @@ async fn test_loopback_trx() {
   let clock_thread = start_clock_server(clock_path, clock_running.clone());
   tokio::time::sleep(Duration::from_millis(300)).await;
 
-  let tx_settings = make_settings("test_tx", 1, 9000, 0, 2, clock_path);
-  let rx_settings = make_settings("test_rx", 2, 9100, 2, 0, clock_path);
+  let tx_settings = make_settings("test_tx", 1, 9000, 0, 2, Some(clock_path));
+  let rx_settings = make_settings("test_rx", 2, 9100, 2, 0, Some(clock_path));
 
-  let mut tx_server = DeviceServer::start(tx_settings).await;
-  let mut rx_server = DeviceServer::start(rx_settings).await;
+  let tx_server = DeviceServer::start(tx_settings).await;
+  let rx_server = DeviceServer::start(rx_settings).await;
+  loopback(tx_server, rx_server).await;
 
+  clock_running.store(false, Ordering::Relaxed);
+  let _ = clock_thread.join();
+  let _ = std::fs::remove_file(clock_path);
+}
+
+/// Devices given a clock source by the application (instead of `CLOCK_PATH`) share its clock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_loopback_trx_with_given_clock_source() {
+  let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).try_init();
+
+  let clock = Arc::new(FreeRunningClockSource::new());
+  let tx_settings = make_settings("test_tx_given_clock", 3, 9200, 0, 2, None);
+  let rx_settings = make_settings("test_rx_given_clock", 4, 9300, 2, 0, None);
+  let tx_server = DeviceServer::try_start_with_clock(tx_settings, clock.clone()).await.unwrap();
+  let rx_server = DeviceServer::try_start_with_clock(rx_settings, clock).await.unwrap();
+  loopback(tx_server, rx_server).await;
+}
+
+/// Transmits from `tx_server` to `rx_server` and verifies the received samples.
+async fn loopback(mut tx_server: DeviceServer, mut rx_server: DeviceServer) {
   let tx_hostname = tx_server.self_info.friendly_hostname.clone();
 
   let tx_clock_rx = tx_server.get_realtime_clock_receiver();
@@ -241,9 +268,6 @@ async fn test_loopback_trx() {
 
   rx_server.shutdown().await;
   tx_server.shutdown().await;
-  clock_running.store(false, Ordering::Relaxed);
-  let _ = clock_thread.join();
-  let _ = std::fs::remove_file(clock_path);
 
   atomic::fence(Ordering::SeqCst);
 

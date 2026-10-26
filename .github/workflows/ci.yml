@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install --assume-yes libasound2-dev
+      - run: cargo build --workspace --all-targets
+      # The ALSA plugin's DAW tests are timing-sensitive: run serially.
+      # searchfire's own test needs mDNS multicast on the host network.
+      - run: cargo test --workspace --exclude searchfire -- --test-threads=1
+
+  portable:
+    # the crates other drivers build on (the ALSA plugin and inferno-doctor are Linux-only)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build -p inferno_aoip -p inferno_driver_core -p inferno2pipe --all-targets
+      - run: cargo test -p inferno_aoip -p inferno_driver_core -- --test-threads=1
+        # not yet known to pass on these runners (networking on 127.0.0.1): don't fail the build on it yet
+        continue-on-error: true
