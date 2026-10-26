@@ -257,7 +257,15 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
               }
             }
             if dropped_late {
-              sd.late_packets.fetch_add(1, Ordering::Relaxed);
+              let count = sd.late_packets.fetch_add(1, Ordering::Relaxed) + 1;
+              if count.is_power_of_two() {
+                let late = now_opt.map(|now| wrapped_diff(now, timestamp));
+                warn!(
+                  "dropped a packet arriving too late to be played: {late:?} samples after its timestamp, \
+                   network latency {} samples ({count} late packets so far)",
+                  sd.latency_samples
+                );
+              }
             }
             //(sd.callback)(src, &buf[..recv_size]);
           }

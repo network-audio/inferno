@@ -325,6 +325,7 @@ impl<T: Default + NoUninit, P: ProxyToBuffer<Atomic<T>>> RBInput<T, P> {
     // Put default values in any holes in readable_pos..close_until_pos range:
     if wrapsub(close_until_pos, self.rb.readable_pos.load(Ordering::Relaxed)) > 0 {
       let mut hole = false;
+      let mut filled = 0usize;
       self.rb.buffer.map(|buffer| {
         for_in_ring(
           self.rb.items_size,
@@ -333,6 +334,7 @@ impl<T: Default + NoUninit, P: ProxyToBuffer<Atomic<T>>> RBInput<T, P> {
           |i| {
             if !self.item_ready.get(i).unwrap() {
               hole = true;
+              filled += 1;
               buffer[i * self.rb.stride].store(T::default(), Ordering::Relaxed);
               self.item_ready.set(i, true);
             }
@@ -340,7 +342,14 @@ impl<T: Default + NoUninit, P: ProxyToBuffer<Atomic<T>>> RBInput<T, P> {
         );
       });
       if hole {
-        self.rb.holes_count.fetch_add(1, Ordering::Release);
+        let count = self.rb.holes_count.fetch_add(1, Ordering::Release) + 1;
+        // normal when a stream starts: debug only
+        if count.is_power_of_two() {
+          log::debug!(
+            "{filled} samples before position {close_until_pos} never arrived, filled with silence \
+             ({count} gaps so far)"
+          );
+        }
       }
       atomic::fence(Ordering::Release); // TODO: really needed? won't readable_pos.store(Ordering::Release) suffice?
       self.rb.readable_pos.store(close_until_pos, Ordering::Release);

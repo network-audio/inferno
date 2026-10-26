@@ -65,7 +65,8 @@ def device_env(name, ip, process_id):
         "INFERNO_TX_LATENCY_NS": str(LATENCY_NS),
         # the source is 24-bit: transmit it bit-exact, not dithered
         "INFERNO_TX_SOURCE_BIT_DEPTH": "24",
-        "RUST_LOG": env.get("RUST_LOG", "info"),
+        # gaps filled with silence: normal when a stream starts, a dropout later
+        "RUST_LOG": env.get("RUST_LOG", "info,inferno_aoip::ring_buffer=debug"),
     })
     return env
 
