@@ -322,7 +322,8 @@ struct Worker {
 
 impl Worker {
   fn run(self, mut host: Box<dyn Host>) {
-    let _priority = sleep::realtime_thread();
+    let _priority =
+      sleep::realtime_thread(Duration::from_nanos(self.period as u64 * 1_000_000_000 / self.sample_rate as u64));
     let timer = sleep::Timer::new();
     let rate = self.sample_rate as u64;
     let n = self.period;
@@ -503,7 +504,8 @@ mod sleep {
   /// Real-time priority for the current thread while the guard lives: MMCSS "Pro Audio" on Windows.
   pub struct Priority(#[cfg(windows)] windows_sys::Win32::Foundation::HANDLE);
 
-  pub fn realtime_thread() -> Priority {
+  /// `period`: of the buffer switches.
+  pub fn realtime_thread(#[allow(unused_variables)] period: Duration) -> Priority {
     #[cfg(windows)]
     {
       use windows_sys::Win32::System::Threading::AvSetMmThreadCharacteristicsW;
@@ -517,7 +519,17 @@ mod sleep {
       }
       Priority(handle)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+      // like Core Audio's I/O threads: a switch's work (copies and the host) within its period
+      let computation = (period / 2).clamp(Duration::from_micros(50), Duration::from_millis(5));
+      if let Err(e) = inferno_aoip::utils::set_current_thread_time_constraint(period, computation, period) {
+        log::warn!("can't make the ASIO thread a time-constraint thread (error {e}), expect dropouts");
+        let _ = inferno_aoip::utils::set_current_thread_realtime(85);
+      }
+      Priority()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
       if let Err(e) = inferno_aoip::utils::set_current_thread_realtime(85) {
         log::warn!("can't set realtime priority of the ASIO thread ({e:?}), expect dropouts");

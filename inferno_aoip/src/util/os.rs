@@ -59,6 +59,47 @@ pub fn set_current_thread_realtime(_priority_hint: u8) -> Result<(), Error> {
   thread_priority::set_current_thread_priority(thread_priority::ThreadPriority::Max)
 }
 
+/// macOS: makes the current thread a time-constraint (real-time) thread, like Core Audio's I/O threads: every
+/// `period` it needs up to `computation` of CPU, done within `constraint` of the period's start. Its timers are
+/// then not coalesced either. A thread exceeding its computation repeatedly is demoted by the system, so it's
+/// for threads doing a bounded amount of work per period. Returns the Mach error code on failure.
+#[cfg(target_os = "macos")]
+pub fn set_current_thread_time_constraint(
+  period: std::time::Duration,
+  computation: std::time::Duration,
+  constraint: std::time::Duration,
+) -> Result<(), i32> {
+  let mut timebase = libc::mach_timebase_info { numer: 0, denom: 0 };
+  // safety: valid out pointer
+  if unsafe { libc::mach_timebase_info(&mut timebase) } != 0 || timebase.numer == 0 {
+    return Err(-1);
+  }
+  // nanoseconds to Mach absolute time units
+  let abs = |d: std::time::Duration| {
+    (d.as_nanos() * timebase.denom as u128 / timebase.numer as u128).min(u32::MAX as u128) as u32
+  };
+  let mut policy = libc::thread_time_constraint_policy {
+    period: abs(period),
+    computation: abs(computation),
+    constraint: abs(constraint),
+    preemptible: 1,
+  };
+  // safety: the policy struct matches the flavor and count; the current thread's port
+  let r = unsafe {
+    libc::thread_policy_set(
+      libc::mach_thread_self(),
+      libc::THREAD_TIME_CONSTRAINT_POLICY as _,
+      &mut policy as *mut _ as libc::thread_policy_t,
+      libc::THREAD_TIME_CONSTRAINT_POLICY_COUNT,
+    )
+  };
+  if r == 0 {
+    Ok(())
+  } else {
+    Err(r)
+  }
+}
+
 /// Fine timer resolution (1 ms, process-wide) while it lives. On Windows, sleeps and timeouts of the audio
 /// threads are otherwise rounded up to the default 15.6 ms tick. Nothing to do elsewhere.
 pub struct TimerResolution(());
