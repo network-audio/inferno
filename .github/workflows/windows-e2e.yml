@@ -14,7 +14,8 @@ env:
 jobs:
   e2e:
     # Inferno devices on one Windows host, routed with netaudio (see test/windows_e2e):
-    # pipe: Pipe2inferno -> Inferno2pipe; asio: Pipe2inferno -> ASIO driver -> Inferno2pipe
+    # pipe: Pipe2inferno -> Inferno2pipe; asio: Pipe2inferno -> ASIO driver -> Inferno2pipe;
+    # soundcard: Pipe2inferno -> virtual sound card (usbip-win2) -> WASAPI application -> Inferno2pipe
     strategy:
       fail-fast: false
       matrix:
@@ -22,7 +23,7 @@ jobs:
         # the runner's (netaudio then lists and subscribes them, but skips their status probes). The runner's
         # own adapter mustn't be changed: that cuts the runner off.
         network: [loopback-adapter, shared-ip]
-        scenario: [pipe, asio]
+        scenario: [pipe, asio, soundcard]
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -35,10 +36,29 @@ jobs:
           python-version: "3.13"
       - shell: bash
         run: |
-          cargo build -p pipe2inferno -p inferno2pipe -p asio_inferno
+          cargo build -p pipe2inferno -p inferno2pipe -p asio_inferno -p inferno_soundcard
           cargo build -p inferno_aoip --example ptpv1_test_leader
           cargo build -p asio_inferno --example asio_host
+          cargo build -p inferno_soundcard --example wasapi_host
       - run: pip install netaudio
+      - name: Install usbip-win2, allow recording
+        if: matrix.scenario == 'soundcard'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = "USBip-0.9.8.1-x64.exe"
+          Invoke-WebRequest -Uri "https://github.com/vadimgrn/usbip-win2/releases/download/v.0.9.8.1/$installer" -OutFile $installer
+          $actual = (Get-FileHash -Algorithm SHA256 $installer).Hash.ToLowerInvariant()
+          if ($actual -ne '38cad6d4432b52d5bb9409d9ad03b72fdffc4ada4cd3a48fbeca1a2752a8518a') { throw "checksum mismatch: $actual" }
+          $setup = Start-Process -FilePath ".\$installer" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-','/COMPONENTS=main,client' -Wait -PassThru
+          if ($setup.ExitCode -notin @(0, 3010)) { throw "usbip-win2 setup returned $($setup.ExitCode)" }
+          foreach ($root in 'HKLM:', 'HKCU:') {
+            foreach ($key in 'microphone', 'microphone\NonPackaged') {
+              $path = "$root\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\$key"
+              New-Item -Path $path -Force | Out-Null
+              Set-ItemProperty -Path $path -Name Value -Value Allow
+            }
+          }
       - name: Device addresses
         timeout-minutes: 5
         shell: pwsh

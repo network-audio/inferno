@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inferno Sound Cards</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f6f4; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --line: #deded8;
+    --accent: #c2410c; --accent-text: #ffffff; --ok: #15803d; --warn: #b45309; --bad: #b91c1c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161614; --panel: #201f1d; --text: #ecebe6; --muted: #a3a29c; --line: #34332f;
+      --accent: #f97316; --accent-text: #1b1b19; --ok: #4ade80; --warn: #fbbf24; --bad: #f87171;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, "Segoe UI", sans-serif; }
+  main { max-width: 860px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 0 0 12px; }
+  p.lead { margin: 0 0 20px; color: var(--muted); }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .status { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--warn); flex: none; align-self: center; }
+  .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
+  label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+  input, textarea { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; width: 100%; }
+  textarea { font-family: ui-monospace, Consolas, monospace; font-size: 13px; min-height: 72px; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-size: 13px; font-weight: 500; color: var(--muted); padding: 0 8px 6px 0; }
+  td { padding: 4px 8px 4px 0; vertical-align: top; }
+  td.num { width: 110px; }
+  td.dante { font-size: 13px; color: var(--muted); white-space: nowrap; padding-top: 10px; }
+  .note { font-size: 13px; color: var(--muted); margin: 8px 0 0; }
+  .note.warn { color: var(--warn); }
+  button { font: inherit; border-radius: 6px; padding: 6px 14px; cursor: pointer; border: 1px solid var(--line); background: var(--panel); color: var(--text); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+  button.remove { padding: 6px 10px; }
+  .actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  #message { font-size: 14px; }
+  #message.bad { color: var(--bad); } #message.ok { color: var(--ok); }
+  @media (max-width: 600px) {
+    thead { display: none; }
+    tr { display: grid; grid-template-columns: 1fr 1fr auto; gap: 6px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+    td { padding: 0; } td.name { grid-column: 1 / -1; } td.num { width: auto; } td.dante { grid-column: 1 / -1; padding: 0; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>Inferno Sound Cards</h1>
+  <p class="lead">Windows sound devices on the Dante network. Route their channels with Dante Controller or netaudio.</p>
+
+  <section>
+    <div class="status"><span class="dot" id="dot"></span><strong id="state">Loading…</strong><span id="device" class="note"></span></div>
+  </section>
+
+  <section>
+    <h2>Sound cards</h2>
+    <table>
+      <thead><tr><th>Name</th><th>Playback</th><th>Recording</th><th>Dante channels</th><th></th></tr></thead>
+      <tbody id="cards"></tbody>
+    </table>
+    <div class="actions" style="margin-top: 10px"><button id="add">Add a sound card</button></div>
+    <p class="note">Playback channels are what Windows plays to the card: they're transmitted. Recording channels are received, for Windows to record.</p>
+    <p class="note warn" id="limit" hidden>Most Windows apps (shared mode) can only open up to 32 channels of a device. Larger cards work with apps that open them in exclusive mode; split them into several cards for the others.</p>
+  </section>
+
+  <section>
+    <h2>Dante device</h2>
+    <label for="name">Name on the network (empty: from the computer's name)</label>
+    <input id="name" autocomplete="off" spellcheck="false">
+    <label for="settings" style="margin-top: 12px">More settings, one <code>KEY=VALUE</code> per line (e.g. <code>BIND_IP</code>, <code>RX_LATENCY_NS</code>, <code>SAMPLE_RATE</code>)</label>
+    <textarea id="settings" spellcheck="false"></textarea>
+  </section>
+
+  <div class="actions">
+    <button class="primary" id="save">Save and apply</button>
+    <span id="message" role="status"></span>
+  </div>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let config = null;
+
+function cardRow(card) {
+  const tr = document.createElement("tr");
+  tr.innerHTML = `<td class="name"><input aria-label="Name" class="card-name"></td>
+    <td class="num"><input aria-label="Playback channels" class="card-playback" type="number" min="0" max="128"></td>
+    <td class="num"><input aria-label="Recording channels" class="card-capture" type="number" min="0" max="128"></td>
+    <td class="dante"></td>
+    <td><button class="remove" title="Remove" aria-label="Remove">✕</button></td>`;
+  tr.querySelector(".card-name").value = card.name;
+  tr.querySelector(".card-playback").value = card.playback_channels;
+  tr.querySelector(".card-capture").value = card.capture_channels;
+  tr.querySelector(".remove").onclick = () => { tr.remove(); updateLimit(); };
+  tr.querySelectorAll("input").forEach((i) => i.oninput = updateLimit);
+  return tr;
+}
+
+function readCards() {
+  return [...$("cards").querySelectorAll("tr")].map((tr) => ({
+    name: tr.querySelector(".card-name").value,
+    playback_channels: Number(tr.querySelector(".card-playback").value) || 0,
+    capture_channels: Number(tr.querySelector(".card-capture").value) || 0,
+  }));
+}
+
+function updateLimit() {
+  $("limit").hidden = !readCards().some((c) => c.playback_channels > 32 || c.capture_channels > 32);
+}
+
+function show(c) {
+  config = c;
+  $("name").value = c.name || "";
+  $("settings").value = Object.entries(c.settings).map(([k, v]) => `${k}=${v}`).join("\n");
+  $("cards").replaceChildren(...c.cards.map(cardRow));
+  updateLimit();
+}
+
+function range(r) { return r ? (r[0] === r[1] ? `${r[0]}` : `${r[0]}–${r[1]}`) : "–"; }
+
+async function refreshStatus() {
+  try {
+    const s = await (await fetch("/api/status")).json();
+    $("state").textContent = s.state ? s.state[0].toUpperCase() + s.state.slice(1) : "";
+    $("dot").className = "dot" + (s.running ? " ok" : s.state.startsWith("waiting") || s.state === "starting" ? "" : " bad");
+    $("device").textContent = s.device_name ? `as ${s.device_name}, ${s.sample_rate / 1000} kHz` : "";
+    const rows = $("cards").querySelectorAll("tr");
+    s.cards.forEach((card, i) => {
+      if (rows[i]) rows[i].querySelector(".dante").textContent = `TX ${range(card.tx_channels)} · RX ${range(card.rx_channels)}`;
+    });
+  } catch (e) {
+    $("state").textContent = "The sound card service isn't running";
+    $("dot").className = "dot bad";
+  }
+}
+
+async function save() {
+  const settings = {};
+  for (const line of $("settings").value.split("\n")) {
+    const at = line.indexOf("=");
+    if (line.trim() && at > 0) settings[line.slice(0, at).trim().toUpperCase()] = line.slice(at + 1).trim();
+  }
+  const next = { ...config, name: $("name").value.trim() || null, settings, cards: readCards() };
+  $("message").className = ""; $("message").textContent = "Saving…";
+  const response = await fetch("/api/config", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", "X-Inferno-Soundcard": "1" },
+    body: JSON.stringify(next),
+  });
+  const body = await response.json();
+  if (response.ok) {
+    show(body);
+    $("message").className = "ok"; $("message").textContent = "Saved. The sound cards restart with the new settings.";
+  } else {
+    $("message").className = "bad"; $("message").textContent = body.error;
+  }
+}
+
+$("add").onclick = () => {
+  const n = $("cards").querySelectorAll("tr").length + 1;
+  $("cards").append(cardRow({ name: `Inferno ${n}`, playback_channels: 2, capture_channels: 2 }));
+};
+$("save").onclick = save;
+fetch("/api/config").then((r) => r.json()).then(show).then(refreshStatus);
+setInterval(refreshStatus, 2000);
+</script>
+</body>
+</html>
