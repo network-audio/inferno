@@ -326,6 +326,15 @@ impl<P: ProxyToSamplesBuffer + 'static> FlowsTransmitterInternal<P> {
     if let Err(e) = set_current_thread_realtime(81) {
       warn!("unable to set realtime priority of flows TX thread ({e:?}), expect dropouts. See README: Audio stability tips");
     }
+    // FIFO alone doesn't keep its wake-ups (one per packet, 0.67 ms at 48 kHz) on time on macOS
+    #[cfg(target_os = "macos")]
+    if let Err(e) = crate::util::os::set_current_thread_time_constraint(
+      Duration::from_millis(1),
+      Duration::from_micros(300),
+      Duration::from_millis(1),
+    ) {
+      warn!("unable to make the flows TX thread a time-constraint thread (error {e}), expect late packets");
+    }
     loop {
       let min_next_ts = self
         .flows

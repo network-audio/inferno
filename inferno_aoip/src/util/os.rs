@@ -1,24 +1,9 @@
 use thread_priority::Error;
 
 /// Makes the current thread real-time (FIFO). `priority_hint` is a priority in Linux's range (1..=99): it's
-/// mapped to the range of this OS (e.g. 15..=47 on macOS). On macOS, the threads moving audio (`priority_hint`
-/// of 80 and more) are made time-constraint threads instead: FIFO alone doesn't keep their wake-ups on time.
+/// mapped to the range of this OS (e.g. 15..=47 on macOS).
 #[cfg(target_family = "unix")]
 pub fn set_current_thread_realtime(priority_hint: u8) -> Result<(), Error> {
-  #[cfg(target_os = "macos")]
-  if priority_hint >= 80 {
-    use std::time::Duration;
-    // they wake up for each packet (32 frames: 0.67 ms at 48 kHz) and do little work then
-    let ms = Duration::from_millis(1);
-    if set_current_thread_time_constraint(ms, Duration::from_micros(300), ms).is_ok() {
-      return Ok(());
-    }
-  }
-  set_current_thread_fifo(priority_hint)
-}
-
-#[cfg(target_family = "unix")]
-fn set_current_thread_fifo(priority_hint: u8) -> Result<(), Error> {
   use thread_priority::unix::set_thread_priority_and_policy;
   use thread_priority::{
     RealtimeThreadSchedulePolicy, ThreadPriority, ThreadPriorityValue, ThreadSchedulePolicy,

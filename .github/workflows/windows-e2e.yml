@@ -44,9 +44,17 @@ jobs:
         shell: pwsh
         run: |
           if ("${{ matrix.network }}" -eq "loopback-adapter") {
-            choco install devcon.portable --yes --no-progress | Out-Null
-            $devcon = Get-ChildItem "$env:ChocolateyInstall\lib\devcon.portable" -Recurse -Filter "devcon*64*.exe" |
-              Select-Object -First 1
+            # the package download fails now and then
+            $devcon = $null
+            foreach ($attempt in 1..3) {
+              choco install devcon.portable --yes --no-progress --force | Out-Null
+              $devcon = Get-ChildItem "$env:ChocolateyInstall\lib\devcon.portable" -Recurse -Filter "devcon*64*.exe" `
+                -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($devcon) { break }
+              "devcon not installed (attempt $attempt)"
+              Start-Sleep -Seconds 10
+            }
+            if (-not $devcon) { throw "devcon (Chocolatey devcon.portable) couldn't be installed" }
             "devcon: $($devcon.FullName)"
             & $devcon.FullName install "$env:windir\inf\netloop.inf" "*msloop"
             Start-Sleep -Seconds 5
