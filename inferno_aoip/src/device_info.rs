@@ -53,10 +53,10 @@ impl DeviceInfo {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
   use super::*;
 
-  fn dummy_device_info(latency_ns: usize, sample_rate: u32) -> DeviceInfo {
+  pub(crate) fn dummy_device_info(latency_ns: usize, sample_rate: u32) -> DeviceInfo {
     DeviceInfo {
       ip_address: Ipv4Addr::UNSPECIFIED,
       netmask: Ipv4Addr::UNSPECIFIED,

@@ -16,6 +16,8 @@ const READ_INTERVAL: Duration = Duration::from_millis(50);
 const BUFFER_SIZE: usize = 65536;
 const SANE_CLOCK_DIFF: usize = 192000;
 const MAX_LAG_SAMPLES: Clock = 9600;
+/// How long to wait for channels to receive before going on without them.
+const CLOCK_MARGIN_MS: Clock = 200;
 
 pub type SamplesCallback = Box<dyn FnMut(usize, &Vec<Vec<Sample>>) + Send + 'static>;
 
@@ -196,6 +198,10 @@ struct PeriodicSamplesCollector<P: ProxyToSamplesBuffer> {
   commands_receiver: mpsc::Receiver<Command<P>>,
   channels: Vec<Option<Channel<P>>>,
   callback: SamplesCallback,
+  clock: MediaClock,
+  clock_recv: RealTimeBoxReceiver<Option<ClockOverlay>>,
+  sample_rate: u32,
+  latency_samples: Clock,
 }
 
 fn get_min_max_end_timestamps<'a, P: ProxyToSamplesBuffer + 'a>(
@@ -216,6 +222,41 @@ impl<P: ProxyToSamplesBuffer> PeriodicSamplesCollector<P> {
   fn get_min_max_end_timestamps(&self) -> Option<(Clock, Clock)> {
     get_min_max_end_timestamps(&self.channels)
   }
+  /// Where to read up to: as far as the connected channels have received or, when that's more than
+  /// `CLOCK_MARGIN_MS` behind the media clock (minus the receive latency: the largest of the device's and the
+  /// connected flows'), the clock, so that time goes on, in silence, while nothing is received.
+  fn readable_until(&mut self) -> Option<Clock> {
+    let received = self.get_min_max_end_timestamps().map(|(min_end_ts, max_end_ts)| {
+      // lag prevention logic to prevent abruptly disconnected transmitters from causing buffer overrun
+      // in other audio channels
+      let lag = max_end_ts.wrapping_sub(min_end_ts);
+      if lag > MAX_LAG_SAMPLES {
+        max_end_ts.wrapping_sub(MAX_LAG_SAMPLES)
+      } else {
+        min_end_ts
+      }
+    });
+    // also the receiver's initial overlay, before any update
+    if self.clock_recv.update() || !self.clock.is_ready() {
+      if let Some(ovl) = self.clock_recv.get() {
+        self.clock.update_overlay(*ovl);
+      }
+    }
+    let clock = self.clock.wrapping_now_in_timebase(self.sample_rate as u64).map(|now| {
+      let latency = self
+        .channels
+        .iter()
+        .flatten()
+        .map(|ch| ch.latency_samples)
+        .fold(self.latency_samples, Clock::max);
+      now.wrapping_sub(latency + self.sample_rate as Clock * CLOCK_MARGIN_MS / 1000)
+    });
+    match (received, clock) {
+      (Some(received), Some(clock)) if wrapped_diff(received, clock) < 0 => Some(clock),
+      (Some(received), _) => Some(received),
+      (None, clock) => clock,
+    }
+  }
   async fn run(&mut self) {
     let mut clock = None;
     let mut read_data_interval = interval(READ_INTERVAL);
@@ -224,26 +265,17 @@ impl<P: ProxyToSamplesBuffer> PeriodicSamplesCollector<P> {
     loop {
       tokio::select! {
         _ = read_data_interval.tick() => {
-          if let Some((min_end_ts, max_end_ts)) = self.get_min_max_end_timestamps() {
-            // lag prevention logic to prevent abruptly disconnected transmitters from causing buffer overrun
-            // in other audio channels
-            let lag = max_end_ts.wrapping_sub(min_end_ts);
-            let readable_until = if lag > MAX_LAG_SAMPLES {
-              max_end_ts.wrapping_sub(MAX_LAG_SAMPLES)
-            } else {
-              min_end_ts
-            };
-
+          if let Some(readable_until) = self.readable_until() {
             let new_clock = {
               if let Some(mut start_timestamp) = clock {
                 // we already have clock, use it as a start timestamp
 
-                let mut readable_samples_count = readable_until.wrapping_sub(start_timestamp).try_into().unwrap();
-                if readable_samples_count == 0 {
-                  warn!("no new samples?!");
-                } else {
-                  //debug!("we have {readable_samples_count} new samples");
+                // e.g. the clock took over from the channels, or a flow with a higher latency connected: wait until
+                // it's past where we are
+                if wrapped_diff(readable_until, start_timestamp) <= 0 {
+                  continue;
                 }
+                let mut readable_samples_count: usize = readable_until.wrapping_sub(start_timestamp);
                 if readable_samples_count > SANE_CLOCK_DIFF {
                   error!("insane clock diff {readable_samples_count}, using {SANE_CLOCK_DIFF} last samples");
                   readable_samples_count = SANE_CLOCK_DIFF;
@@ -253,27 +285,18 @@ impl<P: ProxyToSamplesBuffer> PeriodicSamplesCollector<P> {
                   readable_samples_count = BUFFER_SIZE.try_into().unwrap();
                 }
                 for chi in 0..self.channels.len() {
-                  let buffer = channels_buffers[chi].as_mut_slice();
-                  let ch_opt = {
-                    if let Some(ch) = &mut self.channels[chi] {
-                      // if ch.source.readable_until() changes from None to Some after get_*_timestamp() call,
-                      // or lag prevention logic triggers,
-                      // it would break our assumption that each channel has *at least* readable_samples_count readable.
-                      // that's why we need this check.
-                      // XXX FIXME wrapping
-                      if wrapped_diff(ch.source.readable_until(), readable_until) < 0 {
-                        None
-                      } else {
-                        Some(ch)
-                      }
-                    } else {
-                      None
+                  let buffer = &mut channels_buffers[chi][0..readable_samples_count];
+                  match &mut self.channels[chi] {
+                    // received nothing of it (yet, or the transmitter is gone): silence
+                    Some(ch) if wrapped_diff(ch.source.readable_until(), start_timestamp) <= 0 => {
+                      ch.was_connected = false;
+                      buffer.fill(0);
                     }
-                  };
-                  if let Some(ch) = ch_opt {
-                    ch.read_samples_from_ringbuffer(start_timestamp, &mut buffer[0..readable_samples_count]);
-                  } else {
-                    buffer[0..readable_samples_count].fill(0);
+                    // what the channel hasn't received in time is silence
+                    Some(ch) => {
+                      ch.read_samples_from_ringbuffer(start_timestamp, buffer);
+                    }
+                    None => buffer.fill(0),
                   }
                 }
                 (self.callback)(readable_samples_count, &channels_buffers);
@@ -333,12 +356,17 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static> SamplesCollector<P> {
   pub fn new_with_callback(
     self_info: Arc<DeviceInfo>,
     callback: SamplesCallback,
+    clock_recv: RealTimeBoxReceiver<Option<ClockOverlay>>,
   ) -> (Self, Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
     let (tx, rx) = mpsc::channel(100);
     let mut internal = PeriodicSamplesCollector {
       commands_receiver: rx,
       channels: (0..self_info.rx_channels.len()).map(|_| None).collect(),
       callback,
+      clock: MediaClock::new(false /* TODO */),
+      clock_recv,
+      sample_rate: self_info.sample_rate,
+      latency_samples: self_info.latency_samples(),
     };
     return (Self { commands_sender: tx }, async move { internal.run().await }.boxed());
   }
@@ -385,5 +413,85 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static> SamplesCollector<P> {
   }
   pub async fn shutdown(&self) {
     self.commands_sender.send(Command::Shutdown).await.log_and_forget();
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::sync::Mutex;
+
+  use atomic::Atomic;
+
+  use super::*;
+  use crate::{
+    device_info::{tests::dummy_device_info, Channel as DeviceChannel},
+    ring_buffer::{self, OwnedBuffer},
+  };
+
+  const RATE: u32 = 48000;
+
+  fn collector(
+    channels: usize,
+  ) -> (SamplesCollector<OwnedBuffer<Atomic<Sample>>>, Arc<Mutex<Vec<Vec<Sample>>>>, MediaClock) {
+    let mut info = dummy_device_info(0, RATE);
+    info.rx_channels = (0..channels)
+      .map(|i| DeviceChannel { factory_name: format!("{i}"), friendly_name: Default::default() })
+      .collect();
+    let recorded = Arc::new(Mutex::new(vec![vec![]; channels]));
+    let rec = recorded.clone();
+    let callback = move |count: usize, chs: &Vec<Vec<Sample>>| {
+      let mut rec = rec.lock().unwrap();
+      for (r, ch) in rec.iter_mut().zip(chs) {
+        r.extend_from_slice(&ch[..count]);
+      }
+    };
+    let (_, clock_recv) = real_time_box_channel::channel(Box::new(Some(ClockOverlay::monotonic())));
+    let (col, fut) = SamplesCollector::new_with_callback(Arc::new(info), Box::new(callback), clock_recv);
+    tokio::spawn(fut);
+    let mut clock = MediaClock::new(false);
+    clock.update_overlay(ClockOverlay::monotonic());
+    (col, recorded, clock)
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn silence_while_nothing_is_received() {
+    let (col, recorded, _) = collector(2);
+    let started = std::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let expected = started.elapsed().as_secs_f64() * RATE as f64;
+    col.shutdown().await;
+    let rec = recorded.lock().unwrap();
+    for ch in rec.iter() {
+      assert!(
+        (ch.len() as f64 - expected).abs() < 0.15 * RATE as f64,
+        "{} samples, expected {expected}",
+        ch.len()
+      );
+      assert!(ch.iter().all(|&s| s == 0));
+    }
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn gaps_in_reception_are_silence() {
+    let (col, recorded, clock) = collector(2);
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let start = clock.wrapping_now_in_timebase(RATE as u64).unwrap();
+    let (mut sink, source) = ring_buffer::new_owned::<Sample>(524288, start, 0);
+    col.connect_channel(0, source, 0).await;
+    // 0.1 s of audio, then the transmitter stops
+    sink.write_from_at(start, std::iter::repeat(7).take(4800));
+    let started = std::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    col.shutdown().await;
+    let rec = recorded.lock().unwrap();
+    let audio = &rec[0];
+    let first = audio.iter().position(|&s| s != 0).expect("no audio recorded");
+    assert!(audio[first..first + 4800].iter().all(|&s| s == 7));
+    assert!(audio[first + 4800..].iter().all(|&s| s == 0));
+    // time went on after the transmitter stopped
+    let after = (audio.len() - first - 4800) as f64 / RATE as f64;
+    assert!(after > started.elapsed().as_secs_f64() - 0.1 - 0.2 - 0.15, "only {after} s after the audio");
+    assert!(rec[1].iter().all(|&s| s == 0));
+    assert_eq!(rec[0].len(), rec[1].len());
   }
 }

@@ -360,6 +360,7 @@ impl DeviceServer {
     let (col, col_fut) = SamplesCollector::<OwnedBuffer<Atomic<Sample>>>::new_with_callback(
       self.self_info.clone(),
       Box::new(samples_callback),
+      self.get_realtime_clock_receiver(),
     );
     let tasks = vec![tokio::spawn(col_fut)];
     let buffering = OwnedBuffering::new(524288 /*TODO*/, 4800 /*TODO*/, Arc::new(col));
