@@ -97,7 +97,8 @@ fn start(
     settings.self_info.factory_device_id.iter().map(|b| format!("{b:02x}")).collect();
   let sample_rate = settings.self_info.sample_rate;
   let mut engine =
-    Engine::new(settings, &config.card_channels(), None).map_err(|e| fail(e.to_string()))?;
+    Engine::new(settings, &config.card_channels(), config.playback_lead(sample_rate), None)
+      .map_err(|e| fail(e.to_string()))?;
 
   set_state(status, "waiting for the clock");
   let waiting = Instant::now();

@@ -75,6 +75,8 @@
     <input id="name" autocomplete="off" spellcheck="false">
     <label for="settings" style="margin-top: 12px">More settings, one <code>KEY=VALUE</code> per line (e.g. <code>BIND_IP</code>, <code>RX_LATENCY_NS</code>, <code>SAMPLE_RATE</code>)</label>
     <textarea id="settings" spellcheck="false"></textarea>
+    <label for="margin" style="margin-top: 12px">Playback margin in milliseconds: how late Windows' audio may be before it's transmitted as silence (adds as much latency)</label>
+    <input id="margin" type="number" min="1" max="100" style="max-width: 110px">
   </section>
 
   <div class="actions">
@@ -117,6 +119,7 @@ function updateLimit() {
 function show(c) {
   config = c;
   $("name").value = c.name || "";
+  $("margin").value = c.playback_margin_ms;
   $("settings").value = Object.entries(c.settings).map(([k, v]) => `${k}=${v}`).join("\n");
   $("cards").replaceChildren(...c.cards.map(cardRow));
   updateLimit();
@@ -146,7 +149,10 @@ async function save() {
     const at = line.indexOf("=");
     if (line.trim() && at > 0) settings[line.slice(0, at).trim().toUpperCase()] = line.slice(at + 1).trim();
   }
-  const next = { ...config, name: $("name").value.trim() || null, settings, cards: readCards() };
+  const next = {
+    ...config, name: $("name").value.trim() || null, settings, cards: readCards(),
+    playback_margin_ms: Number($("margin").value) || 0,
+  };
   $("message").className = ""; $("message").textContent = "Saving…";
   const response = await fetch("/api/config", {
     method: "PUT",

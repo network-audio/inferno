@@ -304,8 +304,10 @@ def soundcard_scenario(args, procs, exe):
     rx_recording = out / "rx_recording.raw"
     stop_file = out / "stop-wasapi-host"
     config = out / "soundcard.json"
+    # the runners' audio engine stalls for 10-15 ms now and then
     config.write_text(json.dumps({"cards": [{"name": CARD_NAME, "playback_channels": CHANNELS,
-                                             "capture_channels": CHANNELS}]}))
+                                             "capture_channels": CHANNELS}],
+                                  "playback_margin_ms": 30}))
     procs.start("tx", [args.bin_dir / f"pipe2inferno{exe}", "-c", str(CHANNELS), "-i", out / "to_card.raw"],
                 device_env(TX_NAME, ip(0), 1))
     procs.start("soundcard", [args.bin_dir / f"inferno_soundcard{exe}", "--no-tray"],

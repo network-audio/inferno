@@ -9,8 +9,8 @@
 //!   the capture rings, as far as the receiver made them readable (silence where it didn't, rather than the
 //!   audio of a ring cycle ago)
 //! * a playback transfer arrives ahead of the frames it covers (by the transfers Windows queues): it's written
-//!   to the playback rings `PLAYBACK_LEAD` frames later than its frames, so that it's there when the
-//!   transmitter reads them (as they're due)
+//!   to the playback rings a margin later than its frames (`Config::playback_margin_ms`), so that it's there
+//!   when the transmitter reads them (as they're due)
 
 use std::{
   ops::Range,
@@ -31,10 +31,6 @@ use inferno_aoip::{
 use inferno_driver_core::{BuffersSignature, DeviceError, Direction, Stream, StreamOptions};
 use log::{info, warn};
 use usbip_audio::uac2::Uac2Streams;
-
-/// How much later than its frames playback audio is transmitted (5 ms): margin for Windows submitting the next
-/// transfer only once one completes, and for the completion being late (a stalled thread).
-pub const PLAYBACK_LEAD: usize = 240;
 
 /// The channels of one virtual sound card.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +60,9 @@ struct Shared {
   playback_rings: Rings,
   /// per playback ring: frames since the start written (silence beyond)
   playback_written: Arc<Vec<AtomicUsize>>,
+  /// how much later than its frames playback audio is transmitted: margin for Windows submitting the next
+  /// transfer only once one completes, and for the completion being late (a stalled thread)
+  playback_lead: usize,
   late_playback: AtomicU64,
   unreceived_capture: AtomicU64,
   clock: Arc<EngineClock>,
@@ -140,7 +139,7 @@ impl Uac2Streams for CardStreams {
     if channels == 0 {
       return;
     }
-    let start = frame as usize + PLAYBACK_LEAD;
+    let start = frame as usize + self.shared.playback_lead;
     let frames = samples.len() / channels;
     for (i, ch) in self.playback.clone().enumerate() {
       let ring = &self.shared.playback_rings[ch];
@@ -230,14 +229,17 @@ pub struct Engine {
   capture_readable: Arc<Vec<AtomicUsize>>,
   playback_rings: Rings,
   playback_written: Arc<Vec<AtomicUsize>>,
+  playback_lead: usize,
   shared: Option<Arc<Shared>>,
 }
 
 impl Engine {
-  /// Prepares the device for `cards`: `settings`' RX and TX channels are replaced by theirs.
+  /// Prepares the device for `cards`: `settings`' RX and TX channels are replaced by theirs. Playback audio is
+  /// transmitted `playback_lead` frames later than its frames.
   pub fn new(
     mut settings: Settings,
     cards: &[CardChannels],
+    playback_lead: usize,
     clock_source: Option<Arc<dyn ClockSource>>,
   ) -> Result<Self, DeviceError> {
     let (rx, tx) = (cards.iter().map(|c| c.capture).sum(), cards.iter().map(|c| c.playback).sum());
@@ -247,7 +249,7 @@ impl Engine {
     let latency = info
       .latency_samples()
       .max(settings.tx_latency_ns as usize * info.sample_rate as usize / 1_000_000_000);
-    let frames = ring_frames(latency);
+    let frames = ring_frames(latency + playback_lead);
     let mut engine = Self {
       sample_rate: info.sample_rate,
       cards: cards.to_vec(),
@@ -257,6 +259,7 @@ impl Engine {
       capture_readable: Arc::new((0..rx).map(|_| AtomicUsize::new(0)).collect()),
       playback_rings: rings(tx, frames),
       playback_written: Arc::new((0..tx).map(|_| AtomicUsize::new(0)).collect()),
+      playback_lead,
       shared: None,
     };
     let with_clock = |stream: Stream| match &clock_source {
@@ -337,6 +340,7 @@ impl Engine {
       capture_readable: self.capture_readable.clone(),
       playback_rings: self.playback_rings.clone(),
       playback_written: self.playback_written.clone(),
+      playback_lead: self.playback_lead,
       late_playback: AtomicU64::new(0),
       unreceived_capture: AtomicU64::new(0),
       clock: clock.clone(),
@@ -402,6 +406,8 @@ mod tests {
     assert_eq!(dst, [7, 8, 1, 2], "wrapping around the ring");
   }
 
+  const LEAD: usize = 240;
+
   fn card(channels: usize) -> CardStreams {
     let source: Arc<dyn ClockSource> = Arc::new(inferno_aoip::clock::FreeRunningClockSource::new());
     let shared = Arc::new(Shared {
@@ -409,6 +415,7 @@ mod tests {
       capture_readable: Arc::new(vec![]),
       playback_rings: rings(channels, 8192),
       playback_written: Arc::new((0..channels).map(|_| AtomicUsize::new(0)).collect()),
+      playback_lead: LEAD,
       late_playback: AtomicU64::new(0),
       unreceived_capture: AtomicU64::new(0),
       clock: Arc::new(EngineClock::new(&source, 48000, 0)),
@@ -423,14 +430,14 @@ mod tests {
     ring.iter().for_each(|s| s.store(7, Ordering::Relaxed)); // a cycle ago
     card.playback(1000, &[1; 48]);
     let written = card.shared.playback_written[0].load(Ordering::Relaxed);
-    assert_eq!(written, 1000 + PLAYBACK_LEAD + 48);
+    assert_eq!(written, 1000 + LEAD + 48);
     // the next transfer 100 frames later than the last ended
     card.playback(1148, &[2; 48]);
     let at = |p: usize| ring[p & (ring.len() - 1)].load(Ordering::Relaxed);
     assert_eq!(at(written - 1), 1);
-    assert!((written..1148 + PLAYBACK_LEAD).all(|p| at(p) == 0), "the gap is silence");
-    assert_eq!(at(1148 + PLAYBACK_LEAD), 2);
-    assert_eq!(card.shared.playback_written[0].load(Ordering::Relaxed), 1148 + PLAYBACK_LEAD + 48);
+    assert!((written..1148 + LEAD).all(|p| at(p) == 0), "the gap is silence");
+    assert_eq!(at(1148 + LEAD), 2);
+    assert_eq!(card.shared.playback_written[0].load(Ordering::Relaxed), 1148 + LEAD + 48);
   }
 
   #[test]

@@ -22,7 +22,7 @@ use inferno_aoip::{
   },
 };
 use inferno_soundcard::{
-  config::{card_uac2_config, CardConfig},
+  config::{card_uac2_config, CardConfig, Config},
   engine::{CardChannels, Engine},
 };
 use usbip_audio::{uac2::Uac2Device, Server};
@@ -244,7 +244,8 @@ async fn plays_and_records_through_usbip() {
   let clock_for_engine = clock.clone();
   let (engine, server) = tokio::task::spawn_blocking(move || {
     let channels = [CardChannels { playback: CHANNELS, capture: CHANNELS }];
-    let mut engine = Engine::new(card_settings, &channels, Some(clock_for_engine)).unwrap();
+    let lead = Config::default().playback_lead(RATE);
+    let mut engine = Engine::new(card_settings, &channels, lead, Some(clock_for_engine)).unwrap();
     let card_clock = engine.start().unwrap();
     let server = Server::start(0, card_clock).unwrap();
     let card = CardConfig { name: "Test card".into(), playback_channels: 2, capture_channels: 2 };

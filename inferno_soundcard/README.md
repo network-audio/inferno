@@ -8,7 +8,7 @@ Each sound card is a USB Audio 2.0 device, emulated by the `inferno_soundcard` s
 
 - One Inferno device carries all the cards. Its TX channels are the cards' playback channels, card after card, and its RX channels their recording channels. The settings page shows which Dante channels each card has.
 - The USB transfers complete by the Dante media clock, so Windows plays and records at the network's rate, without resampling of its own. The cards appear once the device has a clock: a PTP leader on the network or, on a network without Dante devices, the service itself, after 5 s (`CLOCK_LEADER=off` among its settings to only follow).
-- Recording gets what the receiver made readable, and silence where it hasn't (late or missing packets). It never gets older audio from the ring. Playback is transmitted 5 ms (240 frames) later than its frames, a margin for Windows and the service's threads being late.
+- Recording gets what the receiver made readable, and silence where it hasn't (late or missing packets). It never gets older audio from the ring. Playback is transmitted a margin later than Windows plays it (10 ms by default, the setting `playback_margin_ms`), for Windows' audio engine and the service's threads being late; audio later than that goes out as silence.
 - The usbip-win2 driver can be used by other applications at the same time, e.g. [Win AirPlay](https://github.com/network-audio/win-airplay). Each runs its own USB/IP server on a free port and detaches only its own devices.
 
 ## Install
@@ -20,6 +20,7 @@ Download the installer for your architecture from the [releases page](https://gi
 Click the tray icon, or open `http://127.0.0.1:47800/`. Changes apply right away: the cards restart.
 
 - **Sound cards:** a name, playback channels and recording channels for each, up to 128 each at 48 kHz.
+- **Playback margin** (1 to 100 ms): raise it if the log warns that playback arrived late, at the cost of as much latency.
 - **Name** on the Dante network, and further [settings](../README.md#settings) as `KEY=VALUE` lines, e.g. `BIND_IP` for the network interface or `RX_LATENCY_NS`. The channel counts are the cards'. The sample rate must be a multiple of 8 kHz (48 or 96 kHz): USB Audio 2.0 at high speed carries whole frames per 125 µs.
 
 The configuration is `%APPDATA%\Inferno\soundcard.json` (or `INFERNO_SOUNDCARD_CONFIG`), and `INFERNO_*` environment variables complete it. The log is `%LOCALAPPDATA%\Inferno\soundcard.log`.

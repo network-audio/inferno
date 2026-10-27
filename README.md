@@ -95,7 +95,7 @@ Big thanks to [Project Pendulum](https://github.com/pendulum-project) (by [Trife
 **Features:**
 * [sound cards](inferno_soundcard/README.md) (`inferno_soundcard`): Windows sound devices for any application, as many cards as you like, each with its own playback and recording channels. Set up on a settings page opened from the tray icon. They're USB audio devices attached by the signed [usbip-win2](https://github.com/vadimgrn/usbip-win2) driver, which other applications such as [Win AirPlay](https://github.com/network-audio/win-airplay) can share
 * [ASIO driver](asio_inferno/README.md) (`asio_inferno`, x64): for DAWs and other ASIO hosts; each application using it is a Dante device of its own
-* built-in PTPv1 follower: no PTP daemon needed, the network's Dante devices provide the clock
+* built-in PTPv1 clock: no PTP daemon needed. It follows the network's Dante devices or, without one, an Inferno device leads it ([`CLOCK_LEADER`](#settings))
 
 **Install:**
 1. **Sound cards:** download the installer for your architecture (x64 or ARM64) from the [releases page](https://github.com/network-audio/inferno/releases) and run it. It installs usbip-win2 if it's missing and starts the service at sign-in.
@@ -349,7 +349,12 @@ If you want to contribute but can't code or don't know where to start because th
 
 # Changelog
 
-## Unreleased
+## 0.7.0
+* Inferno2pipe records silence while nothing is connected or a transmitter stops, along the media clock, instead of pausing the recording
+* sound cards: the playback margin (how late Windows' audio may be) is a setting, 10 ms by default (was 5 ms): runners' audio engines were late by 10-15 ms now and then
+* PTPv1 clock leader (`CLOCK_LEADER=auto`, the default; `off` to only follow): a device leads the network's clock when there's no better leader (e.g. a network of Inferno devices only), hands over to Dante devices, and takes over without a clock jump. Tested with candidates on one host, a hand-over to a simulated Dante leader and back, and in the Windows end-to-end test without a leader
+
+## 0.6.0
 * DAW support in the ALSA plugin: stopping and restarting a stream (transport stop/start, xrun recovery) keeps the Dante device, flows and subscriptions running, audio resumes within about the network latency instead of several seconds
 * `snd_pcm_delay` includes the network latency, for latency compensation in DAWs
 * the device transmits silence while no application is playing (e.g. capture-only applications), so receivers don't see a broken stream; starting or stopping playback switches the transmitter without interrupting flows
@@ -389,8 +394,6 @@ If you want to contribute but can't code or don't know where to start because th
 * macOS: the ASIO engine's switch thread is a time-constraint thread, like Core Audio's I/O threads: with FIFO priority alone it woke up late (outputs lost)
 * ALSA plugin, capture: the application reads silence, not the audio of a buffer cycle ago, where the receiver hasn't received (nor closed) it in time, e.g. while the receiver's thread is stalled (warned about)
 * new Windows sound cards (`inferno_soundcard`): Windows sound devices for any application, emulated as USB Audio 2.0 devices over USB/IP and attached by the signed usbip-win2 driver (no kernel driver of our own), clocked by the Dante media clock; configured on a settings page; installers for x64 and ARM64 on the releases page. Tested in CI: a USB/IP round trip on every platform, and on Windows Pipe2inferno -> card -> exclusive-mode WASAPI application -> Inferno2pipe, bit-exact
-* Inferno2pipe records silence while nothing is connected or a transmitter stops, along the media clock, instead of pausing the recording
-* PTPv1 clock leader (`CLOCK_LEADER=auto`, the default; `off` to only follow): a device leads the network's clock when there's no better leader (e.g. a network of Inferno devices only), hands over to Dante devices, and takes over without a clock jump. Tested with candidates on one host, a hand-over to a simulated Dante leader and back, and in the Windows end-to-end test without a leader
 
 ## 0.5.0
 * works with JACK, should work with any app that uses the soundcard as an interrupt source

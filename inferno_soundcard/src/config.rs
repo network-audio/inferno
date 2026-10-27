@@ -14,6 +14,8 @@ pub const SHARED_MODE_CHANNELS: u16 = 32;
 /// At 48 kHz, as many as fit into a high-speed USB isochronous endpoint.
 pub const MAX_CHANNELS: u16 = 128;
 pub const DEFAULT_UI_PORT: u16 = 47800;
+pub const DEFAULT_PLAYBACK_MARGIN_MS: u32 = 10;
+pub const MAX_PLAYBACK_MARGIN_MS: u32 = 100;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -27,6 +29,9 @@ pub struct Config {
   pub cards: Vec<CardConfig>,
   /// Port of the settings page on 127.0.0.1
   pub ui_port: u16,
+  /// How much later than Windows plays it audio is transmitted: margin for Windows' audio being late (e.g. a
+  /// stalled audio engine). Audio later than that is transmitted as silence.
+  pub playback_margin_ms: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +57,7 @@ impl Default for Config {
       settings: BTreeMap::new(),
       cards: vec![CardConfig::default()],
       ui_port: DEFAULT_UI_PORT,
+      playback_margin_ms: DEFAULT_PLAYBACK_MARGIN_MS,
     }
   }
 }
@@ -116,9 +122,17 @@ impl Config {
   }
 
   /// What's wrong with the configuration, if anything.
+  /// The playback margin in frames at `sample_rate`.
+  pub fn playback_lead(&self, sample_rate: u32) -> usize {
+    self.playback_margin_ms as usize * sample_rate as usize / 1000
+  }
+
   pub fn validate(&self) -> Result<(), String> {
     if self.cards.is_empty() {
       return Err("add a sound card".into());
+    }
+    if !(1..=MAX_PLAYBACK_MARGIN_MS).contains(&self.playback_margin_ms) {
+      return Err(format!("the playback margin must be 1 to {MAX_PLAYBACK_MARGIN_MS} ms"));
     }
     let sample_rate = self.device_settings()?.self_info.sample_rate;
     let mut names = std::collections::BTreeSet::new();
@@ -178,12 +192,23 @@ mod tests {
   }
 
   #[test]
+  fn playback_margin_is_limited() {
+    for (ms, ok) in
+      [(0, false), (1, true), (MAX_PLAYBACK_MARGIN_MS, true), (MAX_PLAYBACK_MARGIN_MS + 1, false)]
+    {
+      let config = Config { playback_margin_ms: ms, ..Config::default() };
+      assert_eq!(config.validate().is_ok(), ok, "{ms} ms");
+    }
+  }
+
+  #[test]
   fn reads_partial_json() {
     let config: Config =
       serde_json::from_str(r#"{"cards": [{"name": "Stage", "capture_channels": 16}]}"#).unwrap();
     assert_eq!(config.cards[0].playback_channels, 2);
     assert_eq!(config.cards[0].capture_channels, 16);
     assert_eq!(config.ui_port, DEFAULT_UI_PORT);
+    assert_eq!(config.playback_lead(48000), 480);
     assert!(serde_json::from_str::<Config>(r#"{"cardz": []}"#).is_err(), "misspelt keys are errors");
   }
 
