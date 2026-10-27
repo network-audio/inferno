@@ -4,11 +4,7 @@
 
 This project is named after [a place](https://en.wikipedia.org/wiki/Inferno_(Dante)) destined for those who create undocumented network protocols.
 
-Highly experimental for now. I don't recommend using it for serious purposes.
-
-However, chances that it'll break already working Dante network are low.
-
-If you know what you're doing and have basic Linux command line experience, it is perfectly usable for non-critical tasks, e.g. listening to music, playing multitracks through mixing console for mixing practice, recording rehearsals.
+Inferno makes a Linux or Windows computer a Dante device: applications play to and record from the Dante network through a virtual soundcard, routed with Dante Controller or [netaudio](https://github.com/chris-ritsen/network-audio-controller) like any other device.
 
 Big thanks to [Project Pendulum](https://github.com/pendulum-project) (by [Trifecta Tech Foundation](https://trifectatech.org/)) for creating and maintaining [Statime](https://github.com/pendulum-project/statime) and collaboration on features needed for audiovisual networks functionality! Audio transmission would be much more difficult to implement without it.
 
@@ -21,10 +17,10 @@ Big thanks to [Project Pendulum](https://github.com/pendulum-project) (by [Trife
 
 |   | **Inferno** | [DVS](https://www.getdante.com/products/software-essentials/dante-virtual-soundcard) | [AES67 Linux daemon](https://github.com/bondagit/aes67-linux-daemon) |
 |---|---|---|---|
-| Maturity | ⏳ Alpha but used in production | ✅ Production-ready | ✅ Probably stable |
-| Platforms | Linux, Windows (experimental) | Mac, Windows  | Linux |
+| Maturity | ✅ Used in production | ✅ Production-ready | ✅ Probably stable |
+| Platforms | Linux, Windows | Mac, Windows  | Linux |
 | Supported protocols | Dante | Dante | AES67 |
-| Directly supported audio backends | ALSA, ASIO and Windows sound devices (experimental) | CoreAudio, ASIO, WDM | ALSA |
+| Directly supported audio backends | ALSA, ASIO, Windows sound devices | CoreAudio, ASIO, WDM | ALSA |
 | Works with DAWs | ✅ Yes ([tested with Ardour](alsa_pcm_inferno/README.md#daws)) | ✅ Yes | ✅ Yes |
 | Route audio using Dante Controller patchbay | ✅ Yes! | ✅ Yes | 🚫 AES67->Dante only |
 | Configurable using Dante Controller | ⏳ A bit (channel names, TX multicasts) | ✅ Yes | 🚫 No |
@@ -46,7 +42,6 @@ Big thanks to [Project Pendulum](https://github.com/pendulum-project) (by [Trife
 | Privacy | 😊 No tracking | 😡 Registration required, telemetry enabled by default | 😊 No tracking |
 
 * ✅ - usable
-* 💣 - experimental
 * ☑️ - not a part of this software but integration is easily possible
 * ⏳ - will be implemented soon (until 2025-06 probably)
 * 🚫 - unimplemented and not planned for the near future
@@ -59,8 +54,14 @@ Big thanks to [Project Pendulum](https://github.com/pendulum-project) (by [Trife
 
 
 # Quick start
-For the virtual soundcard (`alsa_pcm_inferno`), on Linux:
 
+## Linux
+**Features:**
+* the ALSA device `inferno` (`alsa_pcm_inferno`): a virtual soundcard for ALSA, JACK and PipeWire applications, DAWs included
+* [`Inferno2pipe`](inferno2pipe/README.md) and `pipe2inferno`: record to or transmit from a file or pipe, without an audio stack
+* clock from a PTP daemon ([our Statime fork](https://github.com/teodly/statime/tree/inferno-dev), PTPv1 and PTPv2), with optional hardware timestamping
+
+**Install:**
 1. **Prerequisites:** [Rust](https://rustup.rs/), git and the ALSA development files:
    * Debian/Ubuntu/Mint: `sudo apt install libasound2-dev pkg-config`
    * Fedora/CentOS: `sudo dnf install alsa-lib-devel`
@@ -73,26 +74,45 @@ For the virtual soundcard (`alsa_pcm_inferno`), on Linux:
    See [Clocking options](#clocking-options) for hardware timestamping and PTPv2.
 3. **Install:** clone this repository with `--recursive` (some dependencies are submodules) and run the installer in it, naming the network interface connected to the Dante network:
    ```
-   git clone --recursive https://gitlab.com/lumifaza/inferno.git
+   git clone --recursive https://github.com/network-audio/inferno.git
    cd inferno && ./install.sh --statime eth0 --pipewire
    ```
-   It installs the ALSA plugin where your alsa-lib looks for plugins, defines the ALSA device `inferno` (`/etc/alsa/conf.d/50-inferno.conf`), installs `inferno-doctor` and, with `--statime IFACE`, starts Statime as the `inferno-statime` service. `--pipewire` adds an Inferno sink and source to PipeWire, restart PipeWire afterwards. Leave out what you don't need; `./install.sh --help` lists the options, `--uninstall` removes everything again.
+   It installs the ALSA plugin, defines the ALSA device `inferno` (`/etc/alsa/conf.d/50-inferno.conf`), installs `inferno-doctor` and, with `--statime IFACE`, starts Statime as the `inferno-statime` service. `--pipewire` adds an Inferno sink and source to PipeWire (restart PipeWire afterwards). `./install.sh --help` lists the options, `--uninstall` removes everything.
 4. **Check:** `inferno-doctor` checks the plugin, the settings, the clock, the network ports and realtime permissions, and says what to fix. Run it as the user of the audio application (e.g. PipeWire).
-5. **Use:** the ALSA device `inferno`, e.g. `aplay -D inferno ...`, `jackd -dalsa -dinferno -p1024 -n4`, or PipeWire's "Inferno (Dante)" sink and source. It appears on the network while an application has it open: route its channels with Dante Controller or [netaudio](https://github.com/chris-ritsen/network-audio-controller). See [`alsa_pcm_inferno`](alsa_pcm_inferno/README.md) for buffer sizes, DAWs and channel counts, and [Configuration](#configuration) for its settings.
+5. **Use:** the ALSA device `inferno`, e.g. `aplay -D inferno ...`, `jackd -dalsa -dinferno -p1024 -n4`, or PipeWire's "Inferno (Dante)" sink and source. It appears on the network while an application has it open. See [`alsa_pcm_inferno`](alsa_pcm_inferno/README.md) for buffer sizes, DAWs and channel counts.
 
-For capturing to a file without an audio stack, see [`Inferno2pipe`](inferno2pipe/README.md) (`cargo build --release -p inferno2pipe`).
+**Configuration:** [settings](#settings) go in the ALSA device definition (`/etc/alsa/conf.d/50-inferno.conf` or `~/.asoundrc`) or in `INFERNO_*` environment variables, e.g. `RX_CHANNELS`, `TX_CHANNELS`, `NAME`, `BIND_IP` and latencies. See [Configuration](#configuration).
 
+* **Several devices on one computer** (e.g. PipeWire and another application each opening `inferno`): the first one uses the standard ports. A further one, if `ALT_PORT` isn't set, picks free ports (from 20000-20999) and, if `PROCESS_ID`/`DEVICE_ID` and `NAME` aren't set, a process ID and a name with it appended, so that it is a separate device. It picks the same ones each time it starts, so its saved state is kept. To choose them yourself, set `NAME`, `PROCESS_ID` and `ALT_PORT` (at least 10 apart). PCMs with the same device ID in one application are one device.
+* **Resetting a device:** subscriptions, channel names and multicast flows are saved in `~/.local/state/inferno_aoip/<device ID>`; delete that directory while the device isn't open. `inferno-doctor` shows the path.
+* **Security frameworks:** seccomp, SELinux and similar must not block clock-related syscalls. For PipeWire run by systemd, `install.sh --pipewire` installs the needed override ([`os_integration/pipewire/systemd_allow_clock.conf`](os_integration/pipewire/systemd_allow_clock.conf)).
+* **Without the installer:** copy `target/release/libasound_module_pcm_inferno.so` into alsa-lib's plugin directory (`$(pkg-config --variable=libdir alsa)/alsa-lib`) and add the device from [`alsa_pcm_inferno/asoundrc`](alsa_pcm_inferno/asoundrc) to `~/.asoundrc`. Run Statime with `sudo statime -c inferno-ptpv1.toml`, after setting the network interface in that file.
+
+## Windows
+**Features:**
+* [sound cards](inferno_soundcard/README.md) (`inferno_soundcard`): Windows sound devices for any application, as many cards as you like, each with its own playback and recording channels. Set up on a settings page opened from the tray icon. They're USB audio devices attached by the signed [usbip-win2](https://github.com/vadimgrn/usbip-win2) driver, which other applications such as [Win AirPlay](https://github.com/network-audio/win-airplay) can share
+* [ASIO driver](asio_inferno/README.md) (`asio_inferno`, x64): for DAWs and other ASIO hosts; each application using it is a Dante device of its own
+* built-in PTPv1 follower: no PTP daemon needed, the network's Dante devices provide the clock
+
+**Install:**
+1. **Sound cards:** download the installer for your architecture (x64 or ARM64) from the [releases page](https://github.com/network-audio/inferno/releases) and run it. It installs usbip-win2 if it's missing and starts the service at sign-in.
+2. **ASIO driver:** build it and register it from an administrator prompt; ASIO hosts then list **Inferno**:
+   ```
+   cargo build --release -p asio_inferno
+   regsvr32 target\release\inferno_asio.dll
+   ```
+3. **Firewall:** allow UDP 319 and 320 (PTP) and Inferno's ports when Windows asks (see [Networking](#networking)).
+
+**Configuration:**
+* sound cards: click the tray icon or open `http://127.0.0.1:47800/` to set the cards and their channel counts, the device name and further [settings](#settings) (e.g. `BIND_IP`). Changes apply right away. The configuration is saved in `%APPDATA%\Inferno\soundcard.json`, the log in `%LOCALAPPDATA%\Inferno\soundcard.log`.
+* ASIO driver: the control panel button opens `%APPDATA%\Inferno\inferno_asio.conf`, `KEY=VALUE` lines with the [settings](#settings), e.g. `NAME`, `RX_CHANNELS`, `TX_CHANNELS`. Restart the application after changing them. The log is `%TEMP%\inferno_asio.log`.
+* Most Windows applications (shared mode) open at most 32 channels of a sound card; larger cards work with applications that open them in exclusive mode.
+* Device state (subscriptions, channel names, multicast flows) is saved in `%LOCALAPPDATA%\inferno_aoip\<device ID>`.
+
+## Networking
 **Firewall:** allow incoming UDP 4440, 8800, 4455 and 8700 (or `ALT_PORT` to `ALT_PORT+3`), 5353 (mDNS), 4321 (multicast audio), 319 and 320 (PTP), and audio flows from transmitters (their ports are chosen by the operating system, so can't be known beforehand).
 
 **IPv4 and IPv6:** Dante devices use IPv4 only, and so does Inferno (Dante's protocols carry IPv4 addresses). It works on dual-stack hosts and networks: IPv6 is ignored. Without `BIND_IP`, it uses the address of the IPv4 default route or, if there is none (e.g. a Dante network without a gateway, internet over IPv6 only), an IPv4 address of an interface, link-local 169.254.x.x addresses last; with several interfaces to choose from, set `BIND_IP`.
-
-**Security frameworks:** seccomp, SELinux and similar must not block clock-related syscalls. For PipeWire run by systemd, `install.sh --pipewire` installs the needed override ([`os_integration/pipewire/systemd_allow_clock.conf`](os_integration/pipewire/systemd_allow_clock.conf), as `~/.config/systemd/user/pipewire.service.d/inferno-clock.conf`).
-
-**Several devices on one computer** (e.g. PipeWire and another application each opening `inferno`): the first one uses the standard ports. A further one, if `ALT_PORT` isn't set, picks free ports (from 20000-20999) and, if `PROCESS_ID`/`DEVICE_ID` and `NAME` aren't set, a process ID and a name with it appended, so that it is a separate device. It picks the same ones each time it starts (they depend on its name), so its saved state is kept. To choose them yourself, set `NAME`, `PROCESS_ID` and `ALT_PORT` (at least 10 apart), see [Settings](#settings). PCMs with the same device ID in one application are one device.
-
-**Resetting a device:** subscriptions, channel names and multicast flows are saved in `~/.local/state/inferno_aoip/<device ID>`; delete that directory while the device isn't open. `inferno-doctor` shows the path.
-
-**Without the installer:** copy `target/release/libasound_module_pcm_inferno.so` into alsa-lib's plugin directory (`$(pkg-config --variable=libdir alsa)/alsa-lib`) and add the device from [`alsa_pcm_inferno/asoundrc`](alsa_pcm_inferno/asoundrc) to `~/.asoundrc`. Run Statime with `sudo statime -c inferno-ptpv1.toml`, after setting the network interface in that file.
 
 ## Cross compiling
 If you want to use Inferno on Raspberry Pi or other single-board computer, it is usually faster to compile on your desktop/server/laptop (*host*) and copy resulting binaries to the *target*. Also, you will not run out of SD card space or RAM.
@@ -185,8 +205,8 @@ This project is dual licensed under the GPLv3-or-later and AGPLv3-or-later. You 
 * `inferno2pipe` - capture audio, writing interleaved 32-bit integer samples into an Unix named pipe (or a raw file). Helper script for recording to more convenient format is also provided. **Start here if you want to use Inferno for capturing audio without setting up whole audio stack**
 * `inferno_driver_core` - platform-neutral core of virtual soundcard drivers: the device shared by an application's streams, and the stream lifecycle (prepare, start, stop, restart without dropping flows, waiting for the clock). **Start here if you want to write a driver for another audio API** (CoreAudio, Windows): translate its callbacks to a `Stream`'s, like `alsa_pcm_inferno` does
 * `pipe2inferno` - the opposite of `inferno2pipe`: transmits interleaved 32-bit integer samples from a file or a pipe (`-` for stdin). For testing, and for sending audio without an audio stack
-* `asio_inferno` - ASIO driver: a virtual soundcard for Windows DAWs and other ASIO hosts (experimental, see [its README](asio_inferno/README.md))
-* `inferno_soundcard` - Windows sound cards on the Dante network, for any Windows application: USB audio devices served over USB/IP, attached by the signed usbip-win2 driver, with a settings page and tray icon (experimental, see [its README](inferno_soundcard/README.md); installers are on the [releases page](https://github.com/network-audio/inferno/releases))
+* `asio_inferno` - ASIO driver: a virtual soundcard for Windows DAWs and other ASIO hosts (see [its README](asio_inferno/README.md))
+* `inferno_soundcard` - Windows sound cards on the Dante network, for any Windows application: USB audio devices served over USB/IP, attached by the signed usbip-win2 driver, with a settings page and tray icon (see [its README](inferno_soundcard/README.md); installers are on the [releases page](https://github.com/network-audio/inferno/releases))
 * `alsa_pcm_inferno` - virtual soundcard for ALSA. **Start here if you've ever dreamed of Dante Virtual Soundcard for Linux**
 * `searchfire` - fork of [Searchlight](https://github.com/WilliamVenner/searchlight) mDNS crate, modified for compatibility with Dante's mDNS
 
@@ -249,7 +269,7 @@ The ALSA configuration wins over environment variables. Names are case-insensiti
 
 ## Settings
 All settings have default values. In a simple setup you should be able to start without specifying any parameters.
-* `BIND_IP` - which local IPv4 address to bind to. Specifying it may be necessary if you have multiple network interfaces. Alternatively, network interface name may be specified, in that case the first IPv4 address belonging to the interface will be used. Defaults to the address of the IPv4 default route or, without one, an interface's IPv4 address (see [IPv4 and IPv6](#quick-start)).
+* `BIND_IP` - which local IPv4 address to bind to. Specifying it may be necessary if you have multiple network interfaces. Alternatively, network interface name may be specified, in that case the first IPv4 address belonging to the interface will be used. Defaults to the address of the IPv4 default route or, without one, an interface's IPv4 address (see [IPv4 and IPv6](#networking)).
 * `DEVICE_ID` - 16 hexadecimal digits (8 bytes) used as a device ID. Dante devices usually use MAC address padded with zeros. Inferno uses `0000<IP address>0000` by default. Device ID is the storage key when saving state.
 * `NAME` - name of advertised device. If unspecified, name based on app name and IP address will be generated. May be removed in future versions when it becomes settable from DC and so stored in a configuration file.
 * `SAMPLE_RATE` - sample rate this device will operate on
@@ -350,7 +370,7 @@ If you want to contribute but can't code or don't know where to start because th
 * portability: `inferno_aoip` builds for macOS and Windows. The media clock comes from a `ClockSource` (usrvclock/Statime by default on Unix), and applications can give a device their own with `DeviceServer::try_start_with_clock`
 * new `inferno_driver_core` crate: the shared device and stream lifecycle, moved out of the ALSA plugin, to build drivers for other audio APIs on
 * new `pipe2inferno`: transmits audio from a file or pipe
-* new ASIO driver for Windows (`asio_inferno`, experimental): tested in CI with a minimal ASIO host, Pipe2inferno -> driver inputs and driver outputs -> Inferno2pipe, bit-exact
+* new ASIO driver for Windows (`asio_inferno`): tested in CI with a minimal ASIO host, Pipe2inferno -> driver inputs and driver outputs -> Inferno2pipe, bit-exact
 * PTPv1 follower built in (`CLOCK_SOURCE=ptpv1`, the default on Windows): follows the clock of a Dante network without a PTP daemon. Tested against a simulated leader on Linux, macOS and Windows, and in the Windows end-to-end test
 * Windows: receiving multicast flows works (sockets can't be bound to a multicast address there); end-to-end test in CI (`test/windows_e2e`): Pipe2inferno to Inferno2pipe routed with netaudio, bit-exact
 * a device that can't listen on its address gets a hint matching the cause (address in use, or not an address of this host)
@@ -364,7 +384,7 @@ If you want to contribute but can't code or don't know where to start because th
 * ASIO driver: the host's inputs are silence, not the audio of a ring cycle ago (~170 ms), where the receiver hasn't received (nor closed) them in time, e.g. when a transmitter disappears while the receiver is stalled; also no leftovers of the previous run after a restart
 * macOS: the ASIO engine's switch thread is a time-constraint thread, like Core Audio's I/O threads: with FIFO priority alone it woke up late (outputs lost)
 * ALSA plugin, capture: the application reads silence, not the audio of a buffer cycle ago, where the receiver hasn't received (nor closed) it in time, e.g. while the receiver's thread is stalled (warned about)
-* new Windows sound cards (`inferno_soundcard`, experimental): Windows sound devices for any application, emulated as USB Audio 2.0 devices over USB/IP and attached by the signed usbip-win2 driver (no kernel driver of our own), clocked by the Dante media clock; configured on a settings page; installers for x64 and ARM64 on the releases page. Tested in CI: a USB/IP round trip on every platform, and on Windows Pipe2inferno -> card -> exclusive-mode WASAPI application -> Inferno2pipe, bit-exact
+* new Windows sound cards (`inferno_soundcard`): Windows sound devices for any application, emulated as USB Audio 2.0 devices over USB/IP and attached by the signed usbip-win2 driver (no kernel driver of our own), clocked by the Dante media clock; configured on a settings page; installers for x64 and ARM64 on the releases page. Tested in CI: a USB/IP round trip on every platform, and on Windows Pipe2inferno -> card -> exclusive-mode WASAPI application -> Inferno2pipe, bit-exact
 
 ## 0.5.0
 * works with JACK, should work with any app that uses the soundcard as an interrupt source

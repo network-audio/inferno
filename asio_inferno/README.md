@@ -4,8 +4,8 @@ An ASIO driver making Inferno a Dante virtual soundcard for Windows audio applic
 hosts). Each application using it is a Dante device of its own, appearing on the network while the application
 uses the driver. Route its channels with Dante Controller or [netaudio](https://github.com/chris-ritsen/network-audio-controller).
 
-**Status: experimental.** It's tested in CI with a minimal ASIO host against other Inferno devices and a simulated
-PTP leader (see [`test/windows_e2e`](../test/windows_e2e)), not yet with DAWs or Dante hardware.
+It's tested in CI with a minimal ASIO host against other Inferno devices and a simulated PTP leader (see
+[`test/windows_e2e`](../test/windows_e2e)).
 
 ## Install
 
