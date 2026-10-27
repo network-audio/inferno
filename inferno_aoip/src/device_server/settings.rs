@@ -29,6 +29,7 @@ pub const KEYS: &[&str] = &[
   "TX_LATENCY_NS",
   "TX_SOURCE_BIT_DEPTH",
   "CLOCK_SOURCE",
+  "CLOCK_LEADER",
   "CLOCK_PATH",
   "USE_SAFE_CLOCK",
 ];
@@ -294,6 +295,8 @@ pub struct Settings {
   pub self_info: DeviceInfo,
   pub tx_latency_ns: u32,
   pub clock_source: ClockSourceKind,
+  /// lead the network's clock when there's no better leader (`CLOCK_LEADER=auto`, with `CLOCK_SOURCE=ptpv1`)
+  pub clock_leader: bool,
   pub clock_path: Option<PathBuf>,
   pub use_safe_clock: bool,
   pub tx_source_bit_depth: u8,
@@ -390,6 +393,12 @@ impl Settings {
       })?,
     };
 
+    let clock_leader = match config.get("CLOCK_LEADER").map(String::as_str) {
+      None | Some("off") => false,
+      Some("auto") => true,
+      Some(other) => return Err(invalid("CLOCK_LEADER", other, "must be off or auto")),
+    };
+
     let auto_identity = AutoIdentity {
       ports: !config.contains_key("ALT_PORT"),
       process_id: !config.contains_key("PROCESS_ID") && !config.contains_key("DEVICE_ID"),
@@ -400,6 +409,7 @@ impl Settings {
       tx_latency_ns: parse(&config, "TX_LATENCY_NS", "must be a latency in nanoseconds, e.g. 10000000")?
         .unwrap_or(10_000_000),
       clock_source,
+      clock_leader,
       clock_path: config.get("CLOCK_PATH").map(PathBuf::from),
       use_safe_clock,
       tx_source_bit_depth,
@@ -475,6 +485,9 @@ mod tests {
     assert_eq!(settings(&[]).unwrap().clock_source, ClockSourceKind::platform_default());
     assert_eq!(settings(&[("CLOCK_SOURCE", "ptpv1")]).unwrap().clock_source, ClockSourceKind::Ptpv1);
     assert_eq!(settings(&[("CLOCK_SOURCE", "free-running")]).unwrap().clock_source, ClockSourceKind::FreeRunning);
+    assert!(!settings(&[]).unwrap().clock_leader);
+    assert!(settings(&[("CLOCK_LEADER", "auto")]).unwrap().clock_leader);
+    assert_eq!(settings(&[("CLOCK_LEADER", "always")]).err().unwrap().key, "CLOCK_LEADER");
     let e = settings(&[("CLOCK_SOURCE", "gps")]).err().unwrap();
     assert_eq!(e.key, "CLOCK_SOURCE");
     assert!(e.to_string().contains("ptpv1"), "{e}");

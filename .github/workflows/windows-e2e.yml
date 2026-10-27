@@ -23,7 +23,7 @@ jobs:
         # the runner's (netaudio then lists and subscribes them, but skips their status probes). The runner's
         # own adapter mustn't be changed: that cuts the runner off.
         network: [loopback-adapter, shared-ip]
-        scenario: [pipe, asio, soundcard]
+        scenario: [pipe, asio, soundcard, pipe-leader]
     runs-on: windows-latest
     timeout-minutes: 30
     steps:

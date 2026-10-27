@@ -20,8 +20,10 @@ ASIO hosts then list **Inferno**. `regsvr32 /u target\release\inferno_asio.dll` 
 ## Clock
 
 The device follows the Dante network's PTPv1 clock leader (a Dante device) with Inferno's built-in PTPv1
-follower: no PTP daemon is needed, but the network needs a leader. Starting the driver waits up to 8 s for the
-clock; if it doesn't come, the host shows why (`getErrorMessage`), and the log has details.
+follower: no PTP daemon is needed, but the network needs a leader. Without Dante devices, set
+[`CLOCK_LEADER=auto`](../README.md#settings) on an Inferno device (this one, or e.g. the sound card service) to
+lead the clock. Starting the driver waits up to 8 s for the clock; if it doesn't come, the host shows why
+(`getErrorMessage`), and the log has details.
 
 The sample rate is the network's (`SAMPLE_RATE`, default 48000): the driver accepts no other.
 

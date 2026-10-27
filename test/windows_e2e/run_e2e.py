@@ -8,10 +8,12 @@ Scenarios:
 * soundcard: a virtual sound card (inferno_soundcard, attached through usbip-win2), played and recorded in
   exclusive mode by a minimal WASAPI application (the `wasapi_host` example): Pipe2inferno -> the card's
   microphone, recorded; another signal played to the card's speakers -> Inferno2pipe
+* pipe-leader: as pipe, without the simulated leader: the devices are leader candidates (CLOCK_LEADER=auto)
+  and one of them leads the clock
 
 Devices run on this host, each on an IP address of its own if given several (netaudio 0.4 keys devices by
 IP). Each follows the clock of a simulated PTPv1 leader (the `ptpv1_test_leader` example) with its own
-PTPv1 follower, Inferno's default clock source on Windows.
+PTPv1 follower, Inferno's default clock source on Windows (except in pipe-leader).
 
 Usage: python run_e2e.py --scenario pipe --bin-dir target/debug --ips 10.213.77.1,10.213.77.2,10.213.77.3 --out-dir e2e-out
 """
@@ -28,6 +30,8 @@ from pathlib import Path
 
 SAMPLE_RATE = 48000
 CHANNELS = 2
+# more environment for the devices, per scenario
+DEVICE_ENV = {}
 SOURCE_SECONDS = 150
 # audio to record once subscribed
 RECORD_SECONDS = 20
@@ -74,6 +78,7 @@ def device_env(name, ip, process_id):
         # gaps filled with silence: normal when a stream starts, a dropout later
         "RUST_LOG": env.get("RUST_LOG", "info,inferno_aoip::ring_buffer=debug"),
     })
+    env.update(DEVICE_ENV)
     return env
 
 
@@ -194,6 +199,15 @@ def check_clock(log_paths):
     return True
 
 
+def check_one_leader(log_paths):
+    leading = [path.name for path in log_paths if "leading the clock as" in path.read_text(errors="replace")]
+    if not leading:
+        log("❌ no device leads the clock")
+        return False
+    log(f"✅ leading the clock: {', '.join(leading)}")
+    return True
+
+
 def check_recording(source, path, what):
     matching = compare(source, path)
     if matching < MIN_MATCHING_SECONDS * SAMPLE_RATE:
@@ -217,6 +231,8 @@ def pipe_scenario(args, procs, exe):
         return False
     log(f"✅ devices discovered ({time.time() - start:.0f} s)")
     if not check_clock([out / "tx.log", out / "rx.log"]):
+        return False
+    if args.scenario == "pipe-leader" and not check_one_leader([out / "tx.log", out / "rx.log"]):
         return False
     if not subscribe(TX_NAME, RX_NAME) or not check_subscribed([RX_NAME]):
         return False
@@ -340,7 +356,7 @@ def main():
     # the Windows console's code page can't print ✅/❌
     sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scenario", choices=["pipe", "asio", "soundcard"], default="pipe")
+    parser.add_argument("--scenario", choices=["pipe", "asio", "soundcard", "pipe-leader"], default="pipe")
     parser.add_argument("--bin-dir", type=Path, required=True)
     parser.add_argument("--ips", required=True, help="comma-separated addresses of this host for the devices")
     parser.add_argument("--out-dir", type=Path, required=True)
@@ -350,11 +366,15 @@ def main():
     exe = ".exe" if sys.platform == "win32" else ""
 
     procs = Processes(args.out_dir)
-    procs.start("leader", [args.bin_dir / "examples" / f"ptpv1_test_leader{exe}", args.ips[0]],
-                dict(os.environ, RUST_LOG="info"))
+    if args.scenario == "pipe-leader":
+        DEVICE_ENV["INFERNO_CLOCK_LEADER"] = "auto"
+    else:
+        procs.start("leader", [args.bin_dir / "examples" / f"ptpv1_test_leader{exe}", args.ips[0]],
+                    dict(os.environ, RUST_LOG="info"))
     ok = False
     try:
-        scenarios = {"pipe": pipe_scenario, "asio": asio_scenario, "soundcard": soundcard_scenario}
+        scenarios = {"pipe": pipe_scenario, "asio": asio_scenario, "soundcard": soundcard_scenario,
+                     "pipe-leader": pipe_scenario}
         ok = scenarios[args.scenario](args, procs, exe)
         return 0 if ok else 1
     finally:

@@ -262,6 +262,7 @@ impl DeviceServer {
       None => start_clock_source(
         settings.clock_source,
         settings.clock_path.clone(),
+        settings.clock_leader,
         self_info.ip_address,
         self_info.mac_address.octets(),
       )

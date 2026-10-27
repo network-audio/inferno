@@ -1,4 +1,4 @@
-//! PTPv1 (IEEE 1588-2002) messages, as far as a follower (and the test leader) needs them.
+//! PTPv1 (IEEE 1588-2002) messages, as far as a follower and a leader need them.
 //! Layout as in Statime's PTPv1 support, which works with Dante devices.
 
 pub const HEADER_LEN: usize = 40;
@@ -191,19 +191,21 @@ fn write_grandmaster(buf: &mut [u8], gm: &Grandmaster) {
   buf[25] = gm.preferred as u8;
 }
 
-/// A Sync of a leader which is its own grandmaster.
+/// A Sync of a leader which is its own grandmaster, sending one every 2^`log_sync_interval` seconds.
 pub fn sync(
   source: PortId,
   sequence_id: u16,
   origin: PtpNs,
   assist: bool,
   gm: &Grandmaster,
+  log_sync_interval: i8,
 ) -> [u8; SYNC_LEN] {
   let mut buf = [0u8; SYNC_LEN];
   write_header(&mut buf, source, sequence_id, Control::Sync, assist);
   let b = &mut buf[HEADER_LEN..];
   ns_to_timestamp(origin, &mut b[0..8]);
   write_grandmaster(&mut b[12..40], gm);
+  b[43] = log_sync_interval as u8;
   b[55] = gm.stratum;
   b[56..60].copy_from_slice(&gm.identifier);
   b[61] = COMMUNICATION_TECHNOLOGY_ETHERNET;
@@ -261,7 +263,7 @@ mod tests {
 
   #[test]
   fn sync_round_trip() {
-    let buf = sync(LEADER, 42, 1_700_000_000_123_456_789, true, &GM);
+    let buf = sync(LEADER, 42, 1_700_000_000_123_456_789, true, &GM, -3);
     let m = parse(&buf).unwrap();
     assert_eq!(
       m.header,
@@ -296,14 +298,15 @@ mod tests {
     assert_eq!(buf[32], 2, "control: Follow_Up");
     assert_eq!(&buf[42..44], &[0x12, 0x34], "associatedSequenceId after 2 reserved bytes");
     assert_eq!(&buf[44..52], &[0, 0, 0, 1, 0, 0, 0, 2], "preciseOriginTimestamp");
-    let buf = sync(LEADER, 1, 0, true, &GM);
+    let buf = sync(LEADER, 1, 0, true, &GM, -3);
     assert_eq!(buf[35], 0x08, "PTP_ASSIST flag");
+    assert_eq!(buf[83], (-3i8) as u8, "syncInterval");
     assert_eq!(buf[20], 1, "event message");
   }
 
   #[test]
   fn rejects_other_versions_and_short_packets() {
-    let mut buf = sync(LEADER, 1, 0, false, &GM);
+    let mut buf = sync(LEADER, 1, 0, false, &GM, -3);
     assert!(parse(&buf[..SYNC_LEN - 1]).is_none());
     buf[1] = 2; // PTPv2
     assert!(parse(&buf).is_none());

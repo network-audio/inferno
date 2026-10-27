@@ -210,11 +210,15 @@ impl ClockSourceKind {
 pub fn start_clock_source(
   kind: ClockSourceKind,
   clock_path: Option<PathBuf>,
+  leader: bool,
   interface: Ipv4Addr,
   mac: [u8; 6],
 ) -> std::io::Result<Arc<dyn ClockSource>> {
   if clock_path.is_some() && kind != ClockSourceKind::Usrvclock {
     log::warn!("CLOCK_PATH only applies to CLOCK_SOURCE=usrvclock, ignoring it");
+  }
+  if leader && kind != ClockSourceKind::Ptpv1 {
+    log::warn!("CLOCK_LEADER only applies to CLOCK_SOURCE=ptpv1, ignoring it");
   }
   Ok(match kind {
     #[cfg(unix)]
@@ -223,7 +227,11 @@ pub fn start_clock_source(
     ClockSourceKind::Usrvclock => {
       return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "usrvclock needs Unix"))
     }
-    ClockSourceKind::Ptpv1 => Arc::new(ptpv1::Ptpv1ClockSource::start(ptpv1::Ptpv1Config::new(interface, mac))?),
+    ClockSourceKind::Ptpv1 => {
+      let mut config = ptpv1::Ptpv1Config::new(interface, mac);
+      config.leader = leader;
+      Arc::new(ptpv1::Ptpv1ClockSource::start(config)?)
+    }
     ClockSourceKind::FreeRunning => {
       log::warn!(
         "CLOCK_SOURCE=free-running: the local clock, not synchronised to the network. Audio exchanged with \

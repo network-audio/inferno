@@ -106,7 +106,8 @@ impl TestLeader {
         sequence_id = sequence_id.wrapping_add(1);
         let approximate = clock.now();
         let sent = clock.now();
-        let _ = socket.send_to(&messages::sync(me, sequence_id, approximate, true, &grandmaster), event);
+        let _ =
+          socket.send_to(&messages::sync(me, sequence_id, approximate, true, &grandmaster, -3), event);
         let _ = socket.send_to(&messages::follow_up(me, sequence_id, sequence_id, sent), general);
         std::thread::sleep(config.sync_interval);
       }
