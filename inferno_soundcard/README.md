@@ -4,16 +4,16 @@ Windows sound devices on the Dante network, for any Windows application (browser
 
 ## How it works
 
-Each sound card is a USB Audio 2.0 device, emulated by the `inferno_soundcard` service and served over [USB/IP](https://www.kernel.org/doc/html/latest/usb/usbip_protocol.html) on `127.0.0.1`. The [shared usbip-audio crate](https://github.com/stakach/usbip-audio) provides the server and the device. The signed [usbip-win2](https://github.com/vadimgrn/usbip-win2) driver attaches it, and Windows' own `usbaudio2.sys` makes it a sound device. No kernel driver of our own, so nothing to sign.
+Each sound card is a USB Audio 2.0 device, emulated by the `inferno_soundcard` service and served over [USB/IP](https://www.kernel.org/doc/html/latest/usb/usbip_protocol.html) on `127.0.0.1`. The [shared usbip-audio crate](https://github.com/network-audio/usbip-audio) provides the server and the device. The signed [usbip-win2](https://github.com/vadimgrn/usbip-win2) driver attaches it, and Windows' own `usbaudio2.sys` makes it a sound device. No kernel driver of our own, so nothing to sign.
 
 - One Inferno device carries all the cards. Its TX channels are the cards' playback channels, card after card, and its RX channels their recording channels. The settings page shows which Dante channels each card has.
 - The USB transfers complete by the Dante media clock, so Windows plays and records at the network's rate, without resampling of its own. The cards appear once the device has a clock (a PTP leader on the network).
 - Recording gets what the receiver made readable, and silence where it hasn't (late or missing packets). It never gets older audio from the ring. Playback is transmitted 5 ms (240 frames) later than its frames, a margin for Windows and the service's threads being late.
-- The usbip-win2 driver can be used by other applications at the same time, e.g. [Win AirPlay](https://github.com/stakach/win-airplay). Each runs its own USB/IP server on a free port and detaches only its own devices.
+- The usbip-win2 driver can be used by other applications at the same time, e.g. [Win AirPlay](https://github.com/network-audio/win-airplay). Each runs its own USB/IP server on a free port and detaches only its own devices.
 
 ## Install
 
-Download the installer for your architecture from the [releases page](https://github.com/stakach/inferno/releases), run it and approve the administrator prompt. It installs usbip-win2 0.9.8.1 if it's missing (uninstalling leaves it, for other applications), and starts the service at sign-in, with administrator rights to attach the devices. Restart Windows if prompted.
+Download the installer for your architecture from the [releases page](https://github.com/network-audio/inferno/releases), run it and approve the administrator prompt. It installs usbip-win2 0.9.8.1 if it's missing (uninstalling leaves it, for other applications), and starts the service at sign-in, with administrator rights to attach the devices. Restart Windows if prompted.
 
 ## Settings
 
