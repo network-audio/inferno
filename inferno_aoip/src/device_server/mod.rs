@@ -356,11 +356,26 @@ impl DeviceServer {
     })
   }
 
+  /// Receives into `samples_callback`, as far as all the subscribed channels have received: samples come only
+  /// while a flow is alive.
   pub async fn receive_with_callback(&mut self, samples_callback: SamplesCallback) {
+    self.receive_with_callback_impl(samples_callback, None).await
+  }
+  /// Like [`receive_with_callback`](Self::receive_with_callback), but time goes on along the media clock: silence
+  /// while nothing is received (nothing subscribed, a transmitter gone), after waiting 200 ms for late audio.
+  pub async fn receive_with_callback_clocked(&mut self, samples_callback: SamplesCallback) {
+    let clock = self.get_realtime_clock_receiver();
+    self.receive_with_callback_impl(samples_callback, Some(clock)).await
+  }
+  async fn receive_with_callback_impl(
+    &mut self,
+    samples_callback: SamplesCallback,
+    clock_recv: Option<RealTimeClockReceiver>,
+  ) {
     let (col, col_fut) = SamplesCollector::<OwnedBuffer<Atomic<Sample>>>::new_with_callback(
       self.self_info.clone(),
       Box::new(samples_callback),
-      self.get_realtime_clock_receiver(),
+      clock_recv,
     );
     let tasks = vec![tokio::spawn(col_fut)];
     let buffering = OwnedBuffering::new(524288 /*TODO*/, 4800 /*TODO*/, Arc::new(col));

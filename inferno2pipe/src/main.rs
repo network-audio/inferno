@@ -92,7 +92,7 @@ async fn main() {
     };
 
     let mut server = DeviceServer::start(settings).await;
-    server.receive_with_callback(Box::new(write_callback)).await;
+    server.receive_with_callback_clocked(Box::new(write_callback)).await;
 
     tokio::select! {
         _ = stop_rx => {}

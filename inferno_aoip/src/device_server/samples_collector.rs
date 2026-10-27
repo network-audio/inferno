@@ -199,7 +199,8 @@ struct PeriodicSamplesCollector<P: ProxyToSamplesBuffer> {
   channels: Vec<Option<Channel<P>>>,
   callback: SamplesCallback,
   clock: MediaClock,
-  clock_recv: RealTimeBoxReceiver<Option<ClockOverlay>>,
+  /// `None`: only as far as the channels have received
+  clock_recv: Option<RealTimeBoxReceiver<Option<ClockOverlay>>>,
   sample_rate: u32,
   latency_samples: Clock,
 }
@@ -222,9 +223,9 @@ impl<P: ProxyToSamplesBuffer> PeriodicSamplesCollector<P> {
   fn get_min_max_end_timestamps(&self) -> Option<(Clock, Clock)> {
     get_min_max_end_timestamps(&self.channels)
   }
-  /// Where to read up to: as far as the connected channels have received or, when that's more than
-  /// `CLOCK_MARGIN_MS` behind the media clock (minus the receive latency: the largest of the device's and the
-  /// connected flows'), the clock, so that time goes on, in silence, while nothing is received.
+  /// Where to read up to: as far as the connected channels have received or, if following the clock and that's
+  /// more than `CLOCK_MARGIN_MS` behind the media clock (minus the receive latency: the largest of the device's
+  /// and the connected flows'), the clock, so that time goes on, in silence, while nothing is received.
   fn readable_until(&mut self) -> Option<Clock> {
     let received = self.get_min_max_end_timestamps().map(|(min_end_ts, max_end_ts)| {
       // lag prevention logic to prevent abruptly disconnected transmitters from causing buffer overrun
@@ -236,9 +237,12 @@ impl<P: ProxyToSamplesBuffer> PeriodicSamplesCollector<P> {
         min_end_ts
       }
     });
+    let Some(clock_recv) = &mut self.clock_recv else {
+      return received;
+    };
     // also the receiver's initial overlay, before any update
-    if self.clock_recv.update() || !self.clock.is_ready() {
-      if let Some(ovl) = self.clock_recv.get() {
+    if clock_recv.update() || !self.clock.is_ready() {
+      if let Some(ovl) = clock_recv.get() {
         self.clock.update_overlay(*ovl);
       }
     }
@@ -356,7 +360,7 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static> SamplesCollector<P> {
   pub fn new_with_callback(
     self_info: Arc<DeviceInfo>,
     callback: SamplesCallback,
-    clock_recv: RealTimeBoxReceiver<Option<ClockOverlay>>,
+    clock_recv: Option<RealTimeBoxReceiver<Option<ClockOverlay>>>,
   ) -> (Self, Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
     let (tx, rx) = mpsc::channel(100);
     let mut internal = PeriodicSamplesCollector {
@@ -446,7 +450,7 @@ mod tests {
       }
     };
     let (_, clock_recv) = real_time_box_channel::channel(Box::new(Some(ClockOverlay::monotonic())));
-    let (col, fut) = SamplesCollector::new_with_callback(Arc::new(info), Box::new(callback), clock_recv);
+    let (col, fut) = SamplesCollector::new_with_callback(Arc::new(info), Box::new(callback), Some(clock_recv));
     tokio::spawn(fut);
     let mut clock = MediaClock::new(false);
     clock.update_overlay(ClockOverlay::monotonic());
