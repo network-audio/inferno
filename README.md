@@ -22,9 +22,9 @@ Big thanks to [Project Pendulum](https://github.com/pendulum-project) (by [Trife
 |   | **Inferno** | [DVS](https://www.getdante.com/products/software-essentials/dante-virtual-soundcard) | [AES67 Linux daemon](https://github.com/bondagit/aes67-linux-daemon) |
 |---|---|---|---|
 | Maturity | ⏳ Alpha but used in production | ✅ Production-ready | ✅ Probably stable |
-| Platforms | Linux  | Mac, Windows  | Linux |
+| Platforms | Linux, Windows (experimental) | Mac, Windows  | Linux |
 | Supported protocols | Dante | Dante | AES67 |
-| Directly supported audio backends | ALSA | CoreAudio, ASIO, WDM | ALSA |
+| Directly supported audio backends | ALSA, ASIO and Windows sound devices (experimental) | CoreAudio, ASIO, WDM | ALSA |
 | Works with DAWs | ✅ Yes ([tested with Ardour](alsa_pcm_inferno/README.md#daws)) | ✅ Yes | ✅ Yes |
 | Route audio using Dante Controller patchbay | ✅ Yes! | ✅ Yes | 🚫 AES67->Dante only |
 | Configurable using Dante Controller | ⏳ A bit (channel names, TX multicasts) | ✅ Yes | 🚫 No |
@@ -186,10 +186,11 @@ This project is dual licensed under the GPLv3-or-later and AGPLv3-or-later. You 
 * `inferno_driver_core` - platform-neutral core of virtual soundcard drivers: the device shared by an application's streams, and the stream lifecycle (prepare, start, stop, restart without dropping flows, waiting for the clock). **Start here if you want to write a driver for another audio API** (CoreAudio, Windows): translate its callbacks to a `Stream`'s, like `alsa_pcm_inferno` does
 * `pipe2inferno` - the opposite of `inferno2pipe`: transmits interleaved 32-bit integer samples from a file or a pipe (`-` for stdin). For testing, and for sending audio without an audio stack
 * `asio_inferno` - ASIO driver: a virtual soundcard for Windows DAWs and other ASIO hosts (experimental, see [its README](asio_inferno/README.md))
+* `inferno_soundcard` - Windows sound cards on the Dante network, for any Windows application: USB audio devices served over USB/IP, attached by the signed usbip-win2 driver, with a settings page and tray icon (experimental, see [its README](inferno_soundcard/README.md); installers are on the [releases page](https://github.com/stakach/inferno/releases))
 * `alsa_pcm_inferno` - virtual soundcard for ALSA. **Start here if you've ever dreamed of Dante Virtual Soundcard for Linux**
 * `searchfire` - fork of [Searchlight](https://github.com/WilliamVenner/searchlight) mDNS crate, modified for compatibility with Dante's mDNS
 
-`inferno_aoip`, `inferno_driver_core`, `inferno2pipe` and `pipe2inferno` build for Linux, macOS and Windows; the ALSA plugin and `inferno-doctor` are Linux-only, the ASIO driver Windows-only. The media clock comes from a `ClockSource` (`inferno_aoip::clock`), chosen by [`CLOCK_SOURCE`](#settings): on Unix the default is a PTP daemon at `CLOCK_PATH` (see below), on Windows Inferno's own PTPv1 follower. Applications can also give a device their own with `DeviceServer::try_start_with_clock` (or `Stream::with_clock_source`).
+`inferno_aoip`, `inferno_driver_core`, `inferno2pipe` and `pipe2inferno` build for Linux, macOS and Windows; the ALSA plugin and `inferno-doctor` are Linux-only, the ASIO driver and the sound cards Windows-only (the sound cards' engine and USB/IP server build and are tested anywhere). The media clock comes from a `ClockSource` (`inferno_aoip::clock`), chosen by [`CLOCK_SOURCE`](#settings): on Unix the default is a PTP daemon at `CLOCK_PATH` (see below), on Windows Inferno's own PTPv1 follower. Applications can also give a device their own with `DeviceServer::try_start_with_clock` (or `Stream::with_clock_source`).
 
 
 # Clocking options
@@ -363,6 +364,7 @@ If you want to contribute but can't code or don't know where to start because th
 * ASIO driver: the host's inputs are silence, not the audio of a ring cycle ago (~170 ms), where the receiver hasn't received (nor closed) them in time, e.g. when a transmitter disappears while the receiver is stalled; also no leftovers of the previous run after a restart
 * macOS: the ASIO engine's switch thread is a time-constraint thread, like Core Audio's I/O threads: with FIFO priority alone it woke up late (outputs lost)
 * ALSA plugin, capture: the application reads silence, not the audio of a buffer cycle ago, where the receiver hasn't received (nor closed) it in time, e.g. while the receiver's thread is stalled (warned about)
+* new Windows sound cards (`inferno_soundcard`, experimental): Windows sound devices for any application, emulated as USB Audio 2.0 devices over USB/IP and attached by the signed usbip-win2 driver (no kernel driver of our own), clocked by the Dante media clock; configured on a settings page; installers for x64 and ARM64 on the releases page. Tested in CI: a USB/IP round trip on every platform, and on Windows Pipe2inferno -> card -> exclusive-mode WASAPI application -> Inferno2pipe, bit-exact
 
 ## 0.5.0
 * works with JACK, should work with any app that uses the soundcard as an interrupt source

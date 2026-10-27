@@ -1,0 +1,162 @@
+name: Release
+
+# Windows installers of the virtual sound cards: built and smoke-tested on every run, published as assets of
+# the release of a pushed v* tag (or of an existing tag, run by hand).
+on:
+  push:
+    tags: ['v*']
+    branches: [dev, windows-e2e]
+    paths: ['packaging/**', 'inferno_soundcard/**', '.github/workflows/release.yml']
+  pull_request:
+    paths: ['packaging/**', 'inferno_soundcard/**', '.github/workflows/release.yml']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to publish the installers for (empty to only build them)
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  USBIP_VERSION: 0.9.8.1
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: windows-2025, arch: x64 }
+          - { os: windows-11-arm, arch: arm64 }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked -p inferno_soundcard
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inferno-soundcard-${{ matrix.arch }}
+          path: target/release/inferno_soundcard.exe
+          if-no-files-found: error
+
+  installer:
+    needs: build
+    strategy:
+      matrix:
+        arch: [x64, arm64]
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: inferno-soundcard-${{ matrix.arch }}
+          path: staging
+      - name: Stage files and compile the installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $arch = '${{ matrix.arch }}'
+          $tag = '${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}'
+          $version = if ($tag -match '^v(\d+\.\d+\.\d+)$') { $Matches[1] } else {
+            (Select-String -Path inferno_soundcard/Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          }
+          "version $version"
+          $upstream = "staging/USBip-$env:USBIP_VERSION-$arch.exe"
+          Invoke-WebRequest -Uri "https://github.com/vadimgrn/usbip-win2/releases/download/v.$env:USBIP_VERSION/USBip-$env:USBIP_VERSION-$arch.exe" -OutFile $upstream
+          $expected = if ($arch -eq 'x64') { '38cad6d4432b52d5bb9409d9ad03b72fdffc4ada4cd3a48fbeca1a2752a8518a' } else { 'cab7ff97f79275eeb5c5b8bb2eb3111ff6b6c4eead07d9bec9be5bd1e3a35800' }
+          $actual = (Get-FileHash -Algorithm SHA256 $upstream).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "usbip-win2 release checksum mismatch: $actual" }
+          Copy-Item packaging/windows/*.ps1, packaging/windows/USBIP-LICENSE.txt staging/
+          Copy-Item LICENSE staging/LICENSE.txt
+          if (-not (Get-Command makensis.exe -ErrorAction SilentlyContinue)) {
+            choco install nsis --no-progress -y
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          $nsis = (Get-Command makensis.exe -ErrorAction SilentlyContinue).Source
+          if (-not $nsis) { $nsis = 'C:\Program Files (x86)\NSIS\makensis.exe' }
+          & $nsis "/DDIST_DIR=$((Resolve-Path staging).Path)" "/DUSBIP_ARCH=$arch" "/DVERSION=$version" "/DOUT_FILE=$((Get-Location).Path)\inferno-soundcard-windows-$arch-setup.exe" packaging/windows/installer.nsi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inferno-soundcard-installer-${{ matrix.arch }}
+          path: inferno-soundcard-windows-${{ matrix.arch }}-setup.exe
+          if-no-files-found: error
+
+  smoke-test:
+    # installs, checks the service starts (its settings page answers), uninstalls
+    needs: installer
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-2025, arch: x64 }
+          - { os: windows-11-arm, arch: arm64 }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: inferno-soundcard-installer-${{ matrix.arch }}
+      - name: Install, check, uninstall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = (Resolve-Path inferno-soundcard-windows-${{ matrix.arch }}-setup.exe).Path
+          $result = Start-Process -FilePath $setup -ArgumentList '/S' -PassThru
+          if (-not $result.WaitForExit(240000)) { throw 'the installer did not finish within four minutes' }
+          if ($result.ExitCode -ne 0) {
+            Get-Content (Join-Path $env:TEMP 'inferno-soundcard-setup.log') -Tail 80 -ErrorAction SilentlyContinue
+            throw "the installer exited with $($result.ExitCode)"
+          }
+          $folder = Join-Path $env:ProgramFiles 'Inferno Sound Cards'
+          $usbip = [System.IO.File]::ReadAllText((Join-Path $folder 'usbip-path.txt')).Trim()
+          if (-not (Test-Path -LiteralPath $usbip -PathType Leaf)) { throw "usbip.exe missing: $usbip" }
+          $task = Get-ScheduledTask -TaskName 'Inferno Sound Cards'
+          if ($task.Actions.Arguments -notmatch '-WindowStyle Hidden') { throw 'the service task is not hidden' }
+          $status = $null
+          for ($i = 0; $i -lt 60 -and -not $status; $i++) {
+            try { $status = Invoke-RestMethod http://127.0.0.1:47800/api/status } catch { Start-Sleep -Seconds 1 }
+          }
+          if (-not $status) {
+            Get-Content (Join-Path $env:LOCALAPPDATA 'Inferno\soundcard.log') -Tail 50 -ErrorAction SilentlyContinue
+            throw 'the service did not start: its settings page does not answer'
+          }
+          "service: $($status.state)"
+          $page = Invoke-WebRequest http://127.0.0.1:47800/ -UseBasicParsing
+          if ($page.Content -notmatch 'Inferno Sound Cards') { throw 'the settings page is missing' }
+          $result = Start-Process -FilePath (Join-Path $folder 'Uninstall.exe') -ArgumentList '/S', "_?=$folder" -Wait -PassThru
+          if ($result.ExitCode -ne 0) { throw "the uninstaller exited with $($result.ExitCode)" }
+          if (Get-ScheduledTask -TaskName 'Inferno Sound Cards' -ErrorAction SilentlyContinue) { throw 'the service task remained' }
+          if (Get-Process inferno_soundcard -ErrorAction SilentlyContinue) { throw 'the service is still running' }
+          if (-not (Test-Path -LiteralPath $usbip)) { throw 'usbip-win2 was removed, other applications may need it' }
+          'installed, started, uninstalled'
+
+  publish:
+    needs: smoke-test
+    if: github.ref_type == 'tag' || inputs.tag != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: inferno-soundcard-installer-*
+          merge-multiple: true
+          path: installers
+      - name: Publish the installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          ls -l installers
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" installers/*.exe --clobber
+          else
+            gh release create "$TAG" installers/*.exe --verify-tag --title "Inferno $TAG" --notes-file packaging/windows/RELEASE.md
+          fi
