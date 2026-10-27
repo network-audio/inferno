@@ -295,7 +295,8 @@ pub struct Settings {
   pub self_info: DeviceInfo,
   pub tx_latency_ns: u32,
   pub clock_source: ClockSourceKind,
-  /// lead the network's clock when there's no better leader (`CLOCK_LEADER=auto`, with `CLOCK_SOURCE=ptpv1`)
+  /// lead the network's clock when there's no better leader (`CLOCK_LEADER=auto`, the default; with
+  /// `CLOCK_SOURCE=ptpv1`)
   pub clock_leader: bool,
   pub clock_path: Option<PathBuf>,
   pub use_safe_clock: bool,
@@ -394,10 +395,13 @@ impl Settings {
     };
 
     let clock_leader = match config.get("CLOCK_LEADER").map(String::as_str) {
-      None | Some("off") => false,
-      Some("auto") => true,
-      Some(other) => return Err(invalid("CLOCK_LEADER", other, "must be off or auto")),
+      None | Some("auto") => true,
+      Some("off") => false,
+      Some(other) => return Err(invalid("CLOCK_LEADER", other, "must be auto or off")),
     };
+    if config.contains_key("CLOCK_LEADER") && clock_source != ClockSourceKind::Ptpv1 {
+      log::warn!("CLOCK_LEADER only applies to CLOCK_SOURCE=ptpv1, ignoring it");
+    }
 
     let auto_identity = AutoIdentity {
       ports: !config.contains_key("ALT_PORT"),
@@ -485,8 +489,9 @@ mod tests {
     assert_eq!(settings(&[]).unwrap().clock_source, ClockSourceKind::platform_default());
     assert_eq!(settings(&[("CLOCK_SOURCE", "ptpv1")]).unwrap().clock_source, ClockSourceKind::Ptpv1);
     assert_eq!(settings(&[("CLOCK_SOURCE", "free-running")]).unwrap().clock_source, ClockSourceKind::FreeRunning);
-    assert!(!settings(&[]).unwrap().clock_leader);
+    assert!(settings(&[]).unwrap().clock_leader);
     assert!(settings(&[("CLOCK_LEADER", "auto")]).unwrap().clock_leader);
+    assert!(!settings(&[("CLOCK_LEADER", "off")]).unwrap().clock_leader);
     assert_eq!(settings(&[("CLOCK_LEADER", "always")]).err().unwrap().key, "CLOCK_LEADER");
     let e = settings(&[("CLOCK_SOURCE", "gps")]).err().unwrap();
     assert_eq!(e.key, "CLOCK_SOURCE");

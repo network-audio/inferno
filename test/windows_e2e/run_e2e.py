@@ -8,8 +8,8 @@ Scenarios:
 * soundcard: a virtual sound card (inferno_soundcard, attached through usbip-win2), played and recorded in
   exclusive mode by a minimal WASAPI application (the `wasapi_host` example): Pipe2inferno -> the card's
   microphone, recorded; another signal played to the card's speakers -> Inferno2pipe
-* pipe-leader: as pipe, without the simulated leader: the devices are leader candidates (CLOCK_LEADER=auto)
-  and one of them leads the clock
+* pipe-leader: as pipe, without the simulated leader: one of the devices (leader candidates by default,
+  CLOCK_LEADER=auto) leads the clock
 
 Devices run on this host, each on an IP address of its own if given several (netaudio 0.4 keys devices by
 IP). Each follows the clock of a simulated PTPv1 leader (the `ptpv1_test_leader` example) with its own
@@ -30,8 +30,6 @@ from pathlib import Path
 
 SAMPLE_RATE = 48000
 CHANNELS = 2
-# more environment for the devices, per scenario
-DEVICE_ENV = {}
 SOURCE_SECONDS = 150
 # audio to record once subscribed
 RECORD_SECONDS = 20
@@ -78,7 +76,6 @@ def device_env(name, ip, process_id):
         # gaps filled with silence: normal when a stream starts, a dropout later
         "RUST_LOG": env.get("RUST_LOG", "info,inferno_aoip::ring_buffer=debug"),
     })
-    env.update(DEVICE_ENV)
     return env
 
 
@@ -366,9 +363,7 @@ def main():
     exe = ".exe" if sys.platform == "win32" else ""
 
     procs = Processes(args.out_dir)
-    if args.scenario == "pipe-leader":
-        DEVICE_ENV["INFERNO_CLOCK_LEADER"] = "auto"
-    else:
+    if args.scenario != "pipe-leader":
         procs.start("leader", [args.bin_dir / "examples" / f"ptpv1_test_leader{exe}", args.ips[0]],
                     dict(os.environ, RUST_LOG="info"))
     ok = False

@@ -217,9 +217,6 @@ pub fn start_clock_source(
   if clock_path.is_some() && kind != ClockSourceKind::Usrvclock {
     log::warn!("CLOCK_PATH only applies to CLOCK_SOURCE=usrvclock, ignoring it");
   }
-  if leader && kind != ClockSourceKind::Ptpv1 {
-    log::warn!("CLOCK_LEADER only applies to CLOCK_SOURCE=ptpv1, ignoring it");
-  }
   Ok(match kind {
     #[cfg(unix)]
     ClockSourceKind::Usrvclock => Arc::new(UsrvClockSource::start(clock_path)),

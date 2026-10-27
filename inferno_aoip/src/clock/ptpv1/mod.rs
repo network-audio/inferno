@@ -56,7 +56,8 @@ pub struct Ptpv1Config {
   pub group: Ipv4Addr,
   pub event_port: u16,
   pub general_port: u16,
-  /// whether to lead the clock when there's no better leader (setting `CLOCK_LEADER`)
+  /// whether to lead the clock when there's no better leader (setting `CLOCK_LEADER`, on by default for
+  /// devices; off by default here, for followers only)
   pub leader: bool,
   /// how long a leader candidate waits for a leader before leading itself
   pub leader_timeout: Duration,
