@@ -16,8 +16,8 @@ use inferno_aoip::{
   clock::ClockSource,
   device_info::DeviceId,
   device_server::{
-    AtomicSample, DeviceServer, ExternalBufferParameters, RealTimeClockReceiver, Sample, Settings,
-    StreamAnchor, TransferNotifier,
+    AtomicSample, BuffersValid, DeviceServer, ExternalBufferParameters, RealTimeClockReceiver, Sample,
+    Settings, StreamAnchor, TransferNotifier,
   },
   utils::run_future_in_new_thread,
 };
@@ -115,7 +115,7 @@ static SILENCE: AtomicSample = AtomicSample::new(0);
 /// Starts transmitting silence, or switches the running transmitter to it (keeping its flows).
 async fn transmit_silence(device_server: &mut DeviceServer, channels: usize) -> Transmitter {
   // never valid and never started: the transmitter sends silence without touching the buffer
-  let valid = Arc::new(RwLock::new(false));
+  let valid = BuffersValid::new(false);
   let anchor = StreamAnchor::new_paused_guarding(valid.clone());
   let buffers = (0..channels)
     .map(|_| unsafe { ExternalBufferParameters::new(&SILENCE, 1, 1, valid.clone(), None) })

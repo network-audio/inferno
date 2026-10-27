@@ -168,6 +168,7 @@ impl<P: ProxyToSamplesBuffer + 'static> FlowsTransmitterInternal<P> {
     let max_awake_time_samples = (self.sample_rate / 200) as ClockDiff;
     let max_lag_samples = self.max_lag_samples;
     let mut iterations = 0;
+    let mut yielded = false;
     let mut max_missing_samples = 0;
     // pause silence must stay digital silence
     let dither_16 = !paused && self.should_dither(16);
@@ -260,13 +261,15 @@ impl<P: ProxyToSamplesBuffer + 'static> FlowsTransmitterInternal<P> {
           warn!("send returned error");
         }
         iterations += 1;
-        if (iterations % 16) == 0 {
+        // catching up is bounded (by `now`, and `max_lag_samples` above): let other threads run meanwhile, but
+        // don't stop, the packets due are needed, and the other flows' too
+        if (iterations % 16) == 0 && !yielded {
           if let Some(real_now) = self.clock.wrapping_now_in_timebase(self.sample_rate as u64) {
             let diff = wrapped_diff(real_now.try_into().unwrap(), now as Clock);
             if diff > max_awake_time_samples {
-              warn!("blocked for {diff} samples, yielding to avoid CPU lockup");
-              std::thread::sleep(Duration::from_micros(2000));
-              return;
+              warn!("transmitting for {diff} samples (catching up), yielding");
+              std::thread::yield_now();
+              yielded = true;
             }
           }
         }
@@ -364,7 +367,7 @@ impl<P: ProxyToSamplesBuffer + 'static> FlowsTransmitterInternal<P> {
         self
           .current_timestamp
           .store(cur_ts_opt.unwrap_or(usize::MAX), Ordering::SeqCst /*TODO: really needed?*/);
-        self.on_transfer.as_ref().map(|transfer| (transfer.callback)());
+        self.on_transfer.as_ref().map(|transfer| transfer.notify_at(Some(now as Clock)));
 
         if !sleep_duration.is_zero() {
           std::thread::sleep(sleep_duration);

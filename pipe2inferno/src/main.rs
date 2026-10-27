@@ -4,13 +4,13 @@ use std::fs::File;
 use std::io::Read;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
 
 use inferno_aoip::device_server::{
-    AtomicSample, DeviceServer, ExternalBufferParameters, MediaClock, RealTimeClockReceiver,
-    Sample, Settings, StreamAnchor,
+    AtomicSample, BuffersValid, DeviceServer, ExternalBufferParameters, MediaClock,
+    RealTimeClockReceiver, Sample, Settings, StreamAnchor,
 };
 
 const ABOUT: &str = "Pipe2inferno
@@ -161,7 +161,7 @@ async fn main() {
     let mut server = DeviceServer::start(settings).await;
     let start_time = wait_for_clock(server.get_realtime_clock_receiver(), sample_rate).await;
 
-    let valid = Arc::new(RwLock::new(true));
+    let valid = BuffersValid::new(true);
     let buffers = rings
         .iter()
         .map(|ring| {

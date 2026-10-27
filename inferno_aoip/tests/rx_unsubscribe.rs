@@ -8,11 +8,12 @@
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use inferno_aoip::device_server::{
-  AtomicSample, DeviceServer, ExternalBufferParameters, MediaClock, Sample, Settings, StreamAnchor,
+  AtomicSample, BuffersValid, DeviceServer, ExternalBufferParameters, MediaClock, Sample, Settings,
+  StreamAnchor,
 };
 
 const SAMPLE_RATE: u32 = 48000;
@@ -71,7 +72,7 @@ async fn wait_for_clock(mut clock_rx: inferno_aoip::device_server::RealTimeClock
 
 fn external_buffers(
   bufs: &[Arc<Vec<AtomicSample>>],
-  valid: &Arc<RwLock<bool>>,
+  valid: &Arc<BuffersValid>,
 ) -> Vec<ExternalBufferParameters<Sample>> {
   bufs
     .iter()
@@ -116,7 +117,7 @@ async fn channels_end_silent(transmitter_disappears: bool, base_port: u16) {
   let tx_bufs: Vec<Arc<Vec<AtomicSample>>> = (0..CHANNELS)
     .map(|_| Arc::new((0..TX_BUF_SIZE).map(|_| AtomicSample::new(0x1234_5600)).collect()))
     .collect();
-  let tx_valid = Arc::new(RwLock::new(true));
+  let tx_valid = BuffersValid::new(true);
   let tx_anchor = StreamAnchor::new_paused();
   tx_server
     .transmit_from_external_buffer(
@@ -130,7 +131,7 @@ async fn channels_end_silent(transmitter_disappears: bool, base_port: u16) {
 
   let rx_bufs: Vec<Arc<Vec<AtomicSample>>> =
     (0..CHANNELS).map(|_| Arc::new((0..RX_BUF_SIZE).map(|_| AtomicSample::new(0)).collect())).collect();
-  let rx_valid = Arc::new(RwLock::new(false));
+  let rx_valid = BuffersValid::new(false);
   let rx_anchor = StreamAnchor::new_paused_guarding(rx_valid.clone());
   rx_server
     .receive_to_external_buffer(

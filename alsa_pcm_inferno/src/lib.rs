@@ -369,12 +369,12 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
         track_position: this.use_flows_clock || (*io).stream == SND_PCM_STREAM_PLAYBACK,
         on_transfer: if this.on_transfer_enabled {
             let efd = this.on_transfer_eventfd;
-            Some(TransferNotifier {
-                callback: Box::new(move || {
+            Some(TransferNotifier::new(
+                Box::new(move || {
                     libc::write(efd, [1u64].as_ptr() as *const c_void, 8);
                 }),
-                max_interval_samples: (*io).period_size.try_into().unwrap(),
-            })
+                (*io).period_size.try_into().unwrap(),
+            ))
         } else {
             None
         },

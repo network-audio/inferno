@@ -310,8 +310,11 @@ impl Worker {
     let mut late_switches = 0u64;
     let mut lost_outputs = 0u64;
     while !self.stop.load(Ordering::Acquire) {
-      if let Some(overlay) = *clock_rx.borrow_and_update() {
-        clock.update_overlay(overlay);
+      // borrowing takes the channel's lock: only when there's a new overlay (checking is lock-free)
+      if clock_rx.has_changed().unwrap_or(false) || !clock.is_ready() {
+        if let Some(overlay) = *clock_rx.borrow_and_update() {
+          clock.update_overlay(overlay);
+        }
       }
       let Some(now) = clock.wrapping_now_in_timebase(rate) else {
         timer.sleep(Duration::from_millis(1));

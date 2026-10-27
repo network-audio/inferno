@@ -1,6 +1,7 @@
 use crate::common::Clock;
+use crate::ring_buffer::BuffersValid;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 const PAUSED: usize = usize::MAX;
 
@@ -22,7 +23,7 @@ pub struct StreamAnchor(Arc<Shared>);
 struct Shared {
   start_time: AtomicUsize,
   network_latency_samples: AtomicUsize,
-  buffers_valid: Option<Arc<RwLock<bool>>>,
+  buffers_valid: Option<Arc<BuffersValid>>,
 }
 
 impl StreamAnchor {
@@ -30,10 +31,10 @@ impl StreamAnchor {
     Self::new(None)
   }
   /// Like `new_paused`, also guarding the validity flag of the stream's external buffers (see type docs).
-  pub fn new_paused_guarding(buffers_valid: Arc<RwLock<bool>>) -> Self {
+  pub fn new_paused_guarding(buffers_valid: Arc<BuffersValid>) -> Self {
     Self::new(Some(buffers_valid))
   }
-  fn new(buffers_valid: Option<Arc<RwLock<bool>>>) -> Self {
+  fn new(buffers_valid: Option<Arc<BuffersValid>>) -> Self {
     Self(Arc::new(Shared {
       start_time: AtomicUsize::new(PAUSED),
       network_latency_samples: AtomicUsize::new(0),
@@ -56,18 +57,15 @@ impl StreamAnchor {
   pub fn pause(&self) {
     self.0.start_time.store(PAUSED, Ordering::Release);
     if let Some(valid) = &self.0.buffers_valid {
-      *valid.write().unwrap() = false;
+      valid.invalidate();
     }
   }
   /// Called by the receiver/transmitter once it addresses the buffers according to `applied_start_time`:
   /// marks guarded buffers valid, unless the stream has been paused or re-anchored meanwhile.
   pub(crate) fn activate(&self, applied_start_time: Clock) {
     if let Some(valid) = &self.0.buffers_valid {
-      // checked under the lock: pause() changes start_time before taking it
-      let mut valid = valid.write().unwrap();
-      if self.start_time() == Some(applied_start_time) {
-        *valid = true;
-      }
+      // checked with changes excluded: pause() changes start_time before invalidating
+      valid.validate_if(|| self.start_time() == Some(applied_start_time));
     }
   }
   /// `None` if paused
@@ -120,23 +118,23 @@ mod tests {
   /// write or read them with the addressing of a previous start.
   #[test]
   fn buffers_are_valid_only_after_activation_of_current_start() {
-    let valid = Arc::new(RwLock::new(false));
+    let valid = BuffersValid::new(false);
     let a = StreamAnchor::new_paused_guarding(valid.clone());
     a.start(1000);
-    assert!(!*valid.read().unwrap(), "start alone must not make buffers valid");
+    assert!(!valid.is_valid(), "start alone must not make buffers valid");
     a.activate(999);
-    assert!(!*valid.read().unwrap(), "activation of another start");
+    assert!(!valid.is_valid(), "activation of another start");
     a.activate(1000);
-    assert!(*valid.read().unwrap());
+    assert!(valid.is_valid());
     a.pause();
-    assert!(!*valid.read().unwrap(), "pause invalidates");
+    assert!(!valid.is_valid(), "pause invalidates");
     a.activate(1000);
-    assert!(!*valid.read().unwrap(), "activation after pause");
+    assert!(!valid.is_valid(), "activation after pause");
     a.start(2000);
     a.activate(1000);
-    assert!(!*valid.read().unwrap(), "late activation of the previous start");
+    assert!(!valid.is_valid(), "late activation of the previous start");
     a.activate(2000);
-    assert!(*valid.read().unwrap());
+    assert!(valid.is_valid());
   }
 
   #[test]

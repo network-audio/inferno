@@ -6,7 +6,7 @@ use itertools::Itertools;
 use std::{
   marker::PhantomData,
   slice,
-  sync::{atomic::AtomicUsize, Arc, RwLock},
+  sync::{atomic::AtomicUsize, Arc, Mutex},
 };
 
 pub fn wrapsub(a: usize, b: usize) -> isize {
@@ -57,17 +57,79 @@ impl<T> ProxyToBuffer<T> for OwnedBuffer<T> {
 
 impl ProxyToSamplesBuffer for OwnedBuffer<Atomic<Sample>> {}
 
+/// Whether external buffers may be accessed: shared by the buffers of a stream (and the views of an
+/// interleaved buffer). Real-time threads enter it without blocking or failing spuriously; invalidating waits
+/// until the accesses in progress have finished, so that the buffers can be released or reconfigured.
+pub struct BuffersValid {
+  /// `VALID` bit, and the number of accesses in progress
+  state: AtomicUsize,
+  /// serializes changes of validity
+  changes: Mutex<()>,
+}
+
+const VALID: usize = 1 << (usize::BITS - 1);
+
+/// An access to valid buffers in progress.
+pub(crate) struct BuffersAccess<'a>(&'a AtomicUsize);
+
+impl Drop for BuffersAccess<'_> {
+  fn drop(&mut self) {
+    self.0.fetch_sub(1, Ordering::Release);
+  }
+}
+
+impl BuffersValid {
+  pub fn new(valid: bool) -> Arc<Self> {
+    Arc::new(Self { state: AtomicUsize::new(if valid { VALID } else { 0 }), changes: Mutex::new(()) })
+  }
+  pub fn is_valid(&self) -> bool {
+    self.state.load(Ordering::Acquire) & VALID != 0
+  }
+  /// Marks the buffers valid if `condition` holds, checked with changes of validity excluded.
+  pub fn validate_if(&self, condition: impl FnOnce() -> bool) {
+    let _changes = self.changes.lock().unwrap_or_else(|e| e.into_inner());
+    if condition() {
+      self.state.fetch_or(VALID, Ordering::AcqRel);
+    }
+  }
+  /// Marks the buffers invalid. Returns once no access is in progress: from then on they aren't touched.
+  pub fn invalidate(&self) {
+    let _changes = self.changes.lock().unwrap_or_else(|e| e.into_inner());
+    self.state.fetch_and(!VALID, Ordering::AcqRel);
+    while self.state.load(Ordering::Acquire) != 0 {
+      std::thread::yield_now();
+    }
+  }
+  pub fn set(&self, valid: bool) {
+    if valid {
+      self.validate_if(|| true);
+    } else {
+      self.invalidate();
+    }
+  }
+  /// `None` if invalid. Never blocks.
+  #[inline(always)]
+  pub(crate) fn enter(&self) -> Option<BuffersAccess<'_>> {
+    let access = BuffersAccess(&self.state);
+    if self.state.fetch_add(1, Ordering::Acquire) & VALID != 0 {
+      Some(access)
+    } else {
+      None
+    }
+  }
+}
+
 /// Buffer which can be invalidated at any time by an external force.
 /// Intended for buffers managed by libraries not written in Rust.
 pub struct ExternalBuffer<T> {
   ptr: *const T,
   length: usize,
   // we're using separate flag because ExternalBuffer may be one of the views of the same interleaved buffer with different offsets
-  valid: Arc<RwLock<bool>>,
+  valid: Arc<BuffersValid>,
   written_from: Option<WrittenFrom>,
 }
 
-// safety: is guaranteed by lockable valid flag
+// safety: is guaranteed by the valid flag, entered for every access
 unsafe impl<T> Send for ExternalBuffer<T> {}
 unsafe impl<T> Sync for ExternalBuffer<T> {}
 
@@ -76,14 +138,14 @@ impl<T> ExternalBuffer<T> {
   ///
   /// `length` is buffer length in items (not in bytes)
   ///
-  /// `valid` is shared and locked reference to flag which should be set to `false` when we are notified that buffer is no longer valid.
-  /// (it can't be atomic_bool by design - it must be locked all time the buffer is in use)
+  /// `valid` is shared with the owner of the buffer, who invalidates it when the buffer is no longer valid
+  /// (it's entered all the time the buffer is in use, so invalidating waits for that).
   ///
   /// Safety: user must ensure that ptr & length correspond to a valid memory region containing a slice `[T; length]`
   unsafe fn new(
     ptr: *const T,
     length: usize,
-    valid: Arc<RwLock<bool>>,
+    valid: Arc<BuffersValid>,
     written_from: Option<WrittenFrom>,
   ) -> Self {
     Self { ptr, length, valid, written_from }
@@ -97,16 +159,8 @@ impl<T> ProxyToBuffer<T> for ExternalBuffer<T> {
   }
   #[inline(always)]
   fn map<R>(&self, cb: impl FnOnce(&[T]) -> R) -> Option<R> {
-    if let Ok(guard) = self.valid.try_read() {
-      let valid = *guard;
-      if valid {
-        Some(cb(unsafe { slice::from_raw_parts(self.ptr, self.length) }))
-      } else {
-        None
-      }
-    } else {
-      None
-    }
+    let _access = self.valid.enter()?;
+    Some(cb(unsafe { slice::from_raw_parts(self.ptr, self.length) }))
   }
   #[inline(always)]
   fn unconditional_read(&self) -> bool {
@@ -115,12 +169,8 @@ impl<T> ProxyToBuffer<T> for ExternalBuffer<T> {
   fn written_from(&self, position: usize) -> Option<usize> {
     let written_from = self.written_from.as_ref()?;
     // the producer may be gone when the buffer is invalid
-    let guard = self.valid.try_read().ok()?;
-    if *guard {
-      Some(written_from(position))
-    } else {
-      None
-    }
+    let _access = self.valid.enter()?;
+    Some(written_from(position))
   }
 }
 
@@ -293,12 +343,16 @@ impl<T: Default + NoUninit, P: ProxyToBuffer<Atomic<T>>> RBInput<T, P> {
       self.rb.writing_pos.store(end_ts, Ordering::SeqCst);
     }
 
-    // Write the items:
+    // Write the items. Readiness is only ever checked between readable_pos and writing_pos: without holes,
+    // everything written is about to be readable, so it needn't be marked (the common case, per packet).
+    let mark_ready = hole;
+    let stride = self.rb.stride;
     self.rb.buffer.map(|buffer| {
       for_in_ring(self.rb.items_size, start_timestamp, end_ts, |i| {
-        //debug!("writing to RB index {i}");
-        buffer[i * self.rb.stride].store(input.next().unwrap(), Ordering::Relaxed);
-        self.item_ready.set(i, true);
+        buffer[i * stride].store(input.next().unwrap(), Ordering::Relaxed);
+        if mark_ready {
+          self.item_ready.set(i, true);
+        }
       });
       atomic::fence(Ordering::Release); // TODO: really needed? won't readable_pos.store(Ordering::Release) suffice?
     });
@@ -549,13 +603,13 @@ pub struct ExternalBufferParameters<T> {
   ptr: *const Atomic<T>,
   length: usize,
   stride: usize,
-  valid: Arc<RwLock<bool>>,
+  valid: Arc<BuffersValid>,
   readable_pos_dest: Option<PositionReportDestination>,
   written_pos_dest: Option<PositionReportDestination>,
   written_from: Option<WrittenFrom>,
 }
 
-// safety: is guaranteed by lockable valid flag
+// safety: is guaranteed by the valid flag
 unsafe impl<T> Send for ExternalBufferParameters<T> {}
 unsafe impl<T> Sync for ExternalBufferParameters<T> {}
 
@@ -564,7 +618,7 @@ impl<T> ExternalBufferParameters<T> {
     ptr: *const Atomic<T>,
     length: usize,
     stride: usize,
-    valid: Arc<RwLock<bool>>,
+    valid: Arc<BuffersValid>,
     readable_pos_dest: Option<PositionReportDestination>,
   ) -> Self {
     Self { ptr, length, stride, valid, readable_pos_dest, written_pos_dest: None, written_from: None }
@@ -620,6 +674,66 @@ pub fn wrap_external_sink<T: Default>(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// In-order writes don't mark readiness: after wrapping around the ring several times (readiness of every
+  /// index stale), a lost packet must still be filled with silence, and only it.
+  #[test]
+  fn hole_after_unmarked_in_order_writes() {
+    let (mut input, output) = new_owned::<i32>(64, 0, 16);
+    let packet = |p: usize| (0..8).map(move |i| (p + i) as i32 + 1);
+    let mut p = 0;
+    while p < 64 * 5 {
+      input.write_from_at(p, packet(p));
+      p += 8;
+    }
+    // packet at p lost
+    for q in [p + 8, p + 16, p + 24] {
+      input.write_from_at(q, packet(q));
+    }
+    // the hole closed (older than hole_fix_wait), the rest arrived: readable to the end
+    assert_eq!(output.readable_until(), p + 32);
+    let mut out = [-1; 16];
+    assert_eq!(output.read_at(p - 4, &mut out), ReadResult { useful_start_index: 0, useful_end_index: 16 });
+    let expected: Vec<i32> =
+      (p - 4..p + 12).map(|q| if (p..p + 8).contains(&q) { 0 } else { q as i32 + 1 }).collect();
+    assert_eq!(&out[..], &expected[..]);
+  }
+
+  #[test]
+  fn buffers_valid_entering() {
+    let valid = BuffersValid::new(false);
+    assert!(valid.enter().is_none());
+    valid.set(true);
+    {
+      let _a = valid.enter().unwrap();
+      let _b = valid.enter().unwrap();
+    }
+    valid.invalidate();
+    assert!(valid.enter().is_none());
+    assert!(!valid.is_valid());
+    // failed entries leave no access behind
+    valid.invalidate();
+  }
+
+  /// Once invalidating returns, no access is in progress: it waits for the ones that are.
+  #[test]
+  fn invalidating_waits_for_accesses_in_progress() {
+    use std::sync::atomic::AtomicBool;
+    let valid = BuffersValid::new(true);
+    let finished = Arc::new(AtomicBool::new(false));
+    let (v, f) = (valid.clone(), finished.clone());
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+      let _access = v.enter().unwrap();
+      entered_tx.send(()).unwrap();
+      std::thread::sleep(std::time::Duration::from_millis(50));
+      f.store(true, Ordering::SeqCst);
+    });
+    entered_rx.recv().unwrap();
+    valid.invalidate();
+    assert!(finished.load(Ordering::SeqCst), "returned while an access was in progress");
+    reader.join().unwrap();
+  }
   use std::sync::{Arc, Barrier};
   use std::thread;
 
@@ -1107,7 +1221,7 @@ mod tests {
 
     let buf: Arc<Vec<Atomic<i32>>> = Arc::new((0..16).map(|_| Atomic::new(-1)).collect());
     std::mem::forget(buf.clone());
-    let valid = Arc::new(std::sync::RwLock::new(true));
+    let valid = BuffersValid::new(true);
     let tab = Arc::new(vec![AtomicUsize::new(0), AtomicUsize::new(0)]);
     let params = unsafe { ExternalBufferParameters::new(buf.as_ptr(), buf.len(), 1, valid, None) }
       .with_written_pos_report(PositionReportDestination::new(tab.clone(), 1));
@@ -1130,7 +1244,7 @@ mod tests {
 
     let buf: Arc<Vec<Atomic<i32>>> = Arc::new((0..16).map(|i| Atomic::new(100 + i)).collect());
     std::mem::forget(buf.clone());
-    let valid = Arc::new(std::sync::RwLock::new(true));
+    let valid = BuffersValid::new(true);
     let written_until = Arc::new(AtomicUsize::new(19));
     let w = written_until.clone();
     let params =
@@ -1152,7 +1266,7 @@ mod tests {
     assert_eq!(output.read_at(24, &mut out), ReadResult { useful_start_index: 0, useful_end_index: 8 });
 
     // invalid buffer: nothing is read, and the producer isn't asked
-    *valid.write().unwrap() = false;
+    valid.invalidate();
     assert_eq!(output.read_at(24, &mut out), ReadResult { useful_start_index: 0, useful_end_index: 0 });
   }
 
@@ -1168,7 +1282,7 @@ mod tests {
     let buf: Arc<Vec<Atomic<i32>>> = Arc::new((0..16).map(|_| Atomic::new(-1)).collect());
     std::mem::forget(buf.clone());
 
-    let valid = Arc::new(std::sync::RwLock::new(true));
+    let valid = BuffersValid::new(true);
     let params = unsafe {
       ExternalBufferParameters::new(buf.as_ptr(), buf.len(), 1, valid.clone(), None)
     };

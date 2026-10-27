@@ -9,7 +9,7 @@
 use std::{
   sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc, RwLock,
+    Arc,
   },
   time::Duration,
 };
@@ -17,8 +17,8 @@ use std::{
 use inferno_aoip::{
   clock::ClockSource,
   device_server::{
-    Clock, ExternalBufferParameters, MediaClock, RealTimeClockReceiver, Sample, Settings, StreamAnchor,
-    TransferNotifier,
+    BuffersValid, Clock, ExternalBufferParameters, MediaClock, RealTimeClockReceiver, Sample, Settings,
+    StreamAnchor, TransferNotifier,
   },
 };
 use log::{debug, error, warn};
@@ -68,7 +68,7 @@ pub struct Stream {
   /// whether this stream's settings were compared with those of the device it shares (once, on first prepare)
   shared_settings_checked: bool,
   /// whether the application's buffers may be accessed (by the receiver/transmitter)
-  buffers_valid: Arc<RwLock<bool>>,
+  buffers_valid: Arc<BuffersValid>,
   /// shared with the receiver/transmitter serving this stream
   anchor: StreamAnchor,
   media_clock: MediaClock,
@@ -81,7 +81,7 @@ pub struct Stream {
 
 impl Stream {
   pub fn new(direction: Direction, settings: Settings) -> Self {
-    let buffers_valid = Arc::new(RwLock::new(false));
+    let buffers_valid = BuffersValid::new(false);
     Self {
       direction,
       settings,
@@ -112,7 +112,7 @@ impl Stream {
   }
 
   /// Guards the application's buffers: give it to the `ExternalBufferParameters` passed to `prepare`.
-  pub fn buffers_valid(&self) -> Arc<RwLock<bool>> {
+  pub fn buffers_valid(&self) -> Arc<BuffersValid> {
     self.buffers_valid.clone()
   }
 

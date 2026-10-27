@@ -9,14 +9,15 @@
 
 use alsa_sys_all::*;
 use inferno_aoip::device_server::{
-    AtomicSample, DeviceServer, ExternalBufferParameters, Sample, Settings, StreamAnchor,
+    AtomicSample, BuffersValid, DeviceServer, ExternalBufferParameters, Sample, Settings,
+    StreamAnchor,
 };
 use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const SAMPLE_RATE: u32 = 48000;
@@ -486,7 +487,7 @@ fn start_library_transmitter(
                     buf.as_ptr(),
                     buf.len(),
                     1,
-                    Arc::new(RwLock::new(true)),
+                    BuffersValid::new(true),
                     None,
                 )
             })

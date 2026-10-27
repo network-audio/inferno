@@ -387,7 +387,9 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
         }
       }
       //if start_time_rx.is_none() {
-      self.on_transfer.as_ref().map(|transfer| (transfer.callback)());
+      if let Some(transfer) = &self.on_transfer {
+        transfer.notify_at(self.clock.wrapping_now_in_timebase(self.sample_rate as u64));
+      }
       //} XXX
 
       if may_have_command {
@@ -846,7 +848,7 @@ mod tests {
 
     // the last audio received
     let buffer: Arc<Vec<AtomicSample>> = Arc::new((0..1024).map(|_| AtomicSample::new(7)).collect());
-    let valid = Arc::new(RwLock::new(true));
+    let valid = crate::ring_buffer::BuffersValid::new(true);
     let params = unsafe { ExternalBufferParameters::new(buffer.as_ptr(), buffer.len(), 1, valid, None) };
     let ring = shared_from_external(&params, 0);
 
@@ -894,7 +896,7 @@ mod tests {
 
     let buffers: Vec<Arc<Vec<AtomicSample>>> =
       (0..2).map(|_| Arc::new((0..4096).map(|_| AtomicSample::new(0)).collect())).collect();
-    let valid = Arc::new(RwLock::new(true));
+    let valid = crate::ring_buffer::BuffersValid::new(true);
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let port = socket.local_addr().unwrap().port();
     socket.set_nonblocking(true).unwrap();

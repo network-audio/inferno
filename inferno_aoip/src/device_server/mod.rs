@@ -50,7 +50,7 @@ pub use crate::clock::{clock_path_or_default, diagnose_missing_clock};
 pub use crate::clock::{ClockOverlay, FreeRunningClockSource};
 pub use crate::media_clock::{MediaClock, RealTimeClockReceiver};
 pub use crate::ring_buffer::{
-  new_owned, ExternalBufferParameters, PositionReportDestination, RBInput, WrittenFrom,
+  new_owned, BuffersValid, ExternalBufferParameters, PositionReportDestination, RBInput, WrittenFrom,
 };
 pub use crate::state_storage::state_dir;
 pub use settings::{Settings, SettingsError};
@@ -67,6 +67,28 @@ const PEAKS_ITER_SLEEP: Duration = Duration::from_millis(100);
 pub struct TransferNotifier {
   pub callback: Box<dyn Fn() + Send + Sync>,
   pub max_interval_samples: Clock,
+  /// media time slot of the last notification, see `notify_at`
+  last_slot: std::sync::atomic::AtomicUsize,
+}
+
+impl TransferNotifier {
+  /// `callback` is called (from a real-time thread) as the stream's position advances, at least every
+  /// `max_interval_samples` (e.g. a period) and more often.
+  pub fn new(callback: Box<dyn Fn() + Send + Sync>, max_interval_samples: Clock) -> Self {
+    Self { callback, max_interval_samples, last_slot: usize::MAX.into() }
+  }
+  /// Calls the callback when media time `now` entered another quarter of `max_interval_samples`: a reader
+  /// waiting for a period is woken within a quarter period (and a packet) of it being ready, not on every
+  /// packet. Unconditionally without the time.
+  pub(crate) fn notify_at(&self, now: Option<Clock>) {
+    if let Some(now) = now {
+      let slot = now / (self.max_interval_samples / 4).max(1);
+      if self.last_slot.swap(slot, std::sync::atomic::Ordering::Relaxed) == slot {
+        return;
+      }
+    }
+    (self.callback)();
+  }
 }
 
 /// Listens on the device's 4 ports: ARC, CMC, flows control, device info.
@@ -584,5 +606,25 @@ impl DeviceServer {
       self.clock_source.shutdown().await;
     }
     info!("shutdown ok");
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::sync::atomic::{AtomicUsize, Ordering};
+
+  #[test]
+  fn transfer_notifications_once_per_quarter_interval() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = calls.clone();
+    let notifier = TransferNotifier::new(Box::new(move || _ = c.fetch_add(1, Ordering::Relaxed)), 1024);
+    // a packet (32 samples) at a time over 4 intervals
+    for now in (10_000..10_000 + 4 * 1024).step_by(32) {
+      notifier.notify_at(Some(now));
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 16);
+    notifier.notify_at(None);
+    assert_eq!(calls.load(Ordering::Relaxed), 17, "without the time: always");
   }
 }

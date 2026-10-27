@@ -12,15 +12,15 @@ use rand::{Rng, SeedableRng};
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use inferno_aoip::clock::ptpv1::test_leader::{TestLeader, TestLeaderConfig};
 use inferno_aoip::clock::ptpv1::{Ptpv1ClockSource, Ptpv1Config};
 use inferno_aoip::clock::{ClockSource, FreeRunningClockSource};
 use inferno_aoip::device_server::{
-  AtomicSample, DeviceServer, ExternalBufferParameters, MediaClock, Sample, Settings, StreamAnchor,
-  TransferNotifier,
+  AtomicSample, BuffersValid, DeviceServer, ExternalBufferParameters, MediaClock, Sample, Settings,
+  StreamAnchor, TransferNotifier,
 };
 
 const BUF_SIZE: usize = 65536;
@@ -209,7 +209,7 @@ async fn loopback(mut tx_server: DeviceServer, mut rx_server: DeviceServer) {
           buf.as_ptr(),
           buf.len(),
           1,
-          Arc::new(RwLock::new(true)),
+          BuffersValid::new(true),
           None, // unconditional read
         )
       }
@@ -224,7 +224,7 @@ async fn loopback(mut tx_server: DeviceServer, mut rx_server: DeviceServer) {
       tx_external_params,
       tx_anchor.clone(),
       tx_current_timestamp.clone(),
-      Some(TransferNotifier { callback: Box::new(|| {}), max_interval_samples: 480 }),
+      Some(TransferNotifier::new(Box::new(|| {}), 480)),
     )
     .await;
 

@@ -27,7 +27,34 @@ fn fifo_priority(hint: u8, min: i32, max: i32) -> u8 {
   (min + hint * (max - min) / 98) as u8
 }
 
-#[cfg(not(target_family = "unix"))]
+/// Registers the current thread with MMCSS as "Pro Audio" (for the rest of its life), like the audio threads of
+/// hosts and drivers: plain thread priorities rank below them. `priority_hint` of 80 and more (the threads that
+/// move audio): critical within the task, high otherwise. Falls back to time-critical thread priority.
+#[cfg(windows)]
+pub fn set_current_thread_realtime(priority_hint: u8) -> Result<(), Error> {
+  use windows_sys::Win32::System::Threading::{
+    AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority, GetCurrentThread, SetThreadPriority,
+    AVRT_PRIORITY_CRITICAL, AVRT_PRIORITY_HIGH, THREAD_PRIORITY_TIME_CRITICAL,
+  };
+  let task: Vec<u16> = "Pro Audio\0".encode_utf16().collect();
+  let mut index = 0u32;
+  // safety: valid null-terminated string and index pointer; the handle is kept until the thread ends
+  let handle = unsafe { AvSetMmThreadCharacteristicsW(task.as_ptr(), &mut index) };
+  if !handle.is_null() {
+    let priority = if priority_hint >= 80 { AVRT_PRIORITY_CRITICAL } else { AVRT_PRIORITY_HIGH };
+    // safety: valid MMCSS handle
+    unsafe { AvSetMmThreadPriority(handle, priority) };
+    return Ok(());
+  }
+  // safety: pseudo-handle of the current thread
+  if unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) } != 0 {
+    Ok(())
+  } else {
+    Err(Error::OS(std::io::Error::last_os_error().raw_os_error().unwrap_or(0)))
+  }
+}
+
+#[cfg(not(any(target_family = "unix", windows)))]
 pub fn set_current_thread_realtime(_priority_hint: u8) -> Result<(), Error> {
   thread_priority::set_current_thread_priority(thread_priority::ThreadPriority::Max)
 }

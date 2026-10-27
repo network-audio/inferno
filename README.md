@@ -353,6 +353,13 @@ If you want to contribute but can't code or don't know where to start because th
 * PTPv1 follower built in (`CLOCK_SOURCE=ptpv1`, the default on Windows): follows the clock of a Dante network without a PTP daemon. Tested against a simulated leader on Linux, macOS and Windows, and in the Windows end-to-end test
 * Windows: receiving multicast flows works (sockets can't be bound to a multicast address there); end-to-end test in CI (`test/windows_e2e`): Pipe2inferno to Inferno2pipe routed with netaudio, bit-exact
 * a device that can't listen on its address gets a hint matching the cause (address in use, or not an address of this host)
+* Pipe2inferno reads its input along the media clock: no more gaps of silence after the first subscription
+* Windows: the audio threads (transmit, receive, PTP) register with MMCSS ("Pro Audio") instead of a thread priority below the audio threads of hosts and drivers
+* the transmitter no longer sleeps 2 ms and skips flows when catching up after a stall
+* external buffers' validity is an atomic flag: real-time threads no longer take a lock, which could fail spuriously (dropping a packet's samples, or marking the previous ring cycle's samples readable)
+* the ALSA plugin wakes the application about 4 times per period instead of on every packet
+* receiving: writing in-order packets into a ring buffer is about 10x faster (no per-sample bookkeeping without holes)
+* ASIO driver: a buffer switch finishing after its outputs were due is warned about (the host has one period, as with any ASIO driver)
 
 ## 0.5.0
 * works with JACK, should work with any app that uses the soundcard as an interrupt source
