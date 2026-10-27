@@ -144,6 +144,13 @@ impl Uac2Streams for CardStreams {
     for (i, ch) in self.playback.clone().enumerate() {
       let ring = &self.shared.playback_rings[ch];
       let mask = ring.len() - 1;
+      // after a pause or a stall the transfers continue later than the last one ended: the positions in
+      // between count as written, they must be silence, not what the ring held a cycle ago
+      let written = self.shared.playback_written[ch].load(Ordering::Acquire);
+      let gap = start.saturating_sub(written).min(ring.len());
+      for p in start - gap..start {
+        ring[p & mask].store(0, Ordering::Relaxed);
+      }
       for f in 0..frames {
         ring[(start + f) & mask].store(samples[f * channels + i], Ordering::Relaxed);
       }
@@ -377,6 +384,37 @@ mod tests {
     assert_eq!(dst, [5, 6, 0, 0]);
     assert_eq!(copy_captured(&r, 12, 6, &mut dst), 0);
     assert_eq!(dst, [7, 8, 1, 2], "wrapping around the ring");
+  }
+
+  fn card(channels: usize) -> CardStreams {
+    let source: Arc<dyn ClockSource> = Arc::new(inferno_aoip::clock::FreeRunningClockSource::new());
+    let shared = Arc::new(Shared {
+      capture_rings: rings(0, 8192),
+      capture_readable: Arc::new(vec![]),
+      playback_rings: rings(channels, 8192),
+      playback_written: Arc::new((0..channels).map(|_| AtomicUsize::new(0)).collect()),
+      late_playback: AtomicU64::new(0),
+      unreceived_capture: AtomicU64::new(0),
+      clock: Arc::new(EngineClock::new(&source, 48000, 0)),
+    });
+    CardStreams { shared, playback: 0..channels, capture: 0..0 }
+  }
+
+  #[test]
+  fn playback_after_a_gap_leaves_silence_in_between() {
+    let card = card(1);
+    let ring = &card.shared.playback_rings[0];
+    ring.iter().for_each(|s| s.store(7, Ordering::Relaxed)); // a cycle ago
+    card.playback(1000, &[1; 48]);
+    let written = card.shared.playback_written[0].load(Ordering::Relaxed);
+    assert_eq!(written, 1000 + PLAYBACK_LEAD + 48);
+    // the next transfer 100 frames later than the last ended
+    card.playback(1148, &[2; 48]);
+    let at = |p: usize| ring[p & (ring.len() - 1)].load(Ordering::Relaxed);
+    assert_eq!(at(written - 1), 1);
+    assert!((written..1148 + PLAYBACK_LEAD).all(|p| at(p) == 0), "the gap is silence");
+    assert_eq!(at(1148 + PLAYBACK_LEAD), 2);
+    assert_eq!(card.shared.playback_written[0].load(Ordering::Relaxed), 1148 + PLAYBACK_LEAD + 48);
   }
 
   #[test]

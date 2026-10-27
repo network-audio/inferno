@@ -33,7 +33,8 @@ mod host {
       Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
       Media::Audio::{
         eCapture, eRender, EDataFlow, IAudioCaptureClient, IAudioClient, IAudioRenderClient, IMMDevice,
-        IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_EXCLUSIVE,
+        IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_E_BUFFER_TOO_LARGE,
+        AUDCLNT_SHAREMODE_EXCLUSIVE,
         DEVICE_STATE_ACTIVE, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0,
       },
       System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ},
@@ -117,6 +118,9 @@ mod host {
     let render_client: IAudioRenderClient = unsafe { render.GetService() }.map_err(at("GetService render"))?;
     let capture_client: IAudioCaptureClient = unsafe { capture.GetService() }.map_err(at("GetService capture"))?;
     let buffer = unsafe { render.GetBufferSize() }.map_err(at("GetBufferSize"))?;
+    let mut period = 0i64;
+    unsafe { render.GetDevicePeriod(Some(&mut period), None) }.map_err(at("GetDevicePeriod"))?;
+    let period_frames = (period as u64 * RATE as u64 / 10_000_000).max(1) as u32;
     let frame_bytes = 4 * channels as usize;
     unsafe { capture.Start() }.map_err(at("Start capture"))?;
     unsafe { render.Start() }.map_err(at("Start render"))?;
@@ -124,9 +128,15 @@ mod host {
     let started = Instant::now();
     let (mut played, mut recorded) = (0usize, 0usize);
     while started.elapsed() < Duration::from_secs(seconds) && !until_file.as_ref().is_some_and(|f| f.exists()) {
-      let free = buffer - unsafe { render.GetCurrentPadding() }.map_err(at("GetCurrentPadding"))?;
-      if free > 0 {
-        let data = unsafe { render_client.GetBuffer(free) }.map_err(at("GetBuffer render"))?;
+      let free = (buffer - unsafe { render.GetCurrentPadding() }.map_err(at("GetCurrentPadding"))?).min(period_frames);
+      // in exclusive mode the space can still be short of the padding's: try again later
+      let data = match unsafe { render_client.GetBuffer(free) } {
+        _ if free == 0 => None,
+        Ok(data) => Some(data),
+        Err(e) if e.code() == AUDCLNT_E_BUFFER_TOO_LARGE => None,
+        Err(e) => return Err(format!("GetBuffer render: {e}")),
+      };
+      if let Some(data) = data {
         let dst = unsafe { std::slice::from_raw_parts_mut(data, free as usize * frame_bytes) };
         let from = (played * frame_bytes).min(source.len());
         let available = (source.len() - from).min(dst.len());

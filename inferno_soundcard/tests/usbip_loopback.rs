@@ -57,12 +57,15 @@ fn signal(ch: usize, p: u64) -> Sample {
   ((((p as u32).wrapping_mul(2654435761) >> 8) ^ (ch as u32 * 0x5a5a5a)) << 8) as Sample
 }
 
-/// Checks that each channel continues the signal sample by sample (silence allowed: not received, or late).
+/// Checks that each channel continues the signal sample by sample. Allowed: silence (not received, or
+/// late), and skipping ahead (after a stall, the transfers restart from the present: a dropout, as on real
+/// USB), but no older audio (e.g. a ring cycle ago).
 #[derive(Default)]
 struct Checker {
   next: [Option<u64>; CHANNELS],
   matched: usize,
   silent: usize,
+  skips: usize,
   mismatch: Option<String>,
 }
 
@@ -76,6 +79,10 @@ impl Checker {
           self.matched += 1;
         } else if s == 0 {
           self.silent += 1;
+        } else if let Some(later) = (p + 1..p + RATE as u64).find(|&q| signal(ch, q) == s) {
+          self.skips += 1;
+          self.next[ch] = Some(later + 1);
+          return;
         } else if self.mismatch.is_none() {
           self.mismatch = Some(format!("channel {ch} at {p}: got {s:#x}, expected {:#x}", signal(ch, p)));
         }
@@ -268,11 +275,15 @@ async fn plays_and_records_through_usbip() {
   let _ = std::fs::remove_dir_all(&state_home);
 
   let (played, captured) = (played.lock().unwrap(), captured.lock().unwrap());
-  println!("played: {} matched, {} silent; recorded: {} matched, {} silent", played.matched, played.silent, captured.matched, captured.silent);
+  println!(
+    "played: {} matched, {} silent, {} skips; recorded: {} matched, {} silent, {} skips",
+    played.matched, played.silent, played.skips, captured.matched, captured.silent, captured.skips
+  );
   assert_eq!(captured.mismatch, None, "recorded exactly what was transmitted, or silence");
   assert_eq!(played.mismatch, None, "transmitted exactly what was played, or silence");
   assert!(captured.matched >= CHANNELS * RATE as usize * 2, "two seconds recorded exactly");
   assert!(played.matched >= CHANNELS * RATE as usize * 2, "two seconds played exactly");
   // shared CI machines stall threads now and then: only that may make audio late (silence)
   assert!(played.silent <= played.matched / 10, "played audio mostly on time");
+  assert!(played.skips + captured.skips <= 10, "a few stalls at most");
 }
