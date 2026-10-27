@@ -9,7 +9,7 @@ edition = "2021"
 [dependencies]
 inferno_aoip = { path = "../inferno_aoip" }
 inferno_driver_core = { path = "../inferno_driver_core" }
-usbip-audio = { git = "https://github.com/stakach/usbip-audio", rev = "bcdb0dbfb504a020c37b70fb26ce34b0c3c4fe02" }
+usbip-audio = { git = "https://github.com/stakach/usbip-audio", rev = "bd68b8d738723d0e1d4eb719a9fac44699dd1eca" }
 env_logger = "0.11"
 log = "0.4.20"
 serde = { version = "1", features = ["derive"] }
