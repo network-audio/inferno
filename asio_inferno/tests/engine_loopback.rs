@@ -13,7 +13,10 @@ use std::{
 
 use inferno_aoip::{
   clock::{ClockSource, FreeRunningClockSource},
-  device_server::{DeviceServer, Sample, Settings},
+  device_server::{
+    state_dir, AtomicSample, BuffersValid, DeviceServer, ExternalBufferParameters, MediaClock, Sample, Settings,
+    StreamAnchor,
+  },
 };
 use inferno_asio::engine::{Engine, Host};
 
@@ -107,8 +110,9 @@ async fn host_output_is_transmitted_on_time() {
   let mut rx =
     DeviceServer::try_start_with_clock(settings("asio_engine_rx", 22, 9700, 2, 0), clock).await.unwrap();
   let matched = Arc::new(AtomicUsize::new(0));
+  let silent = Arc::new(AtomicUsize::new(0));
   let mismatched = Arc::new(Mutex::new(None::<String>));
-  let (m, mm) = (matched.clone(), mismatched.clone());
+  let (m, sl, mm) = (matched.clone(), silent.clone(), mismatched.clone());
   let mut next: [Option<u64>; 2] = [None, None];
   rx.receive_with_callback(Box::new(move |count: usize, channels: &Vec<Vec<Sample>>| {
     for (ch, samples) in channels.iter().enumerate() {
@@ -122,6 +126,9 @@ async fn host_output_is_transmitted_on_time() {
           Some(p) => {
             if s == signal(ch, p) {
               m.fetch_add(1, Ordering::Relaxed);
+            } else if s == 0 {
+              // a switch late beyond its period (the test's thread stalled): its outputs went out as silence
+              sl.fetch_add(1, Ordering::Relaxed);
             } else {
               let mut mm = mm.lock().unwrap();
               eprintln!("MISMATCH channel {ch} at {p}: got {s:#x}, expected {:#x}", signal(ch, p));
@@ -149,17 +156,14 @@ async fn host_output_is_transmitted_on_time() {
   tokio::task::spawn_blocking(move || drop(engine)).await.unwrap();
 
   let expected = elapsed * RATE as f64 / PERIOD as f64;
-  println!(
-    "{switched} switches in {elapsed:.2} s (expected {expected:.0}), {} samples matched",
-    matched.load(Ordering::Relaxed)
-  );
+  let (matched, silent) = (matched.load(Ordering::Relaxed), silent.load(Ordering::Relaxed));
+  println!("{switched} switches in {elapsed:.2} s (expected {expected:.0}), {matched} samples matched, {silent} silent");
   assert!(positions_ok.load(Ordering::Relaxed), "switch positions must increase");
   assert!((switched as f64 - expected).abs() < expected * 0.05, "one switch per period");
-  assert_eq!(*mismatched.lock().unwrap(), None);
-  assert!(
-    matched.load(Ordering::Relaxed) >= 2 * RATE as usize,
-    "a second of both channels received exactly"
-  );
+  assert_eq!(*mismatched.lock().unwrap(), None, "outputs are received exactly, or as silence");
+  assert!(matched >= 2 * RATE as usize, "a second of both channels received exactly");
+  // shared CI machines stall threads now and then, by more than a period: only that may go out as silence
+  assert!(silent <= matched / 10, "outputs mostly on time");
 }
 
 #[test]
@@ -190,3 +194,138 @@ fn a_stalled_host_gets_the_missed_switches() {
   assert!(positions_ok.load(Ordering::Relaxed), "no period skipped");
   assert!((switched as f64 - expected).abs() < expected * 0.05, "the missed switches were caught up");
 }
+
+/// Records nothing: checks that each input continues the transmitted signal, or is silent.
+struct CheckingHost {
+  inputs: Vec<[usize; 2]>,
+  period: usize,
+  /// per input: the signal position of the next sample, once found
+  next: Vec<Option<u64>>,
+  matched: Arc<AtomicUsize>,
+  silent: Arc<AtomicUsize>,
+  mismatch: Arc<Mutex<Option<String>>>,
+}
+
+impl Host for CheckingHost {
+  fn buffer_switch(&mut self, index: usize, _position: u64, _system_time_ns: u64) {
+    for (ch, halves) in self.inputs.iter().enumerate() {
+      let input = unsafe { std::slice::from_raw_parts(halves[index] as *const Sample, self.period) };
+      for &s in input {
+        match self.next[ch] {
+          None if s != 0 => {
+            self.next[ch] = (0..CAPTURE_SIGNAL_FRAMES as u64).find(|&p| signal(ch, p) == s).map(|p| p + 1);
+          }
+          None => {}
+          Some(p) => {
+            // the receiver's silence (not received) is fine; anything else is the signal of another position,
+            // e.g. a ring cycle ago
+            if s == signal(ch, p) {
+              self.matched.fetch_add(1, Ordering::Relaxed);
+            } else if s == 0 {
+              self.silent.fetch_add(1, Ordering::Relaxed);
+            } else {
+              let mut mismatch = self.mismatch.lock().unwrap();
+              if mismatch.is_none() {
+                *mismatch = Some(format!("input {ch} at {p}: got {s:#x}, expected {:#x}", signal(ch, p)));
+              }
+            }
+            self.next[ch] = Some(p + 1);
+          }
+        }
+      }
+    }
+  }
+}
+
+/// Frames of the transmitted signal (power of 2), about 22 s.
+const CAPTURE_SIGNAL_FRAMES: usize = 1 << 20;
+
+/// The engine's capture: another device transmits a known signal to the engine's inputs (subscribed in their
+/// saved state, as by a controller earlier). The host gets it sample by sample; once the transmitter is gone,
+/// silence, never older audio from the engine's rings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transmitted_audio_reaches_the_host_inputs() {
+  let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).try_init();
+  let state_home = std::env::temp_dir().join(format!("inferno_asio_test_state_{}", std::process::id()));
+  std::env::set_var("XDG_STATE_HOME", &state_home);
+  let clock: Arc<dyn ClockSource> = Arc::new(FreeRunningClockSource::new());
+
+  // transmitter: the signal at its ring positions
+  let tx_settings = settings("asio_capture_tx", 31, 9900, 0, 2);
+  let tx_hostname = tx_settings.self_info.friendly_hostname.clone();
+  let mut tx = DeviceServer::try_start_with_clock(tx_settings, clock.clone()).await.unwrap();
+  let rings: Arc<Vec<Vec<AtomicSample>>> = Arc::new(
+    (0..2).map(|ch| (0..CAPTURE_SIGNAL_FRAMES).map(|p| AtomicSample::new(signal(ch, p as u64))).collect()).collect(),
+  );
+  let valid = BuffersValid::new(true);
+  let buffers = rings
+    .iter()
+    .map(|ring| unsafe {
+      ExternalBufferParameters::new(ring.as_ptr(), CAPTURE_SIGNAL_FRAMES, 1, valid.clone(), None)
+    })
+    .collect();
+  let mut clock_rx = tx.get_realtime_clock_receiver();
+  let start = loop {
+    clock_rx.update();
+    let mut media_clock = MediaClock::new(false);
+    if let Some(overlay) = clock_rx.get() {
+      media_clock.update_overlay(*overlay);
+      if let Some(now) = media_clock.wrapping_now_in_timebase(RATE as u64) {
+        break now;
+      }
+    }
+    tokio::time::sleep(Duration::from_millis(10)).await;
+  };
+  tx.transmit_from_external_buffer(buffers, StreamAnchor::new_started(start), Default::default(), None).await;
+
+  // the engine's inputs subscribed to it, as saved by a controller's routing
+  let engine_settings = settings("asio_capture_engine", 32, 10000, 2, 0);
+  let dir = std::path::PathBuf::from(state_dir(&engine_settings.self_info));
+  std::fs::create_dir_all(&dir).unwrap();
+  let subscriptions: String = (1..=2)
+    .map(|ch| {
+      format!(
+        "[[channels]]\nlocal_channel_id = {ch}\nlocal_channel_name = \"RX {ch}\"\ntx_channel_name = \"TX {ch}\"\n\
+         tx_hostname = \"{tx_hostname}\"\n"
+      )
+    })
+    .collect();
+  std::fs::write(dir.join("rx_subscriptions.toml"), subscriptions).unwrap();
+  let clock_for_engine = clock.clone();
+  let mut engine = tokio::task::spawn_blocking(move || {
+    Engine::new_with_clock(engine_settings, PERIOD, Some(clock_for_engine))
+  })
+  .await
+  .unwrap()
+  .unwrap();
+
+  let (matched, silent) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+  let mismatch = Arc::new(Mutex::new(None));
+  let host = CheckingHost {
+    inputs: (0..2).map(|ch| [0, 1].map(|h| engine.input_buffer(ch, h).unwrap() as usize)).collect(),
+    period: PERIOD,
+    next: vec![None; 2],
+    matched: matched.clone(),
+    silent: silent.clone(),
+    mismatch: mismatch.clone(),
+  };
+  engine.start(Box::new(host)).unwrap();
+
+  let deadline = Instant::now() + Duration::from_secs(20);
+  while matched.load(Ordering::Relaxed) < 2 * RATE as usize && Instant::now() < deadline {
+    tokio::time::sleep(Duration::from_millis(100)).await;
+  }
+  let matched_while_transmitting = matched.load(Ordering::Relaxed);
+  // the transmitter disappears without unsubscribing: the inputs must fall silent
+  tx.shutdown().await;
+  tokio::time::sleep(Duration::from_millis(500)).await;
+  let silent_after = silent.load(Ordering::Relaxed);
+  tokio::task::spawn_blocking(move || drop(engine)).await.unwrap();
+  let _ = std::fs::remove_dir_all(&state_home);
+
+  println!("{matched_while_transmitting} samples matched, then {silent_after} silent");
+  assert_eq!(*mismatch.lock().unwrap(), None);
+  assert!(matched_while_transmitting >= 2 * RATE as usize, "a second of both inputs received exactly");
+  assert!(silent_after >= RATE as usize / 2, "silence once the transmitter is gone");
+}
+

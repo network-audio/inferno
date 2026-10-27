@@ -4,6 +4,7 @@ on:
   push:
     branches: [dev]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -37,4 +38,4 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build -p inferno_aoip -p inferno_driver_core -p inferno2pipe -p pipe2inferno -p asio_inferno --all-targets --examples
-      - run: cargo test -p inferno_aoip -p inferno_driver_core -p asio_inferno -- --test-threads=1
+      - run: cargo test --no-fail-fast -p inferno_aoip -p inferno_driver_core -p asio_inferno -- --test-threads=1

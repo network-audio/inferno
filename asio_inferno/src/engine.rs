@@ -23,7 +23,9 @@ use std::{
 
 use inferno_aoip::{
   clock::ClockSource,
-  device_server::{AtomicSample, Clock, ExternalBufferParameters, MediaClock, Sample, Settings},
+  device_server::{
+    AtomicSample, Clock, ExternalBufferParameters, MediaClock, PositionReportDestination, Sample, Settings,
+  },
 };
 use inferno_driver_core::{BuffersSignature, DeviceError, Direction, Stream, StreamOptions};
 use log::{error, info, warn};
@@ -84,6 +86,8 @@ pub struct Engine {
   capture: Option<Stream>,
   playback: Option<Stream>,
   capture_rings: Rings,
+  /// per capture ring: up to where (position since the start) the receiver has made it readable
+  capture_readable: Arc<Vec<AtomicUsize>>,
   playback_rings: Rings,
   /// frames since the start written to the playback rings
   playback_written: Arc<AtomicUsize>,
@@ -145,6 +149,7 @@ impl Engine {
       capture: None,
       playback: None,
       capture_rings: rings(rx, frames),
+      capture_readable: Arc::new((0..rx).map(|_| AtomicUsize::new(0)).collect()),
       playback_rings: rings(tx, frames),
       playback_written: Arc::new(AtomicUsize::new(0)),
       inputs: HostBuffers::new(rx, period),
@@ -158,8 +163,15 @@ impl Engine {
       let channels = engine
         .capture_rings
         .iter()
-        .map(|ring| unsafe {
-          ExternalBufferParameters::new(ring.as_ptr(), frames, 1, stream.buffers_valid(), None)
+        .enumerate()
+        .map(|(ch, ring)| unsafe {
+          ExternalBufferParameters::new(
+            ring.as_ptr(),
+            frames,
+            1,
+            stream.buffers_valid(),
+            Some(PositionReportDestination::new(engine.capture_readable.clone(), ch)),
+          )
         })
         .collect();
       stream.prepare(signature(&engine.capture_rings, period), channels, options())?;
@@ -222,6 +234,14 @@ impl Engine {
       first.media_now(rate).ok_or(DeviceError::NoClock(clock_source.diagnose_missing()))?;
     // the host's outputs of the first switch are due 2 periods later: silence until then
     self.playback_written.store(0, Ordering::Release);
+    // The paused receiver doesn't touch the capture rings: clear what a previous run left. Re-anchoring, it
+    // closes them from the time it notices the start, positions before that would be read as they are.
+    for ring in self.capture_rings.iter() {
+      ring.iter().for_each(|s| s.store(0, Ordering::Relaxed));
+    }
+    for readable in self.capture_readable.iter() {
+      readable.store(0, Ordering::Release);
+    }
     for stream in self.streams() {
       stream.start_at(start_time);
     }
@@ -233,6 +253,7 @@ impl Engine {
       start_time,
       clock_source,
       capture_rings: self.capture_rings.clone(),
+      capture_readable: self.capture_readable.clone(),
       playback_rings: self.playback_rings.clone(),
       playback_written: self.playback_written.clone(),
       inputs: self.inputs.clone(),
@@ -290,6 +311,7 @@ struct Worker {
   start_time: Clock,
   clock_source: Arc<dyn ClockSource>,
   capture_rings: Rings,
+  capture_readable: Arc<Vec<AtomicUsize>>,
   playback_rings: Rings,
   playback_written: Arc<AtomicUsize>,
   inputs: Arc<HostBuffers>,
@@ -309,6 +331,8 @@ impl Worker {
     let mut k: usize = 0;
     let mut late_switches = 0u64;
     let mut lost_outputs = 0u64;
+    let mut unreadable_inputs = 0u64;
+    let mut receiving = vec![false; self.capture_rings.len()];
     while !self.stop.load(Ordering::Acquire) {
       // borrowing takes the channel's lock: only when there's a new overlay (checking is lock-free)
       if clock_rx.has_changed().unwrap_or(false) || !clock.is_ready() {
@@ -345,12 +369,24 @@ impl Worker {
         }
       }
       let half = k % 2;
-      let mask_c = self.capture_rings.first().map(|r| r.len() - 1).unwrap_or(0);
       for (ch, ring) in self.capture_rings.iter().enumerate() {
         let dst = unsafe { std::slice::from_raw_parts_mut(self.inputs.ptr(ch, half, n), n) };
-        for (i, d) in dst.iter_mut().enumerate() {
-          *d = ring[(k * n + i) & mask_c].load(Ordering::Relaxed);
+        let readable = self.capture_readable[ch].load(Ordering::Acquire);
+        let silenced = copy_captured(ring, readable, k * n, dst);
+        // a channel receiving until now, not received (nor closed with silence) in time: rather than the
+        // ring's audio from a cycle ago, the host gets silence
+        if silenced > 0 && receiving[ch] {
+          unreadable_inputs += 1;
+          if unreadable_inputs.is_power_of_two() {
+            warn!(
+              "input {} not received in time ({silenced} frames at {}), silence instead ({unreadable_inputs} \
+               times so far)",
+              ch + 1,
+              k * n + n - silenced
+            );
+          }
         }
+        receiving[ch] = silenced < n;
       }
       self.position.samples.store((k * n) as u64, Ordering::Release);
       let system_time = system_time_ns();
@@ -381,6 +417,22 @@ impl Worker {
       k += 1;
     }
   }
+}
+
+/// Copies `dst.len()` frames from position `start` (since the stream's start) of `ring` (power of 2 long), as
+/// far as the receiver has made them readable: up to `readable`, its position. What's beyond hasn't been
+/// received this ring cycle, it's the audio of a cycle ago: silence instead. A `readable` that isn't within a
+/// ring of `start` (from before a restart, or the positions were overwritten) makes it all silence.
+/// Returns the frames of silence (at the end of `dst`).
+fn copy_captured(ring: &[AtomicSample], readable: usize, start: usize, dst: &mut [Sample]) -> usize {
+  let ahead = readable.wrapping_sub(start) as isize;
+  let valid = if ahead <= 0 || ahead as usize > ring.len() { 0 } else { (ahead as usize).min(dst.len()) };
+  let mask = ring.len() - 1;
+  for (i, d) in dst[..valid].iter_mut().enumerate() {
+    *d = ring[(start + i) & mask].load(Ordering::Relaxed);
+  }
+  dst[valid..].fill(0);
+  dst.len() - valid
 }
 
 /// Precise sleeping and real-time priority for the switch thread.
@@ -490,4 +542,40 @@ pub fn report(last_error: &Mutex<String>, message: impl Into<String>) {
   let message = message.into();
   error!("{message}");
   *last_error.lock().unwrap() = message;
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn ring(frames: usize) -> Vec<AtomicSample> {
+    (0..frames).map(|i| AtomicSample::new(i as Sample + 1)).collect()
+  }
+
+  #[test]
+  fn captured_frames_up_to_the_readable_position() {
+    let ring = ring(16);
+    let mut dst = [-1; 4];
+    // all readable, wrapping around the ring
+    assert_eq!(copy_captured(&ring, 40, 30, &mut dst), 0);
+    assert_eq!(dst, [15, 16, 1, 2]);
+    // the receiver got only to 34 (e.g. the stream stopped): the rest is a ring cycle old, silence instead
+    assert_eq!(copy_captured(&ring, 34, 32, &mut dst), 2);
+    assert_eq!(dst, [1, 2, 0, 0]);
+    assert_eq!(copy_captured(&ring, 32, 32, &mut dst), 4);
+    assert_eq!(dst, [0; 4]);
+  }
+
+  #[test]
+  fn captured_positions_of_another_run_are_silence() {
+    let ring = ring(16);
+    let mut dst = [-1; 4];
+    // readable position from before a restart (far ahead), or behind the start
+    assert_eq!(copy_captured(&ring, 5000, 0, &mut dst), 4);
+    assert_eq!(dst, [0; 4]);
+    assert_eq!(copy_captured(&ring, 0, 8, &mut dst), 4);
+    // a ring ahead: still this cycle; more: overwritten
+    assert_eq!(copy_captured(&ring, 16, 0, &mut dst), 0);
+    assert_eq!(copy_captured(&ring, 17, 0, &mut dst), 4);
+  }
 }
