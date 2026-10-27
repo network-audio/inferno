@@ -17,8 +17,8 @@ use std::{
 use inferno_aoip::{
   clock::{ClockSource, FreeRunningClockSource},
   device_server::{
-    state_dir, AtomicSample, BuffersValid, DeviceServer, ExternalBufferParameters, MediaClock, Sample, Settings,
-    StreamAnchor,
+    state_dir, AtomicSample, BuffersValid, DeviceServer, ExternalBufferParameters, MediaClock, Sample,
+    Settings, StreamAnchor,
   },
 };
 use inferno_soundcard::{
@@ -52,9 +52,11 @@ fn settings(name: &str, process_id: u16, port: u16, rx: usize, tx: usize) -> Set
   Settings::try_new(name, name, Some(Ipv4Addr::LOCALHOST), &config).unwrap()
 }
 
-/// The sample of channel `ch` at position `p`: 24-bit, unique over a long stretch.
+/// The sample of channel `ch` at position `p`: 24-bit, unique within `SIGNAL_FRAMES` (the transmitter's ring,
+/// which it repeats).
 fn signal(ch: usize, p: u64) -> Sample {
-  ((((p as u32).wrapping_mul(2654435761) >> 8) ^ (ch as u32 * 0x5a5a5a)) << 8) as Sample
+  let p = p as u32 & (SIGNAL_FRAMES as u32 - 1);
+  (((p.wrapping_mul(2654435761) >> 8) ^ (ch as u32 * 0x5a5a5a)) << 8) as Sample
 }
 
 /// Checks that each channel continues the signal sample by sample. Allowed: silence (not received, or
@@ -72,7 +74,9 @@ struct Checker {
 impl Checker {
   fn check(&mut self, ch: usize, s: Sample) {
     match self.next[ch] {
-      None if s != 0 => self.next[ch] = (0..SIGNAL_FRAMES as u64).find(|&p| signal(ch, p) == s).map(|p| p + 1),
+      None if s != 0 => {
+        self.next[ch] = (0..SIGNAL_FRAMES as u64).find(|&p| signal(ch, p) == s).map(|p| p + 1)
+      }
       None => {}
       Some(p) => {
         if s == signal(ch, p) {
@@ -173,7 +177,8 @@ fn windows_client(port: u16, stop: Arc<AtomicBool>, captured: Arc<Mutex<Checker>
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn plays_and_records_through_usbip() {
   let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).try_init();
-  let state_home = std::env::temp_dir().join(format!("inferno_soundcard_test_state_{}", std::process::id()));
+  let state_home =
+    std::env::temp_dir().join(format!("inferno_soundcard_test_state_{}", std::process::id()));
   std::env::set_var("XDG_STATE_HOME", &state_home);
   let clock: Arc<dyn ClockSource> = Arc::new(FreeRunningClockSource::new());
 
@@ -182,12 +187,16 @@ async fn plays_and_records_through_usbip() {
   let tx_hostname = tx_settings.self_info.friendly_hostname.clone();
   let mut tx = DeviceServer::try_start_with_clock(tx_settings, clock.clone()).await.unwrap();
   let rings: Arc<Vec<Vec<AtomicSample>>> = Arc::new(
-    (0..CHANNELS).map(|ch| (0..SIGNAL_FRAMES).map(|p| AtomicSample::new(signal(ch, p as u64))).collect()).collect(),
+    (0..CHANNELS)
+      .map(|ch| (0..SIGNAL_FRAMES).map(|p| AtomicSample::new(signal(ch, p as u64))).collect())
+      .collect(),
   );
   let valid = BuffersValid::new(true);
   let buffers = rings
     .iter()
-    .map(|ring| unsafe { ExternalBufferParameters::new(ring.as_ptr(), SIGNAL_FRAMES, 1, valid.clone(), None) })
+    .map(|ring| unsafe {
+      ExternalBufferParameters::new(ring.as_ptr(), SIGNAL_FRAMES, 1, valid.clone(), None)
+    })
     .collect();
   let mut clock_rx = tx.get_realtime_clock_receiver();
   let start = loop {
@@ -201,7 +210,8 @@ async fn plays_and_records_through_usbip() {
     }
     tokio::time::sleep(Duration::from_millis(10)).await;
   };
-  tx.transmit_from_external_buffer(buffers, StreamAnchor::new_started(start), Default::default(), None).await;
+  tx.transmit_from_external_buffer(buffers, StreamAnchor::new_started(start), Default::default(), None)
+    .await;
 
   // the card's recording channels subscribed to it, as saved by a controller's routing
   let card_settings = settings("soundcard_test_card", 42, 10200, CHANNELS, CHANNELS);
@@ -211,8 +221,8 @@ async fn plays_and_records_through_usbip() {
   let subscriptions: String = (1..=CHANNELS)
     .map(|ch| {
       format!(
-        "[[channels]]\nlocal_channel_id = {ch}\nlocal_channel_name = \"RX {ch}\"\ntx_channel_name = \"TX {ch}\"\n\
-         tx_hostname = \"{tx_hostname}\"\n"
+        "[[channels]]\nlocal_channel_id = {ch}\nlocal_channel_name = \"RX {ch}\"\ntx_channel_name = \
+         \"TX {ch}\"\ntx_hostname = \"{tx_hostname}\"\n"
       )
     })
     .collect();
@@ -225,14 +235,18 @@ async fn plays_and_records_through_usbip() {
     let server = Server::start(0, card_clock).unwrap();
     let card = CardConfig { name: "Test card".into(), playback_channels: 2, capture_channels: 2 };
     let streams = engine.card_streams().pop().unwrap();
-    server.add("1-1", Arc::new(Uac2Device::new(card_uac2_config(&card, 0, "test", RATE), streams).unwrap()));
+    server
+      .add("1-1", Arc::new(Uac2Device::new(card_uac2_config(&card, 0, "test", RATE), streams).unwrap()));
     (engine, server)
   })
   .await
   .unwrap();
 
   // receiver of the card's playback
-  let mut rx = DeviceServer::try_start_with_clock(settings("soundcard_test_rx", 43, 10300, CHANNELS, 0), clock).await.unwrap();
+  let mut rx =
+    DeviceServer::try_start_with_clock(settings("soundcard_test_rx", 43, 10300, CHANNELS, 0), clock)
+      .await
+      .unwrap();
   let played = Arc::new(Mutex::new(Checker::default()));
   let checker = played.clone();
   rx.receive_with_callback(Box::new(move |count: usize, channels: &Vec<Vec<Sample>>| {

@@ -69,7 +69,8 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Request> {
       return Err(std::io::ErrorKind::InvalidData.into());
     }
   }
-  let length: usize = headers.iter().find(|(n, _)| n == "content-length").and_then(|(_, v)| v.parse().ok()).unwrap_or(0);
+  let length: usize =
+    headers.iter().find(|(n, _)| n == "content-length").and_then(|(_, v)| v.parse().ok()).unwrap_or(0);
   if length > MAX_BODY {
     return Err(std::io::ErrorKind::InvalidData.into());
   }
@@ -79,13 +80,20 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Request> {
 }
 
 /// Handles a request; `port` is the page's, `commands` applies a new configuration.
-pub fn handle(request: &Request, port: u16, status: &SharedStatus, commands: &mpsc::Sender<Command>) -> Response {
+pub fn handle(
+  request: &Request,
+  port: u16,
+  status: &SharedStatus,
+  commands: &mpsc::Sender<Command>,
+) -> Response {
   let host_ok = matches!(request.header("host"), Some(host) if host == format!("127.0.0.1:{port}") || host == format!("localhost:{port}"));
   if !host_ok {
     return error(421, "unexpected Host");
   }
   match (request.method.as_str(), request.path.as_str()) {
-    ("GET", "/") => Response { status: 200, content_type: "text/html; charset=utf-8", body: PAGE.as_bytes().to_vec() },
+    ("GET", "/") => {
+      Response { status: 200, content_type: "text/html; charset=utf-8", body: PAGE.as_bytes().to_vec() }
+    }
     ("GET", "/api/status") => json(200, &*status.lock().unwrap()),
     ("GET", "/api/config") => match Config::load() {
       Ok(config) => json(200, config),
@@ -125,8 +133,8 @@ fn respond(stream: &mut TcpStream, response: Response) -> std::io::Result<()> {
   };
   write!(
     stream,
-    "HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\
-     X-Frame-Options: DENY\r\nConnection: close\r\n\r\n",
+    "HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: \
+     no-store\r\nX-Frame-Options: DENY\r\nConnection: close\r\n\r\n",
     response.status,
     response.content_type,
     response.body.len()
@@ -156,9 +164,10 @@ pub fn bind(port: u16) -> std::io::Result<TcpListener> {
 
 #[cfg(test)]
 mod tests {
+  use std::sync::{Arc, Mutex};
+
   use super::*;
   use crate::app::Status;
-  use std::sync::{Arc, Mutex};
 
   fn request(method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> Request {
     Request {
@@ -175,7 +184,12 @@ mod tests {
     let (commands, _rx) = mpsc::channel();
     let ok = handle(&request("GET", "/", &[("host", "127.0.0.1:47800")], ""), 47800, &status, &commands);
     assert_eq!(ok.status, 200);
-    let rebound = handle(&request("GET", "/api/status", &[("host", "evil.example:47800")], ""), 47800, &status, &commands);
+    let rebound = handle(
+      &request("GET", "/api/status", &[("host", "evil.example:47800")], ""),
+      47800,
+      &status,
+      &commands,
+    );
     assert_eq!(rebound.status, 421);
   }
 

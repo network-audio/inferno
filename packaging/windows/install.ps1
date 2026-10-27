@@ -4,6 +4,9 @@ param([ValidateSet('Install', 'Uninstall')][string]$Action)
 # Win AirPlay: it stays installed on uninstall) and starts the sound card service at sign-in.
 
 $ErrorActionPreference = 'Stop'
+# Started from PowerShell 7 (e.g. a silent install from a script), Windows PowerShell inherits a module path
+# leading to PowerShell 7's modules, which it can't load: use its own
+$env:PSModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
 Start-Transcript -Path (Join-Path $env:TEMP 'inferno-soundcard-setup.log') -Force | Out-Null
 $taskName = 'Inferno Sound Cards'
 $folder = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -32,7 +35,13 @@ if (-not $usbip) {
         'x64' { '38cad6d4432b52d5bb9409d9ad03b72fdffc4ada4cd3a48fbeca1a2752a8518a' }
         'arm64' { 'cab7ff97f79275eeb5c5b8bb2eb3111ff6b6c4eead07d9bec9be5bd1e3a35800' }
     }
-    $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $upstream).Hash.ToLowerInvariant()
+    # .NET rather than Get-FileHash: started from PowerShell 7, Windows PowerShell may not load its modules
+    $stream = [System.IO.File]::OpenRead($upstream)
+    try {
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        try { $actual = ([System.BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '').ToLowerInvariant() }
+        finally { $sha256.Dispose() }
+    } finally { $stream.Dispose() }
     if ($actual -ne $expected) { throw 'The bundled USBip installer checksum does not match.' }
     $programFiles64 = if ($env:ProgramW6432) { $env:ProgramW6432 } else { ${env:ProgramFiles} }
     $installDir = Join-Path $programFiles64 'USBip'

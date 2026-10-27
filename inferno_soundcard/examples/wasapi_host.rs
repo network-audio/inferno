@@ -34,8 +34,8 @@ mod host {
       Media::Audio::{
         eCapture, eRender, EDataFlow, IAudioCaptureClient, IAudioClient, IAudioRenderClient, IMMDevice,
         IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_E_BUFFER_TOO_LARGE,
-        AUDCLNT_SHAREMODE_EXCLUSIVE,
-        DEVICE_STATE_ACTIVE, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0,
+        AUDCLNT_SHAREMODE_EXCLUSIVE, DEVICE_STATE_ACTIVE, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
+        WAVEFORMATEXTENSIBLE_0,
       },
       System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ},
     },
@@ -54,12 +54,15 @@ mod host {
 
   fn endpoint(flow: EDataFlow, name: &str) -> Result<Option<IMMDevice>, String> {
     let enumerator: IMMDeviceEnumerator =
-      unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.map_err(at("MMDeviceEnumerator"))?;
-    let collection = unsafe { enumerator.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE) }.map_err(at("EnumAudioEndpoints"))?;
+      unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
+        .map_err(at("MMDeviceEnumerator"))?;
+    let collection = unsafe { enumerator.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE) }
+      .map_err(at("EnumAudioEndpoints"))?;
     for index in 0..unsafe { collection.GetCount() }.map_err(at("GetCount"))? {
       let device = unsafe { collection.Item(index) }.map_err(at("Item"))?;
       let store = unsafe { device.OpenPropertyStore(STGM_READ) }.map_err(at("OpenPropertyStore"))?;
-      let friendly = unsafe { store.GetValue(&PKEY_Device_FriendlyName) }.map_err(at("GetValue"))?.to_string();
+      let friendly =
+        unsafe { store.GetValue(&PKEY_Device_FriendlyName) }.map_err(at("GetValue"))?.to_string();
       if friendly == name {
         return Ok(Some(device));
       }
@@ -94,9 +97,12 @@ mod host {
   pub fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let card = arg(&args, "--card").ok_or("--card")?;
-    let channels: u16 = arg(&args, "--channels").unwrap_or("2".into()).parse().map_err(|_| "--channels")?;
-    let source = std::fs::read(arg(&args, "--play").ok_or("--play")?).map_err(|e| format!("--play: {e}"))?;
-    let mut recording = std::fs::File::create(arg(&args, "--record").ok_or("--record")?).map_err(|e| format!("--record: {e}"))?;
+    let channels: u16 =
+      arg(&args, "--channels").unwrap_or("2".into()).parse().map_err(|_| "--channels")?;
+    let source =
+      std::fs::read(arg(&args, "--play").ok_or("--play")?).map_err(|e| format!("--play: {e}"))?;
+    let mut recording = std::fs::File::create(arg(&args, "--record").ok_or("--record")?)
+      .map_err(|e| format!("--record: {e}"))?;
     let seconds: u64 = arg(&args, "--seconds").unwrap_or("60".into()).parse().map_err(|_| "--seconds")?;
     let until_file = arg(&args, "--until-file").map(PathBuf::from);
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok().map_err(at("CoInitializeEx"))?;
@@ -115,8 +121,10 @@ mod host {
     println!("found {speakers} and {microphone} after {:.1} s", waiting.elapsed().as_secs_f64());
     let render = open(&render_device, channels)?;
     let capture = open(&capture_device, channels)?;
-    let render_client: IAudioRenderClient = unsafe { render.GetService() }.map_err(at("GetService render"))?;
-    let capture_client: IAudioCaptureClient = unsafe { capture.GetService() }.map_err(at("GetService capture"))?;
+    let render_client: IAudioRenderClient =
+      unsafe { render.GetService() }.map_err(at("GetService render"))?;
+    let capture_client: IAudioCaptureClient =
+      unsafe { capture.GetService() }.map_err(at("GetService capture"))?;
     let buffer = unsafe { render.GetBufferSize() }.map_err(at("GetBufferSize"))?;
     let mut period = 0i64;
     unsafe { render.GetDevicePeriod(Some(&mut period), None) }.map_err(at("GetDevicePeriod"))?;
@@ -127,8 +135,11 @@ mod host {
 
     let started = Instant::now();
     let (mut played, mut recorded) = (0usize, 0usize);
-    while started.elapsed() < Duration::from_secs(seconds) && !until_file.as_ref().is_some_and(|f| f.exists()) {
-      let free = (buffer - unsafe { render.GetCurrentPadding() }.map_err(at("GetCurrentPadding"))?).min(period_frames);
+    while started.elapsed() < Duration::from_secs(seconds)
+      && !until_file.as_ref().is_some_and(|f| f.exists())
+    {
+      let free = (buffer - unsafe { render.GetCurrentPadding() }.map_err(at("GetCurrentPadding"))?)
+        .min(period_frames);
       // in exclusive mode the space can still be short of the padding's: try again later
       let data = match unsafe { render_client.GetBuffer(free) } {
         _ if free == 0 => None,
@@ -148,7 +159,8 @@ mod host {
       loop {
         let mut data = std::ptr::null_mut();
         let (mut frames, mut flags) = (0u32, 0u32);
-        unsafe { capture_client.GetBuffer(&mut data, &mut frames, &mut flags, None, None) }.map_err(at("GetBuffer capture"))?;
+        unsafe { capture_client.GetBuffer(&mut data, &mut frames, &mut flags, None, None) }
+          .map_err(at("GetBuffer capture"))?;
         if frames == 0 {
           break;
         }
@@ -156,7 +168,9 @@ mod host {
         if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
           recording.write_all(&vec![0; bytes]).map_err(|e| e.to_string())?;
         } else {
-          recording.write_all(unsafe { std::slice::from_raw_parts(data, bytes) }).map_err(|e| e.to_string())?;
+          recording
+            .write_all(unsafe { std::slice::from_raw_parts(data, bytes) })
+            .map_err(|e| e.to_string())?;
         }
         unsafe { capture_client.ReleaseBuffer(frames) }.map_err(at("ReleaseBuffer capture"))?;
         recorded += frames as usize;

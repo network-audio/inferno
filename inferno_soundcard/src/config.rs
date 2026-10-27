@@ -47,7 +47,12 @@ impl Default for CardConfig {
 
 impl Default for Config {
   fn default() -> Self {
-    Self { name: None, settings: BTreeMap::new(), cards: vec![CardConfig::default()], ui_port: DEFAULT_UI_PORT }
+    Self {
+      name: None,
+      settings: BTreeMap::new(),
+      cards: vec![CardConfig::default()],
+      ui_port: DEFAULT_UI_PORT,
+    }
   }
 }
 
@@ -103,7 +108,10 @@ impl Config {
     self
       .cards
       .iter()
-      .map(|c| CardChannels { playback: c.playback_channels as usize, capture: c.capture_channels as usize })
+      .map(|c| CardChannels {
+        playback: c.playback_channels as usize,
+        capture: c.capture_channels as usize,
+      })
       .collect()
   }
 
@@ -137,7 +145,12 @@ pub const PRODUCT_ID: u16 = 0x0001;
 
 /// The USB audio device of card `index` of the device `device_id` (which keeps Windows' settings of the card
 /// apart from other devices' cards).
-pub fn card_uac2_config(card: &CardConfig, index: usize, device_id: &str, sample_rate: u32) -> Uac2Config {
+pub fn card_uac2_config(
+  card: &CardConfig,
+  index: usize,
+  device_id: &str,
+  sample_rate: u32,
+) -> Uac2Config {
   Uac2Config {
     vendor_id: VENDOR_ID,
     product_id: PRODUCT_ID,
@@ -166,7 +179,8 @@ mod tests {
 
   #[test]
   fn reads_partial_json() {
-    let config: Config = serde_json::from_str(r#"{"cards": [{"name": "Stage", "capture_channels": 16}]}"#).unwrap();
+    let config: Config =
+      serde_json::from_str(r#"{"cards": [{"name": "Stage", "capture_channels": 16}]}"#).unwrap();
     assert_eq!(config.cards[0].playback_channels, 2);
     assert_eq!(config.cards[0].capture_channels, 16);
     assert_eq!(config.ui_port, DEFAULT_UI_PORT);
@@ -175,7 +189,11 @@ mod tests {
 
   #[test]
   fn invalid_configurations() {
-    let card = |name: &str, playback, capture| CardConfig { name: name.into(), playback_channels: playback, capture_channels: capture };
+    let card = |name: &str, playback, capture| CardConfig {
+      name: name.into(),
+      playback_channels: playback,
+      capture_channels: capture,
+    };
     let with = |cards| Config { cards, ..Config::default() };
     assert!(with(vec![]).validate().is_err());
     assert!(with(vec![card(" ", 2, 2)]).validate().is_err());
@@ -183,9 +201,11 @@ mod tests {
     assert!(with(vec![card("A", 0, 0)]).validate().is_err(), "no channels");
     assert!(with(vec![card("A", 200, 0)]).validate().is_err());
     assert!(with(vec![card("A", 64, 0), card("B", 0, 8)]).validate().is_ok());
-    let bad_setting = Config { settings: [("SAMPLE_RATE".into(), "44100".into())].into(), ..Config::default() };
+    let bad_setting =
+      Config { settings: [("SAMPLE_RATE".into(), "44100".into())].into(), ..Config::default() };
     assert!(bad_setting.validate().is_err(), "USB audio 2.0 needs a multiple of 8 kHz");
-    let unknown = Config { settings: [("BIND_IPP".into(), "1.2.3.4".into())].into(), ..Config::default() };
+    let unknown =
+      Config { settings: [("BIND_IPP".into(), "1.2.3.4".into())].into(), ..Config::default() };
     assert!(unknown.validate().unwrap_err().contains("BIND_IPP"));
   }
 }

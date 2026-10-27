@@ -19,7 +19,10 @@ fn main() {
   let (commands, receiver) = mpsc::channel();
   let supervisor = {
     let status = status.clone();
-    std::thread::Builder::new().name("supervisor".into()).spawn(move || app::supervise(status, receiver)).unwrap()
+    std::thread::Builder::new()
+      .name("supervisor".into())
+      .spawn(move || app::supervise(status, receiver))
+      .unwrap()
   };
 
   let port = Config::load().map(|c| c.ui_port).unwrap_or(DEFAULT_UI_PORT);

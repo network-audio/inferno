@@ -6,12 +6,16 @@ use windows_sys::Win32::{
   Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
   System::LibraryLoader::GetModuleHandleW,
   UI::{
-    Shell::{ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW},
+    Shell::{
+      ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+      NOTIFYICONDATAW,
+    },
     WindowsAndMessaging::{
-      AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW, GetCursorPos,
-      GetMessageW, LoadIconW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
-      TrackPopupMenu, TranslateMessage, HWND_MESSAGE, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG,
-      SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
+      AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
+      GetCursorPos, GetMessageW, LoadIconW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
+      SetForegroundWindow, TrackPopupMenu, TranslateMessage, HWND_MESSAGE, IDI_APPLICATION, MF_SEPARATOR,
+      MF_STRING, MSG, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU,
+      WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
     },
   },
 };
@@ -31,7 +35,14 @@ fn open_settings() {
   if let Some(url) = URL.get() {
     let open = wide("open");
     unsafe {
-      ShellExecuteW(std::ptr::null_mut(), open.as_ptr(), url.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL)
+      ShellExecuteW(
+        std::ptr::null_mut(),
+        open.as_ptr(),
+        url.as_ptr(),
+        std::ptr::null(),
+        std::ptr::null(),
+        SW_SHOWNORMAL,
+      )
     };
   }
 }
@@ -66,7 +77,8 @@ fn show_menu(hwnd: HWND) {
     GetCursorPos(&mut point);
     // the menu closes when clicking elsewhere only if the window is in the foreground
     SetForegroundWindow(hwnd);
-    let chosen = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, hwnd, std::ptr::null());
+    let chosen =
+      TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, hwnd, std::ptr::null());
     DestroyMenu(menu);
     match chosen as usize {
       MENU_SETTINGS => open_settings(),
@@ -76,7 +88,12 @@ fn show_menu(hwnd: HWND) {
   }
 }
 
-unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn window_proc(
+  hwnd: HWND,
+  message: u32,
+  wparam: WPARAM,
+  lparam: LPARAM,
+) -> LRESULT {
   if message == WM_TRAY {
     match lparam as u32 {
       WM_LBUTTONUP => open_settings(),

@@ -80,7 +80,11 @@ fn set_state(status: &SharedStatus, state: impl Into<String>) {
 }
 
 /// Starts the cards of `config`. Waits for the clock, unless a command arrives first (returned as the error).
-fn start(config: &Config, status: &SharedStatus, commands: &mpsc::Receiver<Command>) -> Result<Running, Option<Command>> {
+fn start(
+  config: &Config,
+  status: &SharedStatus,
+  commands: &mpsc::Receiver<Command>,
+) -> Result<Running, Option<Command>> {
   let fail = |e: String| {
     error!("{e}");
     set_state(status, e);
@@ -89,9 +93,11 @@ fn start(config: &Config, status: &SharedStatus, commands: &mpsc::Receiver<Comma
   config.validate().map_err(fail)?;
   let settings = config.device_settings().map_err(fail)?;
   let device_name = settings.self_info.friendly_hostname.clone();
-  let device_id: String = settings.self_info.factory_device_id.iter().map(|b| format!("{b:02x}")).collect();
+  let device_id: String =
+    settings.self_info.factory_device_id.iter().map(|b| format!("{b:02x}")).collect();
   let sample_rate = settings.self_info.sample_rate;
-  let mut engine = Engine::new(settings, &config.card_channels(), None).map_err(|e| fail(e.to_string()))?;
+  let mut engine =
+    Engine::new(settings, &config.card_channels(), None).map_err(|e| fail(e.to_string()))?;
 
   set_state(status, "waiting for the clock");
   let waiting = Instant::now();

@@ -24,16 +24,17 @@ use std::{
 use inferno_aoip::{
   clock::ClockSource,
   device_server::{
-    AtomicSample, Clock, ExternalBufferParameters, MediaClock, PositionReportDestination, Sample, Settings,
+    AtomicSample, Clock, ExternalBufferParameters, MediaClock, PositionReportDestination, Sample,
+    Settings,
   },
 };
 use inferno_driver_core::{BuffersSignature, DeviceError, Direction, Stream, StreamOptions};
 use log::{info, warn};
 use usbip_audio::uac2::Uac2Streams;
 
-/// How much later than its frames playback audio is transmitted: margin for the transfer that's being
-/// completed when Windows submits the next one.
-pub const PLAYBACK_LEAD: usize = 96;
+/// How much later than its frames playback audio is transmitted (5 ms): margin for Windows submitting the next
+/// transfer only once one completes, and for the completion being late (a stalled thread).
+pub const PLAYBACK_LEAD: usize = 240;
 
 /// The channels of one virtual sound card.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,8 +85,7 @@ struct ClockState {
 
 impl EngineClock {
   fn new(source: &Arc<dyn ClockSource>, sample_rate: u32, start_time: Clock) -> Self {
-    let state =
-      ClockState { receiver: source.subscribe(), clock: MediaClock::new(false), last: None };
+    let state = ClockState { receiver: source.subscribe(), clock: MediaClock::new(false), last: None };
     Self { sample_rate: sample_rate as u64, start_time, state: Mutex::new(state) }
   }
 
@@ -110,7 +110,8 @@ impl usbip_audio::Clock for EngineClock {
   fn now_ns(&self) -> u64 {
     let mut state = self.state.lock().unwrap();
     Self::update(&mut state);
-    let position = state.clock.wrapping_now_in_timebase(self.sample_rate).map(|now| now.wrapping_sub(self.start_time));
+    let position =
+      state.clock.wrapping_now_in_timebase(self.sample_rate).map(|now| now.wrapping_sub(self.start_time));
     let ns = match (position, state.last) {
       // positions before the start (the clock stepped back) count as the start
       (Some(position), _) if (position as isize) >= 0 => {
@@ -162,7 +163,10 @@ impl Uac2Streams for CardStreams {
       if overdue > 0 {
         let count = self.shared.late_playback.fetch_add(1, Ordering::Relaxed) + 1;
         if count.is_power_of_two() {
-          warn!("playback arrived {overdue} frames after it was due: transmitted as silence ({count} times so far)");
+          warn!(
+            "playback arrived {overdue} frames after it was due: transmitted as silence ({count} times \
+             so far)"
+          );
         }
       }
     }
@@ -181,7 +185,10 @@ impl Uac2Streams for CardStreams {
       if silenced > 0 && silenced < frames {
         let count = self.shared.unreceived_capture.fetch_add(1, Ordering::Relaxed) + 1;
         if count.is_power_of_two() {
-          warn!("capture channel not received in time ({silenced} frames), silence instead ({count} times so far)");
+          warn!(
+            "capture channel not received in time ({silenced} frames), silence instead ({count} times \
+             so far)"
+          );
         }
       }
       for (f, s) in column.iter().enumerate() {
@@ -207,7 +214,10 @@ pub fn copy_captured(ring: &[AtomicSample], readable: usize, start: usize, dst: 
 }
 
 fn signature(rings: &Rings) -> BuffersSignature {
-  BuffersSignature { areas: rings.iter().map(|r| (r.as_ptr() as usize, r.len(), 1)).collect(), period_size: 48 }
+  BuffersSignature {
+    areas: rings.iter().map(|r| (r.as_ptr() as usize, r.len(), 1)).collect(),
+    period_size: 48,
+  }
 }
 
 /// The device's receiver and transmitter, and the rings the cards' streams use.
@@ -283,7 +293,9 @@ impl Engine {
           let written = engine.playback_written.clone();
           unsafe { ExternalBufferParameters::new(ring.as_ptr(), frames, 1, stream.buffers_valid(), None) }
             // silence where Windows hasn't played
-            .with_written_from(Arc::new(move |position| written[ch].load(Ordering::Acquire).saturating_sub(position)))
+            .with_written_from(Arc::new(move |position| {
+              written[ch].load(Ordering::Acquire).saturating_sub(position)
+            }))
         })
         .collect();
       if let Err(e) = stream.prepare(signature(&engine.playback_rings), channels, options()) {
@@ -308,7 +320,8 @@ impl Engine {
     let rate = self.sample_rate as u64;
     let first = self.streams().next().ok_or(DeviceError::ThreadEnded)?;
     let clock_source = first.clock_source().ok_or(DeviceError::ThreadEnded)?;
-    let start_time = first.media_now(rate).ok_or(DeviceError::NoClock(clock_source.diagnose_missing()))?;
+    let start_time =
+      first.media_now(rate).ok_or(DeviceError::NoClock(clock_source.diagnose_missing()))?;
     for ring in self.capture_rings.iter().chain(self.playback_rings.iter()) {
       ring.iter().for_each(|s| s.store(0, Ordering::Relaxed));
     }
@@ -340,8 +353,11 @@ impl Engine {
       .cards
       .iter()
       .map(|card| {
-        let streams =
-          CardStreams { shared: shared.clone(), playback: tx..tx + card.playback, capture: rx..rx + card.capture };
+        let streams = CardStreams {
+          shared: shared.clone(),
+          playback: tx..tx + card.playback,
+          capture: rx..rx + card.capture,
+        };
         (rx, tx) = (rx + card.capture, tx + card.playback);
         streams
       })
