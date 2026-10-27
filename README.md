@@ -360,6 +360,8 @@ If you want to contribute but can't code or don't know where to start because th
 * the ALSA plugin wakes the application about 4 times per period instead of on every packet
 * receiving: writing in-order packets into a ring buffer is about 10x faster (no per-sample bookkeeping without holes)
 * ASIO driver: a buffer switch finishing after its outputs were due is warned about (the host has one period, as with any ASIO driver)
+* ASIO driver: the host's inputs are silence, not the audio of a ring cycle ago (~170 ms), where the receiver hasn't received (nor closed) them in time, e.g. when a transmitter disappears while the receiver is stalled; also no leftovers of the previous run after a restart
+* macOS: the audio threads (transmit, receive, the ASIO engine's switches) are time-constraint threads, like Core Audio's I/O threads: with FIFO priority alone they woke up late (dropouts, late packets)
 
 ## 0.5.0
 * works with JACK, should work with any app that uses the soundcard as an interrupt source
