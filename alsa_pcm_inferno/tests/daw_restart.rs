@@ -1161,6 +1161,115 @@ fn capture_after_transmitter_stops_is_silent() {
     );
 }
 
+/// Threads of this process with the given name.
+fn threads_named(name: &str) -> Vec<libc::pid_t> {
+    std::fs::read_dir("/proc/self/task")
+        .unwrap()
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let comm = std::fs::read_to_string(e.path().join("comm")).ok()?;
+            (comm.trim_end() == name).then(|| e.file_name().to_str()?.parse().ok())?
+        })
+        .collect()
+}
+
+fn pin_to_cpu(tid: libc::pid_t, cpu: usize) {
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(cpu, &mut set);
+        assert_eq!(libc::sched_setaffinity(tid, size_of::<libc::cpu_set_t>(), &set), 0);
+    }
+}
+
+/// Starves the receiver threads for `duration`: SCHED_IDLE, on a CPU kept busy by another thread.
+fn starve_receivers(duration: Duration) -> std::thread::JoinHandle<()> {
+    let receivers = threads_named("flows RX");
+    assert!(!receivers.is_empty(), "no receiver thread found");
+    let cpu = unsafe { libc::sched_getcpu() } as usize;
+    let cpu = if cpu == 0 { 1 } else { 0 };
+    std::thread::spawn(move || {
+        pin_to_cpu(0, cpu);
+        for &tid in &receivers {
+            pin_to_cpu(tid, cpu);
+            let param = libc::sched_param { sched_priority: 0 };
+            assert_eq!(unsafe { libc::sched_setscheduler(tid, libc::SCHED_IDLE, &param) }, 0);
+        }
+        let until = Instant::now() + duration;
+        while Instant::now() < until {
+            std::hint::spin_loop();
+        }
+        // SCHED_IDLE may not be left without privileges, but nothing competes with them any more
+        let all = (0..std::thread::available_parallelism().unwrap().get()).fold(
+            unsafe { std::mem::zeroed::<libc::cpu_set_t>() },
+            |mut set, c| {
+                unsafe { libc::CPU_SET(c, &mut set) };
+                set
+            },
+        );
+        for &tid in &receivers {
+            unsafe { libc::sched_setaffinity(tid, size_of::<libc::cpu_set_t>(), &all) };
+        }
+    })
+}
+
+/// When the receiver falls behind (its thread stalls) the application must read silence for what wasn't
+/// received in time, not what the buffer held a buffer cycle ago.
+#[test]
+fn capture_while_the_receiver_stalls_is_silent_not_stale() {
+    if std::thread::available_parallelism().unwrap().get() < 2 {
+        eprintln!("needs 2 CPUs, skipped");
+        return;
+    }
+    let ids = TestIds {
+        base_port: 43000,
+        base_pid: 43,
+        tag: "caprxstall",
+        latency_ns: LONG_LATENCY_NS,
+    };
+    let fx = CaptureFixture::with_pcm(&ids, |config| {
+        Pcm::open_with(config, SND_PCM_STREAM_CAPTURE, 1024, 4096).expect("1024x4 refused")
+    });
+    let mut buf = vec![0 as Sample; fx.pcm().period_size * CHANNELS];
+    let (mut stale, mut fresh, mut silent) = (0, 0, 0);
+    let mut read_for = |duration: Duration, stale: &mut usize, fresh: &mut usize, silent: &mut usize| {
+        let until = Instant::now() + duration;
+        while Instant::now() < until {
+            let r = fx.pcm().read(&mut buf);
+            if r == -(libc::EPIPE as i64) {
+                fx.pcm().prepare();
+                fx.pcm().start();
+                continue;
+            }
+            assert!(r >= 0, "snd_pcm_readi failed: {r}");
+            let data = &buf[..r as usize * CHANNELS];
+            *stale += stale_samples(data, 0);
+            *fresh += data.iter().filter(|&&s| is_fresh_ramp_sample(s, 0)).count();
+            *silent += data.iter().filter(|&&s| s == 0).count();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    read_for(Duration::from_millis(300), &mut stale, &mut fresh, &mut silent);
+    let stall = starve_receivers(Duration::from_millis(500));
+    let (mut stale_stalled, mut silent_stalled) = (0, 0);
+    read_for(Duration::from_millis(500), &mut stale_stalled, &mut fresh, &mut silent_stalled);
+    stall.join().unwrap();
+    read_for(Duration::from_millis(500), &mut stale, &mut fresh, &mut silent);
+    log::info!(
+        "stale {stale} + {stale_stalled} while stalled, fresh {fresh}, silent {silent} + {silent_stalled} while stalled"
+    );
+    assert!(
+        silent_stalled > 0,
+        "the receiver didn't fall behind: the test didn't test anything"
+    );
+    assert_eq!(
+        stale + stale_stalled,
+        0,
+        "{} stale samples captured ({stale_stalled} while the receiver stalled)",
+        stale + stale_stalled
+    );
+    assert!(fresh > 0);
+}
+
 /// T10: right after restarts (as in xrun recovery), captured audio must be fresh audio of the new run,
 /// never misplaced samples written with the previous run's addressing.
 #[test]

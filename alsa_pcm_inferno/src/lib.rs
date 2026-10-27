@@ -102,6 +102,15 @@ struct MyIOPlug {
     use_flows_clock: bool,
     /// capture: per channel, how far the running receiver has written (frames since start_time)
     capture_written: Arc<Vec<AtomicUsize>>,
+    /// capture: per channel, how far the running receiver has made the audio readable (received, or closed
+    /// with silence)
+    capture_readable: Arc<Vec<AtomicUsize>>,
+    /// capture: per channel, the pointer reported last; frames before it not received in time are silenced
+    capture_checked: Vec<usize>,
+    /// capture: per channel, whether audio was received in time when the pointer was reported last
+    capture_receiving: Vec<bool>,
+    /// capture: number of times a receiving channel's audio wasn't received in time
+    unreceived_count: usize,
     stream_info: Arc<StreamInfo>,
     on_transfer_eventfd: libc::c_int,
     on_transfer_enabled: bool,
@@ -148,7 +157,7 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
         }
     }
 
-    let stream_info = &*this.stream_info;
+    let stream_info = this.stream_info.clone();
     let boundary = stream_info.boundary.load(Ordering::Relaxed) as snd_pcm_sframes_t;
     let max_diff = boundary >> 2;
     let boundary_add = stream_info.boundary_add.load(Ordering::Relaxed) as snd_pcm_sframes_t;
@@ -195,6 +204,9 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
             );
             return (-EPIPE).try_into().unwrap();
         }
+        if buffered > 0 {
+            silence_unreceived(this, io, appl, ptr as usize);
+        }
     }
 
     if buffered < 0
@@ -233,6 +245,65 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
     //log::debug!("pointer: {ptr}");
 
     ptr
+}
+
+/// Start of the frames before `ptr` (and from `appl`, the application's pointer) which a channel's receiver
+/// hasn't made `readable`, and which haven't been `checked` already: `ptr` when there are none. Positions are
+/// frames since start_time; a position more than `buffer_size` away is of another run (or the channel has no
+/// receiver).
+fn unreceived_from(appl: usize, ptr: usize, readable: usize, checked: usize, buffer_size: usize) -> usize {
+    let len = ptr.wrapping_sub(appl);
+    let ahead = |position: usize| -> Option<usize> {
+        let a = position.wrapping_sub(appl);
+        (a <= len + buffer_size).then_some(a)
+    };
+    let from = ahead(readable).unwrap_or(0).max(ahead(checked).unwrap_or(0));
+    appl.wrapping_add(from.min(len))
+}
+
+/// Silences the frames the application may read (up to `ptr`) which the receiver hasn't received in time, nor
+/// closed with silence: the buffer still holds the audio of a buffer cycle ago there. The receiver writes those
+/// positions late, if at all: when it stalls, or a running flow's packets arrive late.
+unsafe fn silence_unreceived(this: &mut MyIOPlug, io: *mut snd_pcm_ioplug_t, appl: usize, ptr: usize) {
+    let areas = snd_pcm_ioplug_mmap_areas(io);
+    let channels = (*io).channels as usize;
+    if areas.is_null() || this.capture_readable.len() != channels {
+        return;
+    }
+    let areas = std::slice::from_raw_parts(areas, channels);
+    let buffer_size = (*io).buffer_size as usize;
+    for ch in 0..channels {
+        let readable = this.capture_readable[ch].load(Ordering::Acquire);
+        let checked = this.capture_checked[ch];
+        let from = unreceived_from(appl, ptr, readable, checked, buffer_size);
+        let unreceived = ptr.wrapping_sub(from);
+        // frames that became readable to the application since the pointer was reported last
+        let new = ptr.wrapping_sub(unreceived_from(appl, ptr, appl, checked, buffer_size));
+        if unreceived > 0 {
+            // positions map to the buffer like the receiver's: modulo the buffer size
+            let offset = from % buffer_size;
+            let first = unreceived.min(buffer_size - offset);
+            snd_pcm_area_silence(&areas[ch], offset as _, first as _, (*io).format);
+            if unreceived > first {
+                snd_pcm_area_silence(&areas[ch], 0, (unreceived - first) as _, (*io).format);
+            }
+            if this.capture_receiving[ch] {
+                this.unreceived_count += 1;
+                if this.unreceived_count.is_power_of_two() {
+                    warn!(
+                        "channel {} not received in time ({unreceived} frames at {from}), silence instead \
+                         ({} times so far)",
+                        ch + 1,
+                        this.unreceived_count
+                    );
+                }
+            }
+        }
+        this.capture_checked[ch] = ptr;
+        if new > 0 {
+            this.capture_receiving[ch] = unreceived < new;
+        }
+    }
 }
 
 fn get_app_name() -> Option<String> {
@@ -310,10 +381,16 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
     };
 
     // a running receiver keeps reporting to the table it was started with
+    let new_table = || Arc::new(channels_areas.iter().map(|_| AtomicUsize::new(0)).collect());
     let capture_written = if this.capture_written.len() == channels_areas.len() {
         this.capture_written.clone()
     } else {
-        Arc::new(channels_areas.iter().map(|_| AtomicUsize::new(0)).collect())
+        new_table()
+    };
+    let capture_readable = if this.capture_readable.len() == channels_areas.len() {
+        this.capture_readable.clone()
+    } else {
+        new_table()
     };
     let channels_buffers = channels_areas
         .iter()
@@ -325,7 +402,8 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
                     - ((area.first / bits_per_sample) as usize),
                 (area.step / bits_per_sample) as usize,
                 this.stream.buffers_valid(),
-                None,
+                ((*io).stream == SND_PCM_STREAM_CAPTURE)
+                    .then(|| PositionReportDestination::new(capture_readable.clone(), ch_index)),
             );
             if (*io).stream == SND_PCM_STREAM_PLAYBACK {
                 // send silence, not stale buffer contents, when the application doesn't keep up or stops
@@ -384,10 +462,13 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
         return error_code(&e);
     }
     // the paused receiver doesn't write; positions of the next run start at 0
-    for w in capture_written.iter() {
+    for w in capture_written.iter().chain(capture_readable.iter()) {
         w.store(0, Ordering::Release);
     }
     this.capture_written = capture_written;
+    this.capture_readable = capture_readable;
+    this.capture_checked = vec![0; channels_areas.len()];
+    this.capture_receiving = vec![false; channels_areas.len()];
 
     if (*io).stream == SND_PCM_STREAM_CAPTURE {
         // don't let the application read leftovers from previous runs or uninitialised memory
@@ -591,6 +672,10 @@ unsafe extern "C" fn plugin_define(
         ref_time: Instant::now(),
         use_flows_clock,
         capture_written: Arc::new(vec![]),
+        capture_readable: Arc::new(vec![]),
+        capture_checked: vec![],
+        capture_receiving: vec![],
+        unreceived_count: 0,
         stream_info: StreamInfo::new(std::ptr::null()), // set below, when io's address is known
         on_transfer_eventfd: efd,
         on_transfer_enabled: !disable_pollfd,
@@ -783,6 +868,31 @@ mod tests {
         assert_eq!(info.written_from(3000), 72);
         assert_eq!(info.written_from(3072), 0);
         assert_eq!(info.written_from(4000), 0, "beyond the application pointer");
+    }
+
+    #[test]
+    fn unreceived_frames_start_at_the_readable_position() {
+        let (buffer, appl, ptr) = (4096, 10_000, 10_512);
+        assert_eq!(unreceived_from(appl, ptr, 11_000, 0, buffer), ptr, "received ahead of the pointer");
+        assert_eq!(unreceived_from(appl, ptr, ptr, 0, buffer), ptr);
+        assert_eq!(unreceived_from(appl, ptr, 10_200, 0, buffer), 10_200, "receiver behind");
+        assert_eq!(unreceived_from(appl, ptr, 9_000, 0, buffer), appl, "only what the application can read");
+        assert_eq!(unreceived_from(appl, ptr, 9_000, 10_300, buffer), 10_300, "silenced already");
+        assert_eq!(unreceived_from(appl, ptr, 10_400, 10_300, buffer), 10_400);
+        assert_eq!(unreceived_from(appl, ptr, 9_000, ptr, buffer), ptr);
+    }
+
+    #[test]
+    fn positions_of_another_run_are_unreceived() {
+        let (buffer, appl, ptr) = (4096, 100, 612);
+        // the previous run's positions, or a channel without a receiver
+        assert_eq!(unreceived_from(appl, ptr, 1_000_000, 0, buffer), appl);
+        assert_eq!(unreceived_from(appl, ptr, 0, 0, buffer), appl);
+        // across the wrap of positions
+        let appl = usize::MAX - 100;
+        let ptr = appl.wrapping_add(512);
+        assert_eq!(unreceived_from(appl, ptr, 5, 0, buffer), 5);
+        assert_eq!(unreceived_from(appl, ptr, 1_000, 0, buffer), ptr);
     }
 
     #[test]
