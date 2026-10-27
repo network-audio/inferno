@@ -220,46 +220,54 @@ fn get_min_max_end_timestamps<'a, P: ProxyToSamplesBuffer + 'a>(
 }
 
 impl<P: ProxyToSamplesBuffer> PeriodicSamplesCollector<P> {
-  fn get_min_max_end_timestamps(&self) -> Option<(Clock, Clock)> {
-    get_min_max_end_timestamps(&self.channels)
-  }
-  /// Where to read up to: as far as the connected channels have received or, if following the clock and that's
-  /// more than `CLOCK_MARGIN_MS` behind the media clock (minus the receive latency: the largest of the device's
-  /// and the connected flows'), the clock, so that time goes on, in silence, while nothing is received.
-  fn readable_until(&mut self) -> Option<Clock> {
-    let received = self.get_min_max_end_timestamps().map(|(min_end_ts, max_end_ts)| {
-      // lag prevention logic to prevent abruptly disconnected transmitters from causing buffer overrun
-      // in other audio channels
-      let lag = max_end_ts.wrapping_sub(min_end_ts);
-      if lag > MAX_LAG_SAMPLES {
-        max_end_ts.wrapping_sub(MAX_LAG_SAMPLES)
-      } else {
-        min_end_ts
-      }
-    });
-    let Some(clock_recv) = &mut self.clock_recv else {
-      return received;
+  /// Where to read up to, from `position` (where the last read ended, if any): as far as the connected channels
+  /// have received. If following the clock, channels which have received nothing past `position` for
+  /// `CLOCK_MARGIN_MS` (after the receive latency: the largest of the device's and the connected flows') don't
+  /// hold it back, and without any channel holding it back, the clock does: time goes on, in silence, while
+  /// nothing is received. A channel still receiving holds it back even when late (e.g. the packets queued
+  /// while its flow started, written in a burst), so that it's read whole.
+  fn readable_until(&mut self, position: Option<Clock>) -> Option<Clock> {
+    let Some(clock) = self.clock_position() else {
+      return self.received_until(|_| true);
     };
+    let Some(position) = position else {
+      // the first read: from the clock, or what's been received since
+      return match self.received_until(|_| true) {
+        Some(received) if wrapped_diff(received, clock) > 0 => Some(received),
+        _ => Some(clock),
+      };
+    };
+    let overdue = |until: Clock| wrapped_diff(until, position) <= 0 && wrapped_diff(until, clock) < 0;
+    match self.received_until(|until| !overdue(until)) {
+      Some(received) => Some(received),
+      None if wrapped_diff(clock, position) > 0 => Some(clock),
+      None => None,
+    }
+  }
+  /// As far as the channels whose received position `holds` have received.
+  fn received_until(&self, holds: impl Fn(Clock) -> bool) -> Option<Clock> {
+    let ends =
+      self.channels.iter().flatten().map(|ch| ch.source.readable_until()).filter(|&end| holds(end)).collect_vec();
+    let min_end_ts = *ends.iter().min_by(|&&a, &&b| wrapped_diff(a, b).cmp(&0))?;
+    let max_end_ts = *ends.iter().max_by(|&&a, &&b| wrapped_diff(a, b).cmp(&0))?;
+    // lag prevention logic to prevent abruptly disconnected transmitters from causing buffer overrun
+    // in other audio channels
+    let lag = max_end_ts.wrapping_sub(min_end_ts);
+    Some(if lag > MAX_LAG_SAMPLES { max_end_ts.wrapping_sub(MAX_LAG_SAMPLES) } else { min_end_ts })
+  }
+  /// The media clock minus the receive latency and `CLOCK_MARGIN_MS`, if following the clock and it's available.
+  fn clock_position(&mut self) -> Option<Clock> {
+    let clock_recv = self.clock_recv.as_mut()?;
     // also the receiver's initial overlay, before any update
     if clock_recv.update() || !self.clock.is_ready() {
       if let Some(ovl) = clock_recv.get() {
         self.clock.update_overlay(*ovl);
       }
     }
-    let clock = self.clock.wrapping_now_in_timebase(self.sample_rate as u64).map(|now| {
-      let latency = self
-        .channels
-        .iter()
-        .flatten()
-        .map(|ch| ch.latency_samples)
-        .fold(self.latency_samples, Clock::max);
-      now.wrapping_sub(latency + self.sample_rate as Clock * CLOCK_MARGIN_MS / 1000)
-    });
-    match (received, clock) {
-      (Some(received), Some(clock)) if wrapped_diff(received, clock) < 0 => Some(clock),
-      (Some(received), _) => Some(received),
-      (None, clock) => clock,
-    }
+    let now = self.clock.wrapping_now_in_timebase(self.sample_rate as u64)?;
+    let latency =
+      self.channels.iter().flatten().map(|ch| ch.latency_samples).fold(self.latency_samples, Clock::max);
+    Some(now.wrapping_sub(latency + self.sample_rate as Clock * CLOCK_MARGIN_MS / 1000))
   }
   async fn run(&mut self) {
     let mut clock = None;
@@ -269,7 +277,7 @@ impl<P: ProxyToSamplesBuffer> PeriodicSamplesCollector<P> {
     loop {
       tokio::select! {
         _ = read_data_interval.tick() => {
-          if let Some(readable_until) = self.readable_until() {
+          if let Some(readable_until) = self.readable_until(clock) {
             let new_clock = {
               if let Some(mut start_timestamp) = clock {
                 // we already have clock, use it as a start timestamp
@@ -450,11 +458,58 @@ mod tests {
       }
     };
     let (_, clock_recv) = real_time_box_channel::channel(Box::new(Some(ClockOverlay::monotonic())));
-    let (col, fut) = SamplesCollector::new_with_callback(Arc::new(info), Box::new(callback), Some(clock_recv));
+    let (col, fut) =
+      SamplesCollector::new_with_callback(Arc::new(info), Box::new(callback), Some(clock_recv));
     tokio::spawn(fut);
     let mut clock = MediaClock::new(false);
     clock.update_overlay(ClockOverlay::monotonic());
     (col, recorded, clock)
+  }
+
+  /// A clocked collector with channels received until `ends`, relative to its clock position (returned).
+  fn collector_receiving_until(ends: &[isize]) -> (PeriodicSamplesCollector<OwnedBuffer<Atomic<Sample>>>, Clock) {
+    let (_, clock_recv) = real_time_box_channel::channel(Box::new(Some(ClockOverlay::monotonic())));
+    let (_, rx) = mpsc::channel(1);
+    let mut collector = PeriodicSamplesCollector {
+      commands_receiver: rx,
+      channels: vec![],
+      callback: Box::new(|_, _| {}),
+      clock: MediaClock::new(false),
+      clock_recv: Some(clock_recv),
+      sample_rate: RATE,
+      latency_samples: 0,
+    };
+    let clock = collector.clock_position().unwrap();
+    for (id, &end) in ends.iter().enumerate() {
+      let start = clock.wrapping_add_signed(end - 1000);
+      let (mut sink, source) = ring_buffer::new_owned::<Sample>(1 << 16, start, 0);
+      sink.write_from_at(start, std::iter::repeat(1).take(1000));
+      let channel = Channel { id, source, prev_holes_count: 0, latency_samples: 0, was_connected: true };
+      collector.channels.push(Some(channel));
+    }
+    (collector, clock)
+  }
+
+  #[test]
+  fn clocked_reading_waits_for_channels_still_receiving() {
+    // positions relative to the clock's, far apart: it moves on while the test runs
+    let read = |ends: &[isize], position: isize| {
+      let (mut collector, clock) = collector_receiving_until(ends);
+      let until = collector.readable_until(Some(clock.wrapping_add_signed(position)));
+      (until.map(|u| wrapped_diff(u, clock)), clock)
+    };
+    // a flow's start, written in a burst: late, but received past the position: wait for it
+    assert_eq!(read(&[-5_000, 2_000], -8_000).0, Some(-5_000));
+    // a channel with nothing new, for longer than the margin, doesn't hold it back
+    assert_eq!(read(&[-40_000, 5_000], -40_000).0, Some(5_000));
+    // nothing new, not yet overdue (the position is ahead of the clock): wait
+    assert_eq!(read(&[20_000], 20_000).0, Some(20_000));
+    // nothing received for longer than the margin: the clock
+    let until = read(&[-40_000], -40_000).0.unwrap();
+    assert!((0..4800).contains(&until), "{until}");
+    // no channels: the clock
+    let until = read(&[], -40_000).0.unwrap();
+    assert!((0..4800).contains(&until), "{until}");
   }
 
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
