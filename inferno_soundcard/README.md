@@ -50,12 +50,14 @@ Each sound card is a Core Audio device of the Inferno HAL plug-in ([`inferno_cor
 
 ### Install
 
-Build the package (Rust and the Xcode command line tools needed) and install it:
+The releases' package (`inferno-soundcard-macos.pkg`) is signed with a Developer ID and notarized: open it to install. Or build the package (Rust and the Xcode command line tools needed) and install it:
 
     packaging/macos/build-pkg.sh
     sudo installer -pkg inferno-soundcard-macos.pkg -target /
 
 Without a Developer ID (`CODESIGN_IDENTITY`, `PKG_SIGN_IDENTITY`), the package is signed ad hoc: install it with `installer`, or open it with a right click if macOS refuses. `sudo "/Library/Application Support/Inferno/uninstall.sh"` removes everything but the settings (`--purge` removes them too).
+
+The release workflow signs and notarizes the package with the repository's secrets: `MACOS_CERTIFICATES_P12` (base64 of a `.p12` with the Developer ID Application and Developer ID Installer identities), `MACOS_CERTIFICATES_PASSWORD` (its password), and an App Store Connect API key for the notary service, `NOTARY_KEY_P8` (the `.p8` file), `NOTARY_KEY_ID` and `NOTARY_ISSUER_ID`. Without them it builds the package signed ad hoc, and doesn't publish it.
 
 ### Settings
 
@@ -64,7 +66,7 @@ Open **Inferno Sound Cards** from Applications, or `http://127.0.0.1:47800/`: th
 ### Limits
 
 - Up to 128 playback and 128 recording channels per card at any rate (no shared-mode or USB limit), up to 32 cards.
-- The package isn't notarized yet, and like the Windows sound cards, it's tested in CI only, not yet with real Dante hardware.
+- Like the Windows sound cards, it's tested in CI only, not yet with real Dante hardware.
 
 ## Development
 

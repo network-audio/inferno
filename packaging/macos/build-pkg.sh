@@ -5,7 +5,7 @@
 #
 # --universal builds for Apple silicon and Intel (both Rust targets must be installed), otherwise for this Mac.
 # Signs with CODESIGN_IDENTITY (a Developer ID Application identity; ad hoc without one) and the package with
-# PKG_SIGN_IDENTITY (a Developer ID Installer identity), if set.
+# PKG_SIGN_IDENTITY (a Developer ID Installer identity), if set. The release workflow notarizes it.
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)

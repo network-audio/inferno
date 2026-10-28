@@ -11,4 +11,4 @@ Logs are at `%LOCALAPPDATA%\Inferno\soundcard.log`.
 
 ## macOS sound cards
 
-`inferno-soundcard-macos.pkg` (Apple silicon and Intel, macOS 12 or later) adds the same sound cards to the Mac: Core Audio devices of the Inferno plug-in, for any application. Install it with `sudo installer -pkg inferno-soundcard-macos.pkg -target /` (it isn't notarized yet), then open **Inferno Sound Cards** from Applications for the settings page. `sudo "/Library/Application Support/Inferno/uninstall.sh"` removes it. Logs are at `/Library/Logs/Inferno/soundcard.log`.
+`inferno-soundcard-macos.pkg` (Apple silicon and Intel, macOS 12 or later) adds the same sound cards to the Mac: Core Audio devices of the Inferno plug-in, for any application. It's signed and notarized: open it to install, then open **Inferno Sound Cards** from Applications for the settings page. `sudo "/Library/Application Support/Inferno/uninstall.sh"` removes it. Logs are at `/Library/Logs/Inferno/soundcard.log`.
