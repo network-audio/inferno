@@ -566,10 +566,6 @@ unsafe extern "C" fn do_io_operation(
         let buffer = std::slice::from_raw_parts(main as *const f32, frames * channels);
         let position = at(&(*cycle).mOutputTime);
         let now = set.region.position_now();
-        let last = &device.io.timing.last;
-        last[0].store((*cycle).mInputTime.mSampleTime.to_bits(), Ordering::Relaxed);
-        last[1].store((*cycle).mOutputTime.mSampleTime.to_bits(), Ordering::Relaxed);
-        last[2].store(now.unwrap_or(0) as u64, Ordering::Relaxed);
         if let Some(now) = now {
           let lead = set.region.header().playback_lead as usize;
           device.io.timing.output((position + lead) as i64 - now as i64);
@@ -648,7 +644,7 @@ fn connect() -> Result<Option<Region>, String> {
 fn connection() {
   // what was last logged, not to log it again and again
   let mut last = String::new();
-  // the I/O cycles' timing is logged every 5 s
+  // the I/O cycles' timing is logged every minute
   let mut logged = 0u64;
   let mut report = |message: String, error: bool| {
     if last != message {
@@ -683,7 +679,7 @@ fn connection() {
         } else {
           std::thread::sleep(Duration::from_millis(100));
           logged += 1;
-          if logged % 50 == 0 {
+          if logged.is_multiple_of(600) {
             let cards = set.region.header().cards();
             for device in &set.devices {
               if let Some(timing) = device.io.timing.take() {

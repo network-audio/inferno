@@ -379,6 +379,8 @@ If you want to contribute but can't code or don't know where to start because th
 * macOS sound cards: Core Audio devices on the Dante network, for any application, configured on the settings page like on Windows. A Core Audio HAL plug-in (`inferno_coreaudio`, user space) plays and records through Mach shared memory with the sound card service (a launchd daemon in an unprivileged account), clocked by the Dante media clock: Core Audio runs at the network's rate. No 32-channel limit, nor USB's bandwidth limit at 96 kHz. Installer package built by `packaging/macos/build-pkg.sh`. Tested in CI: the plug-in's I/O loopback on every platform, and on macOS Pipe2inferno -> card -> Core Audio application -> Inferno2pipe, bit-exact
 * sound cards: one engine for both platforms, the rings in a shared region (`inferno_soundcard_shm`)
 * the end-to-end test (now `test/e2e`) also runs on macOS
+* macOS: the PTPv1 follower (`CLOCK_SOURCE=ptpv1`) works without root privileges: its multicast receivers bind PTP's ports (below 1024) to the unspecified address, the only one macOS allows unprivileged processes
+* macOS: the media clock is over `CLOCK_MONOTONIC_RAW`, not NTP-slewed `CLOCK_MONOTONIC` (by thousands of ppm on CI runners): it ticks with the system's host time, as audio APIs do
 
 ## 0.8.0
 * sound cards at 44.1 kHz (and other sample rates that aren't multiples of 8 kHz): USB packets carry 5 or 6 frames per 125 µs, as the clock dictates. Tested on Windows in CI (shared and exclusive mode, up to 64 channels) and end-to-end, bit-exact both ways
