@@ -11,6 +11,7 @@ members = [
     "asio_inferno",
     "inferno_soundcard",
     "inferno_soundcard_shm",
+    "inferno_coreaudio",
     "inferno_doctor",
 ]
 

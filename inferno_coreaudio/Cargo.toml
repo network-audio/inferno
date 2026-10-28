@@ -1,0 +1,18 @@
+[package]
+name = "inferno_coreaudio"
+description = "macOS Core Audio HAL plug-in (AudioServerPlugIn) for the Inferno sound cards: Core Audio devices on the Dante network"
+authors = ["Teo <teodly@lumifaza.org>"]
+license = "GPL-3.0-or-later OR AGPL-3.0-or-later"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# the plug-in's binary in Inferno.driver (see packaging/macos)
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+inferno_soundcard_shm = { path = "../inferno_soundcard_shm" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+mach2 = "0.4"

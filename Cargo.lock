@@ -934,6 +934,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "inferno_coreaudio"
+version = "0.1.0"
+dependencies = [
+ "inferno_soundcard_shm",
+ "libc",
+ "mach2",
+]
+
+[[package]]
 name = "inferno_doctor"
 version = "0.1.0"
 dependencies = [
