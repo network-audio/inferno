@@ -51,6 +51,8 @@ pub struct Timing {
   pub output_max: AtomicI64,
   pub input_min: AtomicI64,
   pub input_max: AtomicI64,
+  /// the last cycle's sample times (input, output; f64 bits) and the position then
+  pub last: [AtomicU64; 3],
 }
 
 impl Default for Timing {
@@ -61,6 +63,7 @@ impl Default for Timing {
       output_max: AtomicI64::new(i64::MIN),
       input_min: AtomicI64::new(i64::MAX),
       input_max: AtomicI64::new(i64::MIN),
+      last: Default::default(),
     }
   }
 }
