@@ -2,7 +2,7 @@ End-to-end test of Inferno on Windows, run by `.github/workflows/windows-e2e.yml
 
 [`pipe2inferno`](../../pipe2inferno) transmits 150 s of pseudo-random 24-bit audio, [`inferno2pipe`](../../inferno2pipe)
 receives it, routed with [netaudio](https://github.com/chris-ritsen/network-audio-controller) like the Linux
-[Docker test](../dockerized_trx). The recording must match the source exactly (bit for bit) for at least 15 s.
+[Docker test](../dockerized_trx). The recording must match the source exactly (bit for bit) for at least 15 s without a break. Elsewhere it may only have silence or skips (where a stalled CI runner made audio late), after which it must continue the source exactly again: wrong audio, e.g. corrupted, repeated or stale, fails.
 
 Both devices run on one host, each following the clock of a simulated PTPv1 leader (the `ptpv1_test_leader`
 example, standard PTP ports) with its own PTPv1 follower: Inferno's default clock source on Windows. This tests

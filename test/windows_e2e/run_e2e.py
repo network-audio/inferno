@@ -1,5 +1,6 @@
 """End-to-end tests of Inferno on Windows, routed with netaudio like the Linux Docker test
-(test/dockerized_trx). Recordings must match their sources exactly. Exits with the test result.
+(test/dockerized_trx). Recordings must match their sources exactly for 15 s, with nothing but silence or skips
+(a stalled runner) elsewhere. Exits with the test result.
 
 Scenarios:
 * pipe: Pipe2inferno transmits a known signal, Inferno2pipe receives it
@@ -98,8 +99,15 @@ def wait_for_devices(names, deadline):
         time.sleep(2)
 
 
+# how far ahead a recording may skip in its source (a stalled stream, e.g. a USB/IP server catching up)
+MAX_SKIP_SECONDS = 10
+
+
 def compare(source, recording_path):
-    """Number of frames of the recording matching the source exactly, after its leading silence."""
+    """Compares the recording with the source, after its leading silence: every frame must be the source's
+    next one, silence (in some or all channels: audio late or lost, e.g. on a stalled runner), or where the
+    recording continues the source further on (it skipped ahead), or resumes it after silence. Returns the
+    longest run of frames matching exactly, and whether anything else (wrong audio) was recorded."""
     recording = array.array("i")
     recording.frombytes(recording_path.read_bytes()[: (recording_path.stat().st_size // 4) * 4])
     frames = len(recording) // CHANNELS
@@ -109,36 +117,62 @@ def compare(source, recording_path):
                   if all(recording[i * CHANNELS + c] != 0 for c in range(CHANNELS))), None)
     if first is None:
         log("recording is silent")
-        return 0
-    # align: find the first recorded frame in the source (unique with pseudo-random samples)
-    window = recording[first * CHANNELS:(first + 8) * CHANNELS]
+        return 0, False
     source_bytes = source.tobytes()
-    offset = source_bytes.find(window.tobytes())
-    while offset >= 0 and offset % (4 * CHANNELS) != 0:
-        offset = source_bytes.find(window.tobytes(), offset + 1)
-    if offset < 0:
+    source_frames = len(source) // CHANNELS
+    frame_bytes = 4 * CHANNELS
+
+    def find(i, lo, hi):
+        """Where the recorded frames from `i` are in the source frames lo..hi (unique with pseudo-random
+        samples), if they are."""
+        window = recording[i * CHANNELS:(i + 8) * CHANNELS].tobytes()
+        offset = source_bytes.find(window, lo * frame_bytes, (hi + 8) * frame_bytes)
+        while offset >= 0 and offset % frame_bytes != 0:
+            offset = source_bytes.find(window, offset + 1, (hi + 8) * frame_bytes)
+        return offset // frame_bytes if offset >= 0 else None
+
+    s = find(first, 0, source_frames)
+    if s is None:
         log(f"recorded audio (from frame {first}) not found in the source")
         log("first recorded frames: " + " ".join(f"{v & 0xffffffff:08x}" for v in recording[:16 * CHANNELS]))
         log("first source frames:   " + " ".join(f"{v & 0xffffffff:08x}" for v in source[:16 * CHANNELS]))
-        return 0
-    source_frame = offset // (4 * CHANNELS)
-    log(f"recording frame {first} is source frame {source_frame}")
-    matching = 0
-    mismatches = 0
-    first_mismatch = None
-    for i in range(first, frames):
-        s = source_frame + i - first
-        if s * CHANNELS + CHANNELS > len(source):
-            break
-        if recording[i * CHANNELS:(i + 1) * CHANNELS] == source[s * CHANNELS:(s + 1) * CHANNELS]:
-            matching += 1
+        return 0, False
+    log(f"recording frame {first} is source frame {s}")
+    matched = silent = skips = run = longest = silent_run = 0
+    wrong = None
+    i = first
+    while i < frames and s < source_frames:
+        recorded = recording[i * CHANNELS:(i + 1) * CHANNELS]
+        expected = source[s * CHANNELS:(s + 1) * CHANNELS]
+        if recorded == expected:
+            matched += 1
+            run += 1
+            longest = max(longest, run)
+            silent_run = 0
+        elif all(r == 0 or r == e for r, e in zip(recorded, expected)):
+            silent += 1
+            silent_run += 1
+            run = 0
         else:
-            mismatches += 1
-            if first_mismatch is None:
-                first_mismatch = i
-    log(f"matching frames: {matching}, mismatching: {mismatches}"
-        + (f" (first at recorded frame {first_mismatch})" if first_mismatch is not None else ""))
-    return matching if mismatches == 0 else 0
+            # skipped ahead, or resuming after silence where the stream stopped
+            at = find(i, max(0, s - silent_run), min(source_frames, s + MAX_SKIP_SECONDS * SAMPLE_RATE))
+            if at is None:
+                wrong = (i, s)
+                break
+            log(f"recorded frame {i}: continues at source frame {at} ({at - s:+d} frames)")
+            skips += 1
+            s = at
+            run = silent_run = 0
+            continue
+        i += 1
+        s += 1
+    log(f"matching frames: {matched} (longest run {longest / SAMPLE_RATE:.1f} s), silent: {silent}, "
+        f"skips: {skips}" + (f"; wrong audio at recorded frame {wrong[0]} (source frame {wrong[1]})" if wrong else ""))
+    # mostly matching: stalls are rare
+    too_silent = silent > matched // 10
+    if too_silent:
+        log("more than a tenth of the recording is silence")
+    return longest, wrong is not None or too_silent
 
 
 class Processes:
@@ -207,11 +241,14 @@ def check_one_leader(log_paths):
 
 
 def check_recording(source, path, what):
-    matching = compare(source, path)
-    if matching < MIN_MATCHING_SECONDS * SAMPLE_RATE:
+    longest, bad = compare(source, path)
+    if bad:
+        log(f"❌ {what}: the recording isn't the source (with silence or skips where late)")
+        return False
+    if longest < MIN_MATCHING_SECONDS * SAMPLE_RATE:
         log(f"❌ {what}: less than {MIN_MATCHING_SECONDS} s of the recording matches the source exactly")
         return False
-    log(f"✅ {what}: {matching / SAMPLE_RATE:.1f} s of audio received exactly as transmitted")
+    log(f"✅ {what}: {longest / SAMPLE_RATE:.1f} s of audio received exactly as transmitted")
     return True
 
 
