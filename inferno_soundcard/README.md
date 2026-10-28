@@ -1,6 +1,6 @@
 # Inferno sound cards for Windows
 
-Windows sound devices on the Dante network, for any Windows application (browsers, video calls, media players, DAWs through WASAPI). Their playback channels are transmitted, their recording channels received. Route them with Dante Controller or netaudio, like any Dante device.
+Windows sound devices on the Dante network, for any Windows application (browsers, video calls, media players, DAWs through WASAPI). Their playback channels are transmitted, their recording channels received. Route them with Dante Controller or [NetAudio](https://netaudio.app/) (open source, [network-audio-controller](https://github.com/chris-ritsen/network-audio-controller)), like any Dante device.
 
 ## How it works
 

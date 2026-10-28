@@ -4,14 +4,14 @@
 
 This project is named after [a place](https://en.wikipedia.org/wiki/Inferno_(Dante)) destined for those who create undocumented network protocols.
 
-Inferno makes a Linux or Windows computer a Dante device: applications play to and record from the Dante network through a virtual soundcard, routed with Dante Controller or [netaudio](https://github.com/chris-ritsen/network-audio-controller) like any other device.
+Inferno makes a Linux or Windows computer a Dante device: applications play to and record from the Dante network through a virtual soundcard, routed with Dante Controller or [NetAudio](https://netaudio.app/), its open source alternative ([network-audio-controller](https://github.com/chris-ritsen/network-audio-controller)), like any other device.
 
 Big thanks to [Project Pendulum](https://github.com/pendulum-project) (by [Trifecta Tech Foundation](https://trifectatech.org/)) for creating and maintaining [Statime](https://github.com/pendulum-project/statime) and collaboration on features needed for audiovisual networks functionality! Audio transmission would be much more difficult to implement without it.
 
 
 # Features
 * receiving audio from and sending audio to Dante devices and virtual devices
-* works with most features of Dante Controller and [network-audio-controller](https://github.com/chris-ritsen/network-audio-controller) (`netaudio` command line tool)
+* works with most features of Dante Controller and [NetAudio](https://netaudio.app/) ([network-audio-controller](https://github.com/chris-ritsen/network-audio-controller): the `netaudio` command line tool, web app and daemon, and an iOS app)
 
 ## Comparison with other AoIP virtual soundcards
 
@@ -112,6 +112,12 @@ Big thanks to [Project Pendulum](https://github.com/pendulum-project) (by [Trife
 * Most Windows applications (shared mode) open at most 32 channels of a sound card; larger cards work with applications that open them in exclusive mode.
 * Device state (subscriptions, channel names, multicast flows) is saved in `%LOCALAPPDATA%\inferno_aoip\<device ID>`.
 
+## Routing
+Inferno devices appear on the network like any Dante device: route their channels with Dante Controller or [NetAudio](https://netaudio.app/), an open source alternative ([network-audio-controller](https://github.com/chris-ritsen/network-audio-controller)). NetAudio runs on Linux, macOS and Windows as a command line tool, web app and daemon (`uv tool install netaudio`), and on iPhone and iPad (beta). For example, to subscribe an Inferno device's receive channels to a transmitter's channels, and list the subscriptions:
+
+    netaudio subscription add --tx transmitter --rx inferno-device
+    netaudio subscription list
+
 ## Networking
 **Firewall:** allow incoming UDP 4440, 8800, 4455 and 8700 (or `ALT_PORT` to `ALT_PORT+3`), 5353 (mDNS), 4321 (multicast audio), 319 and 320 (PTP), and audio flows from transmitters (their ports are chosen by the operating system, so can't be known beforehand).
 
@@ -189,7 +195,7 @@ This project is dual licensed under the GPLv3-or-later and AGPLv3-or-later. You 
 
 ## Control software
 * Dante Controller @ Windows 10, 11
-* network-audio-controller
+* [NetAudio](https://netaudio.app/) ([network-audio-controller](https://github.com/chris-ritsen/network-audio-controller)) 0.4
 
 ## Host
 * x86_64 Linux
@@ -490,7 +496,7 @@ And the following are limitations of AES67 implementation in Dante, not AES67 in
 * sample rate is locked to 48kHz
 
 # Other open source projects related to Dante
-* [network-audio-controller](https://github.com/chris-ritsen/network-audio-controller) - command line connection and device controller, alternative to Dante Controller
+* [NetAudio](https://netaudio.app/) ([network-audio-controller](https://github.com/chris-ritsen/network-audio-controller)) - open source alternative to Dante Controller: device discovery, channel routing and device settings, as a command line tool (`netaudio`), web app and daemon for Linux, macOS and Windows, and an iOS app (beta)
 * [companion-module-audinate-dantecontroller](https://github.com/bitfocus/companion-module-audinate-dantecontroller) - Bitfocus Companion module for controlling Dante devices
 * [inferno_runners](https://github.com/maze42d/inferno_runners) - scripts for running Inferno with PipeWire-based inter-soundcard bridge and [USB audio gadget](https://www.diyaudio.com/community/threads/linux-usb-audio-gadget-rpi4-otg.342070/)
 * [dante-aes67-relay.js](https://gist.github.com/philhartung/87d336a3c432e2ce5452befcad1b945f) - Relay a Dante multicast stream to AES67
