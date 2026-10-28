@@ -34,7 +34,6 @@ Only pages from the settings page itself can change the settings. Requests must 
 
 - Windows' shared-mode audio engine (what most applications use) opens at most 32 channels of a device. Larger cards work with applications that open them in exclusive mode; split them into several cards for the others.
 - The cards use [pid.codes](https://pid.codes)' test USB ids (`1209:0001`) until the project has its own.
-- Like the ASIO driver: tested in CI only, not yet with real Dante hardware.
 
 ## macOS
 
@@ -66,7 +65,6 @@ Open **Inferno Sound Cards** from Applications, or `http://127.0.0.1:47800/`: th
 ### Limits
 
 - Up to 128 playback and 128 recording channels per card at any rate (no shared-mode or USB limit), up to 32 cards.
-- Like the Windows sound cards, it's tested in CI only, not yet with real Dante hardware.
 
 ## Development
 

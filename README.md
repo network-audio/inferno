@@ -375,7 +375,7 @@ If you want to contribute but can't code or don't know where to start because th
 
 # Changelog
 
-## Unreleased
+## 0.9.0
 * macOS sound cards: Core Audio devices on the Dante network, for any application, configured on the settings page like on Windows. A Core Audio HAL plug-in (`inferno_coreaudio`, user space) plays and records through Mach shared memory with the sound card service (a launchd daemon in an unprivileged account), clocked by the Dante media clock: Core Audio runs at the network's rate. No 32-channel limit, nor USB's bandwidth limit at 96 kHz. Installer package built by `packaging/macos/build-pkg.sh`. Tested in CI: the plug-in's I/O loopback on every platform, and on macOS Pipe2inferno -> card -> Core Audio application -> Inferno2pipe, bit-exact
 * macOS sound cards: volume and mute controls for playback and recording (System Settings' sliders, the volume keys), remembered per card; full volume is bit-exact
 * macOS: the release package is signed with a Developer ID and notarized (the release workflow, with the repository's signing secrets)
