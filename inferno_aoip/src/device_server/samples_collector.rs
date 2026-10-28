@@ -231,8 +231,17 @@ impl<P: ProxyToSamplesBuffer> PeriodicSamplesCollector<P> {
   /// `CLOCK_MARGIN_MS` don't hold it back, and without any channel holding it back, the clock does (minus the
   /// receive latency, the largest of the device's and the connected flows', and the margin): time goes on, in
   /// silence, while nothing is received. A channel still receiving holds it back even when late (e.g. the
-  /// packets queued while its flow started, written in a burst), so that it's read whole.
+  /// packets queued while its flow started, written in a burst), so that it's read whole. Following the clock,
+  /// it never reads past the media clock's present: the receiver closes the positions just ahead of it with
+  /// silence (to keep readers going if a flow breaks), which packets arriving late still overwrite.
   fn readable_until(&mut self, position: Option<Clock>) -> Option<Clock> {
+    let until = self.readable_until_uncapped(position)?;
+    match self.clock_now() {
+      Some(now) if wrapped_diff(until, now) > 0 => Some(now),
+      _ => Some(until),
+    }
+  }
+  fn readable_until_uncapped(&mut self, position: Option<Clock>) -> Option<Clock> {
     let now = Instant::now();
     for (progress, channel) in self.progress.iter_mut().zip(&self.channels) {
       let end = channel.as_ref().map(|ch| ch.source.readable_until());
@@ -276,8 +285,8 @@ impl<P: ProxyToSamplesBuffer> PeriodicSamplesCollector<P> {
     let lag = max_end_ts.wrapping_sub(min_end_ts);
     Some(if lag > MAX_LAG_SAMPLES { max_end_ts.wrapping_sub(MAX_LAG_SAMPLES) } else { min_end_ts })
   }
-  /// The media clock minus the receive latency and `CLOCK_MARGIN_MS`, if following the clock and it's available.
-  fn clock_position(&mut self) -> Option<Clock> {
+  /// The media clock's present, if following the clock and it's available.
+  fn clock_now(&mut self) -> Option<Clock> {
     let clock_recv = self.clock_recv.as_mut()?;
     // also the receiver's initial overlay, before any update
     if clock_recv.update() || !self.clock.is_ready() {
@@ -285,7 +294,11 @@ impl<P: ProxyToSamplesBuffer> PeriodicSamplesCollector<P> {
         self.clock.update_overlay(*ovl);
       }
     }
-    let now = self.clock.wrapping_now_in_timebase(self.sample_rate as u64)?;
+    self.clock.wrapping_now_in_timebase(self.sample_rate as u64)
+  }
+  /// The media clock minus the receive latency and `CLOCK_MARGIN_MS`, if following the clock and it's available.
+  fn clock_position(&mut self) -> Option<Clock> {
+    let now = self.clock_now()?;
     let latency =
       self.channels.iter().flatten().map(|ch| ch.latency_samples).fold(self.latency_samples, Clock::max);
     Some(now.wrapping_sub(latency + self.sample_rate as Clock * CLOCK_MARGIN_MS / 1000))
@@ -533,7 +546,11 @@ mod tests {
     // a channel with nothing new for longer than the margin doesn't hold it back
     assert_eq!(read(&[(-40_000, stalled), (5_000, fresh)], -40_000), Some(5_000));
     // nothing new, not stalled yet: wait
-    assert_eq!(read(&[(20_000, fresh)], 20_000), Some(20_000));
+    assert_eq!(read(&[(5_000, fresh)], 5_000), Some(5_000));
+    // never past the present (the clock's read position plus the margin, 9600 frames): the receiver closes the
+    // positions just ahead with silence, which late packets still overwrite
+    let until = read(&[(20_000, fresh)], 0).unwrap();
+    assert!((9_600..9_600 + 4_800).contains(&until), "{until}");
     // nothing received for longer than the margin: the clock
     let until = read(&[(-40_000, stalled)], -40_000).unwrap();
     assert!((0..4800).contains(&until), "{until}");
