@@ -176,14 +176,25 @@ impl<T> ProxyToBuffer<T> for ExternalBuffer<T> {
 
 impl ProxyToSamplesBuffer for ExternalBuffer<Atomic<Sample>> {}
 
+/// Positions a ring buffer can report to, e.g. a table in memory shared with another process.
+pub trait PositionTable: Send + Sync {
+  fn position(&self, index: usize) -> &AtomicUsize;
+}
+
+impl PositionTable for Vec<AtomicUsize> {
+  fn position(&self, index: usize) -> &AtomicUsize {
+    &self[index]
+  }
+}
+
 #[derive(Clone)]
 pub struct PositionReportDestination {
-  tab: Arc<Vec<AtomicUsize>>,
+  tab: Arc<dyn PositionTable>,
   offset: usize,
 }
 
 impl PositionReportDestination {
-  pub fn new(tab: Arc<Vec<AtomicUsize>>, offset: usize) -> Self {
+  pub fn new(tab: Arc<impl PositionTable + 'static>, offset: usize) -> Self {
     Self { tab, offset }
   }
 }
@@ -232,10 +243,10 @@ impl<T, P: ProxyToBuffer<Atomic<T>>> RingBufferShared<T, P> {
   #[inline(always)]
   fn commit_readable_pos(&self) {
     if let Some(dest) = &self.readable_pos_dest {
-      dest.tab[dest.offset].store(self.readable_pos.load(Ordering::Relaxed), Ordering::Release);
+      dest.tab.position(dest.offset).store(self.readable_pos.load(Ordering::Relaxed), Ordering::Release);
     }
     if let Some(dest) = &self.written_pos_dest {
-      dest.tab[dest.offset].store(self.writing_pos.load(Ordering::Relaxed), Ordering::Release);
+      dest.tab.position(dest.offset).store(self.writing_pos.load(Ordering::Relaxed), Ordering::Release);
     }
   }
 

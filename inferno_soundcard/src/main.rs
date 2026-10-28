@@ -1,5 +1,6 @@
 //! The sound card service: runs the cards of the configuration, the settings page and (on Windows) the tray
-//! icon. `--no-tray`: without the icon, until stopped.
+//! icon. `--no-tray`: without the icon, until stopped. On macOS it's a launchd daemon, without an icon, and
+//! serves the cards to the Core Audio plug-in.
 
 use std::sync::{mpsc, Arc, Mutex};
 
@@ -24,6 +25,15 @@ fn main() {
       .spawn(move || app::supervise(status, receiver))
       .unwrap()
   };
+
+  #[cfg(target_os = "macos")]
+  {
+    let status = status.clone();
+    std::thread::Builder::new()
+      .name("mach service".into())
+      .spawn(move || inferno_soundcard::coreaudio::serve(status))
+      .unwrap();
+  }
 
   let port = Config::load().map(|c| c.ui_port).unwrap_or(DEFAULT_UI_PORT);
   match web::bind(port) {

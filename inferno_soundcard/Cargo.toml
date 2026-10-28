@@ -9,6 +9,7 @@ edition = "2021"
 [dependencies]
 inferno_aoip = { path = "../inferno_aoip" }
 inferno_driver_core = { path = "../inferno_driver_core" }
+inferno_soundcard_shm = { path = "../inferno_soundcard_shm" }
 usbip-audio = { git = "https://github.com/network-audio/usbip-audio", rev = "1c0b8c378890e6cd2d8683e299a6091eebfea5ed" }
 env_logger = "0.11"
 log = "0.4.20"
@@ -39,3 +40,6 @@ windows = { version = "0.58", features = [
 
 [dev-dependencies]
 tokio = { version = "1.36", features = ["macros", "rt-multi-thread"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

@@ -23,8 +23,9 @@ use inferno_aoip::{
 };
 use inferno_soundcard::{
   config::{card_uac2_config, CardConfig, Config},
-  engine::{CardChannels, Engine},
+  engine::Engine,
 };
+use inferno_soundcard_shm::RegionCard;
 use usbip_audio::{uac2::Uac2Device, Server};
 
 const CHANNELS: usize = 2;
@@ -267,7 +268,12 @@ async fn plays_and_records_at(rate: u32, run: u16) {
   std::fs::write(dir.join("rx_subscriptions.toml"), subscriptions).unwrap();
   let clock_for_engine = clock.clone();
   let (engine, server) = tokio::task::spawn_blocking(move || {
-    let channels = [CardChannels { playback: CHANNELS, capture: CHANNELS }];
+    let channels = [RegionCard {
+      name: "Test card".into(),
+      uid: "test-1".into(),
+      playback_channels: CHANNELS,
+      capture_channels: CHANNELS,
+    }];
     let lead = Config::default().playback_lead(rate);
     let mut engine = Engine::new(card_settings, &channels, lead, Some(clock_for_engine)).unwrap();
     let card_clock = engine.start().unwrap();

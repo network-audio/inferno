@@ -10,6 +10,7 @@ members = [
     "alsa_pcm_inferno",
     "asio_inferno",
     "inferno_soundcard",
+    "inferno_soundcard_shm",
     "inferno_doctor",
 ]
 
