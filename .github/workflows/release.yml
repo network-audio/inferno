@@ -1,14 +1,14 @@
 name: Release
 
-# Windows installers of the virtual sound cards: built and smoke-tested on every run, published as assets of
-# the release of a pushed v* tag (or of an existing tag, run by hand).
+# Windows and macOS installers of the virtual sound cards: built and smoke-tested on every run, published as
+# assets of the release of a pushed v* tag (or of an existing tag, run by hand).
 on:
   push:
     tags: ['v*']
     branches: [dev, windows-e2e]
-    paths: ['packaging/**', 'inferno_soundcard/**', '.github/workflows/release.yml']
+    paths: ['packaging/**', 'inferno_soundcard/**', 'inferno_soundcard_shm/**', 'inferno_coreaudio/**', '.github/workflows/release.yml']
   pull_request:
-    paths: ['packaging/**', 'inferno_soundcard/**', '.github/workflows/release.yml']
+    paths: ['packaging/**', 'inferno_soundcard/**', 'inferno_soundcard_shm/**', 'inferno_coreaudio/**', '.github/workflows/release.yml']
   workflow_dispatch:
     inputs:
       tag:
@@ -145,8 +145,56 @@ jobs:
           if (-not (Test-Path -LiteralPath $usbip)) { throw 'usbip-win2 was removed, other applications may need it' }
           'installed, started, uninstalled'
 
+  macos:
+    # a universal package (Apple silicon and Intel): built, installed (the service starts, Core Audio loads the
+    # plug-in and lists the default card), uninstalled
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build the package
+        run: |
+          tag='${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}'
+          version=$([[ "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]] && echo "${BASH_REMATCH[1]}" || true)
+          packaging/macos/build-pkg.sh --universal ${version:+--version "$version"} --out inferno-soundcard-macos.pkg
+          pkgutil --payload-files inferno-soundcard-macos.pkg
+          pkgutil --expand-full inferno-soundcard-macos.pkg expanded
+          for binary in "Library/Audio/Plug-Ins/HAL/Inferno.driver/Contents/MacOS/Inferno" "Library/Application Support/Inferno/bin/inferno_soundcard"; do
+            lipo -archs "expanded/Payload/$binary" | grep -q 'x86_64 arm64' || { echo "::error::$binary isn't universal"; exit 1; }
+          done
+      - name: Install, check, uninstall
+        run: |
+          sudo installer -pkg inferno-soundcard-macos.pkg -target /
+          for attempt in $(seq 1 60); do
+            curl -sf http://127.0.0.1:47800/api/status && break
+            sleep 1
+          done
+          echo
+          curl -sf http://127.0.0.1:47800/ | grep -q 'Mac sound devices' || { echo "::error::the settings page is missing"; exit 1; }
+          cargo build -p inferno_coreaudio --example coreaudio_host
+          for attempt in $(seq 1 45); do
+            target/debug/examples/coreaudio_host --list | tee devices.txt
+            grep -q '"Inferno"' devices.txt && break
+            sleep 2
+          done
+          grep -q '"Inferno"' devices.txt || { cat /Library/Logs/Inferno/soundcard.log; echo "::error::the card didn't appear"; exit 1; }
+          sudo "/Library/Application Support/Inferno/uninstall.sh"
+          if launchctl print system/org.network-audio.inferno.soundcard >/dev/null 2>&1; then echo "::error::the service remained"; exit 1; fi
+          if [ -e /Library/Audio/Plug-Ins/HAL/Inferno.driver ]; then echo "::error::the plug-in remained"; exit 1; fi
+          echo 'installed, started, uninstalled'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inferno-soundcard-installer-macos
+          path: inferno-soundcard-macos.pkg
+          if-no-files-found: error
+
   publish:
-    needs: smoke-test
+    needs: [smoke-test, macos]
     if: github.ref_type == 'tag' || inputs.tag != ''
     runs-on: ubuntu-latest
     steps:
@@ -164,7 +212,7 @@ jobs:
           set -euo pipefail
           ls -l installers
           if gh release view "$TAG" > /dev/null 2>&1; then
-            gh release upload "$TAG" installers/*.exe --clobber
+            gh release upload "$TAG" installers/*.exe installers/*.pkg --clobber
           else
-            gh release create "$TAG" installers/*.exe --verify-tag --title "Inferno $TAG" --notes-file packaging/windows/RELEASE.md
+            gh release create "$TAG" installers/*.exe installers/*.pkg --verify-tag --title "Inferno $TAG" --notes-file packaging/windows/RELEASE.md
           fi

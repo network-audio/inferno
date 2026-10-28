@@ -66,11 +66,14 @@ jobs:
       - timeout-minutes: 10
         run: |
           installed=$([[ "${{ matrix.scenario }}" == soundcard* ]] && echo --installed-soundcard || true)
-          python test/e2e/run_e2e.py --scenario ${{ matrix.scenario }} --bin-dir target/debug --ips "$IPS" --out-dir e2e-out $installed
+          # as root: macOS's local network privacy blocks the runner's processes from multicast ("No route to
+          # host"); root processes (and launchd daemons, like the sound card service) are allowed
+          sudo -E env "PATH=$PATH" python test/e2e/run_e2e.py --scenario ${{ matrix.scenario }} --bin-dir target/debug --ips "$IPS" --out-dir e2e-out $installed
       - name: Collect the system's logs
         if: failure()
         run: |
-          mkdir -p e2e-out
+          sudo mkdir -p e2e-out
+          sudo chown -R "$(id -u)" e2e-out
           cp "/Library/Logs/Inferno/soundcard.log" e2e-out/ 2>/dev/null || true
           log show --last 20m --style compact --predicate 'eventMessage CONTAINS "Inferno" OR process == "coreaudiod" OR process CONTAINS "Core Audio"' > e2e-out/system.log || true
           tail -n 200 e2e-out/system.log || true
