@@ -51,13 +51,16 @@ impl<'a> CardIo<'a> {
     let header = self.region.header();
     let start = position + header.playback_lead as usize;
     let written = self.region.playback_written();
+    let mut dropped = false;
     for i in 0..channels {
       let ch = self.card.first_playback as usize + i;
       let ring = self.region.playback_ring(ch);
-      write_playback(ring, &written[ch], start, frames, |f| f32_to_sample(mix[f * channels + i] * gain));
+      dropped |= !write_playback(ring, &written[ch], start, frames, |f| {
+        f32_to_sample(mix[f * channels + i] * gain)
+      });
     }
     // the transmitter reads a position as soon as it's due: audio written after that goes out as silence
-    if now.is_some_and(|now| now as isize - start as isize > 0) {
+    if dropped || now.is_some_and(|now| now as isize - start as isize > 0) {
       header.late_playback.fetch_add(1, Ordering::Relaxed);
     }
   }

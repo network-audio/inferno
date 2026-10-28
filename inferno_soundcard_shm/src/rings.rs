@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 /// Writes `frames` frames of playback at position `start` of `ring` (`sample(i)`: the `i`th), where the
 /// transmitter will read them, and that `written` is past them. Where the card hasn't played since the end of
 /// the last write (after a pause or a stall), the positions in between count as written: they're silence,
-/// not what the ring held a cycle ago.
+/// not what the ring held a cycle ago. Frames more than half a ring behind what's written (the audio API's
+/// timeline jumped back) aren't written: their slots of the ring hold what's about to be transmitted. Returns
+/// whether they were written.
 #[inline]
 pub fn write_playback(
   ring: &[AtomicI32],
@@ -14,9 +16,13 @@ pub fn write_playback(
   start: usize,
   frames: usize,
   mut sample: impl FnMut(usize) -> i32,
-) {
+) -> bool {
   let mask = ring.len() - 1;
-  let gap = start.saturating_sub(written.load(Ordering::Acquire)).min(ring.len());
+  let last = written.load(Ordering::Acquire);
+  if start + frames + ring.len() / 2 < last {
+    return false;
+  }
+  let gap = start.saturating_sub(last).min(ring.len());
   for p in start - gap..start {
     ring[p & mask].store(0, Ordering::Relaxed);
   }
@@ -24,6 +30,7 @@ pub fn write_playback(
     ring[(start + f) & mask].store(sample(f), Ordering::Relaxed);
   }
   written.store(start + frames, Ordering::Release);
+  true
 }
 
 /// Reads `frames` frames from position `start` of `ring` (`put(i, sample)`: the `i`th), as far as the receiver
@@ -79,6 +86,19 @@ mod tests {
     let mut dst = [9; 4];
     assert_eq!(copy_captured(&r, 0, 100, &mut dst), 4);
     assert_eq!(copy_captured(&r, 1000, 100, &mut dst), 4, "readable more than a ring ahead");
+  }
+
+  #[test]
+  fn playback_far_behind_what_was_written_is_dropped() {
+    // e.g. the audio API's timeline jumped back: those slots of the ring hold what's about to be transmitted
+    let r = ring(&[0; 64]);
+    let written = AtomicUsize::new(0);
+    write_playback(&r, &written, 1000, 8, |_| 1);
+    assert!(!write_playback(&r, &written, 1000 - 64, 8, |_| 2), "a ring behind");
+    assert!(r.iter().all(|s| s.load(Ordering::Relaxed) != 2), "nothing overwritten");
+    assert_eq!(written.load(Ordering::Relaxed), 1008);
+    assert!(write_playback(&r, &written, 1004, 8, |_| 3), "overlapping the last write: written again");
+    assert_eq!(written.load(Ordering::Relaxed), 1012);
   }
 
   #[test]

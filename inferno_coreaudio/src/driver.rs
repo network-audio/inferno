@@ -488,6 +488,30 @@ fn load_controls(set: &DeviceSet) {
   }
 }
 
+/// Reads of a clock pair this far apart (ns) are of the same instant, near enough.
+const PAIR_WINDOW_NS: f64 = 2000.0;
+
+/// The underlying clock `clock_id` (ns) and the host time (Mach absolute time) at nearly the same instant:
+/// read between two reads of the host time, the closest pair of a few tries. A thread preempted between two
+/// reads would otherwise give a time stamp off by as long, which Core Audio may take for another period.
+fn clock_pair(clock_id: i64) -> (i64, u64) {
+  let mut best = (u64::MAX, 0, 0);
+  for _ in 0..8 {
+    // safety: no arguments, always succeeds
+    let before = unsafe { mach2::mach_time::mach_absolute_time() };
+    let underlying = underlying_now_ns(clock_id);
+    let after = unsafe { mach2::mach_time::mach_absolute_time() };
+    let window = after.saturating_sub(before);
+    if window < best.0 {
+      best = (window, underlying, before + window / 2);
+    }
+    if (window as f64) < PAIR_WINDOW_NS * ticks_per_ns() {
+      break;
+    }
+  }
+  (best.1, best.2)
+}
+
 /// Host time (Mach absolute time) units per nanosecond.
 fn ticks_per_ns() -> f64 {
   static TIMEBASE: OnceLock<f64> = OnceLock::new();
@@ -553,8 +577,7 @@ unsafe extern "C" fn get_zero_time_stamp(
         origin: io.origin.load(Ordering::Acquire),
         period: ZERO_TIME_STAMP_PERIOD as usize,
       };
-      let underlying = underlying_now_ns(overlay.clock_id);
-      let host_now = mach2::mach_time::mach_absolute_time();
+      let (underlying, host_now) = clock_pair(overlay.clock_id);
       let (sample_time, until_ns) = stamps.latest(&overlay, underlying);
       let host = (host_now as f64 + until_ns as f64 * ticks_per_ns()).max(0.0) as u64;
       (sample_time, host)

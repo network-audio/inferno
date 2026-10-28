@@ -143,9 +143,14 @@ impl Uac2Streams for CardStreams {
     let header = region.header();
     let start = frame as usize + header.playback_lead as usize;
     let frames = samples.len() / channels;
+    let mut dropped = false;
     for (i, ch) in self.playback.clone().enumerate() {
       let written = &region.playback_written()[ch];
-      write_playback(region.playback_ring(ch), written, start, frames, |f| samples[f * channels + i]);
+      dropped |=
+        !write_playback(region.playback_ring(ch), written, start, frames, |f| samples[f * channels + i]);
+    }
+    if dropped {
+      warn!("playback {frames} frames from position {start} far behind what's been played: dropped");
     }
     // the transmitter reads a position as soon as it's due: audio written after that goes out as silence
     if let Some(now) = self.shared.clock.position() {
