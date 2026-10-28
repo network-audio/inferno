@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>org.network-audio.inferno.soundcard</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Library/Application Support/Inferno/bin/inferno_soundcard</string>
+	</array>
+	<!-- the Core Audio plug-in gets the cards from it -->
+	<key>MachServices</key>
+	<dict>
+		<key>org.network-audio.inferno.soundcard</key>
+		<true/>
+	</dict>
+	<!-- an account of its own, without privileges -->
+	<key>UserName</key>
+	<string>_inferno</string>
+	<key>GroupName</key>
+	<string>_inferno</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<!-- the Dante device's saved state is under it -->
+		<key>HOME</key>
+		<string>/Library/Application Support/Inferno</string>
+		<key>RUST_LOG</key>
+		<string>info</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<!-- audio: not throttled like background jobs -->
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>StandardOutPath</key>
+	<string>/Library/Logs/Inferno/soundcard.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Library/Logs/Inferno/soundcard.log</string>
+</dict>
+</plist>

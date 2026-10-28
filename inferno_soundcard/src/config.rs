@@ -107,6 +107,10 @@ impl Config {
     if let Some(name) = self.name.as_deref().filter(|n| !n.trim().is_empty()) {
       config.insert("NAME".into(), name.trim().into());
     }
+    // Inferno's own PTPv1 follower, as on Windows: no PTP daemon to install (the Unix default is Statime)
+    if cfg!(target_os = "macos") && std::env::var_os("INFERNO_CLOCK_SOURCE").is_none() {
+      config.entry("CLOCK_SOURCE".into()).or_insert_with(|| "ptpv1".into());
+    }
     let unknown = Settings::unknown_keys(&config, &["SOUNDCARD_CONFIG"]);
     if !unknown.is_empty() {
       return Err(format!("unknown settings: {}", unknown.join(", ")));
@@ -221,6 +225,14 @@ mod tests {
       }]
     );
     config.validate().unwrap();
+  }
+
+  #[test]
+  #[cfg(any(windows, target_os = "macos"))]
+  fn the_clock_is_inferno_s_own_ptpv1_follower() {
+    use inferno_aoip::clock::ClockSourceKind;
+    let settings = Config::default().device_settings().unwrap();
+    assert_eq!(settings.clock_source, ClockSourceKind::Ptpv1);
   }
 
   #[test]

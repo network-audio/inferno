@@ -37,5 +37,5 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build -p inferno_aoip -p inferno_driver_core -p inferno2pipe -p pipe2inferno -p asio_inferno -p inferno_soundcard --all-targets --examples
-      - run: cargo test --no-fail-fast -p inferno_aoip -p inferno_driver_core -p asio_inferno -p inferno_soundcard -- --test-threads=1
+      - run: cargo build -p inferno_aoip -p inferno_driver_core -p inferno2pipe -p pipe2inferno -p asio_inferno -p inferno_soundcard -p inferno_soundcard_shm -p inferno_coreaudio --all-targets --examples
+      - run: cargo test --no-fail-fast -p inferno_aoip -p inferno_driver_core -p asio_inferno -p inferno_soundcard -p inferno_soundcard_shm -p inferno_coreaudio -- --test-threads=1

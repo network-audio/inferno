@@ -1,4 +1,4 @@
-"""End-to-end tests of Inferno on Windows, routed with netaudio like the Linux Docker test
+"""End-to-end tests of Inferno on Windows and macOS, routed with netaudio like the Linux Docker test
 (test/dockerized_trx). Recordings must match their sources exactly for 15 s, with nothing but silence or skips
 (a stalled runner) elsewhere. Exits with the test result.
 
@@ -10,12 +10,15 @@ Scenarios:
   exclusive mode by a minimal WASAPI application (the `wasapi_host` example): Pipe2inferno -> the card's
   microphone, recorded; another signal played to the card's speakers -> Inferno2pipe
 * soundcard-44k: as soundcard, with the devices at 44.1 kHz (the card's microframes carry 5 or 6 frames)
+* on macOS, soundcard and soundcard-44k use the installed sound card service (a launchd daemon, see
+  packaging/macos: --installed-soundcard) and its Core Audio plug-in, played and recorded by a minimal Core
+  Audio application (the `coreaudio_host` example)
 * pipe-leader: as pipe, without the simulated leader: one of the devices (leader candidates by default,
   CLOCK_LEADER=auto) leads the clock
 
 Devices run on this host, each on an IP address of its own if given several (netaudio 0.4 keys devices by
 IP). Each follows the clock of a simulated PTPv1 leader (the `ptpv1_test_leader` example) with its own
-PTPv1 follower, Inferno's default clock source on Windows (except in pipe-leader).
+PTPv1 follower, Inferno's default clock source on Windows (and set here on macOS; except in pipe-leader).
 
 Usage: python run_e2e.py --scenario pipe --bin-dir target/debug --ips 10.213.77.1,10.213.77.2,10.213.77.3 --out-dir e2e-out
 """
@@ -25,6 +28,7 @@ import array
 import json
 import os
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -43,6 +47,10 @@ RX_NAME = "wine2erx"
 ASIO_NAME = "wine2easio"
 CARD_DEVICE_NAME = "wine2ecard"
 CARD_NAME = "Inferno E2E"
+# the installed sound card service (macOS)
+SERVICE_LABEL = "system/org.network-audio.inferno.soundcard"
+SERVICE_CONFIG = Path("/Library/Application Support/Inferno/soundcard.json")
+SERVICE_LOG = Path("/Library/Logs/Inferno/soundcard.log")
 
 
 def log(message):
@@ -78,6 +86,9 @@ def device_env(name, ip, process_id):
         # gaps filled with silence: normal when a stream starts, a dropout later
         "RUST_LOG": env.get("RUST_LOG", "info,inferno_aoip::ring_buffer=debug"),
     })
+    if sys.platform == "darwin":
+        # usrvclock (Statime) is the default on Unix
+        env["INFERNO_CLOCK_SOURCE"] = "ptpv1"
     return env
 
 
@@ -333,6 +344,17 @@ def asio_scenario(args, procs, exe):
     return check_recording(from_asio, rx_recording, "ASIO driver outputs -> Inferno2pipe") and ok
 
 
+def start_installed_soundcard(config, env):
+    """Restarts the installed sound card service (macOS) with `config`, its device settings those of `env`
+    (it's started by launchd, without our environment)."""
+    settings = {k[len("INFERNO_"):]: v for k, v in env.items() if k.startswith("INFERNO_") and k != "INFERNO_NAME"}
+    config = dict(config, name=env["INFERNO_NAME"], settings=settings)
+    subprocess.run(["sudo", "tee", str(SERVICE_CONFIG)], input=json.dumps(config, indent=2), text=True,
+                   check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["sudo", "truncate", "-s", "0", str(SERVICE_LOG)], check=True)
+    subprocess.run(["sudo", "launchctl", "kickstart", "-k", SERVICE_LABEL], check=True)
+
+
 def soundcard_scenario(args, procs, exe):
     out = args.out_dir
     ip = lambda i: args.ips[i % len(args.ips)]
@@ -340,54 +362,68 @@ def soundcard_scenario(args, procs, exe):
     from_card = write_source(out / "from_card.raw", seed=5678)
     card_recording = out / "card_recording.raw"
     rx_recording = out / "rx_recording.raw"
-    stop_file = out / "stop-wasapi-host"
-    config = out / "soundcard.json"
+    stop_file = out / "stop-host"
     # the runners' audio engine stalls for 10-15 ms now and then
-    config.write_text(json.dumps({"cards": [{"name": CARD_NAME, "playback_channels": CHANNELS,
-                                             "capture_channels": CHANNELS}],
-                                  "playback_margin_ms": 30}))
+    config = {"cards": [{"name": CARD_NAME, "playback_channels": CHANNELS, "capture_channels": CHANNELS}],
+              "playback_margin_ms": 30}
     procs.start("tx", [args.bin_dir / f"pipe2inferno{exe}", "-c", str(CHANNELS), "-i", out / "to_card.raw"],
                 device_env(TX_NAME, ip(0), 1))
-    procs.start("soundcard", [args.bin_dir / f"inferno_soundcard{exe}", "--no-tray"],
-                dict(device_env(CARD_DEVICE_NAME, ip(1), 3), INFERNO_SOUNDCARD_CONFIG=str(config)))
-    host = procs.start("wasapi_host", [args.bin_dir / "examples" / f"wasapi_host{exe}", "--card", CARD_NAME,
-                                       "--channels", str(CHANNELS), "--rate", str(SAMPLE_RATE),
-                                       "--play", out / "from_card.raw",
-                                       "--record", card_recording, "--seconds", "300", "--until-file", stop_file],
+    card_env = device_env(CARD_DEVICE_NAME, ip(1), 3)
+    if args.installed_soundcard:
+        start_installed_soundcard(config, card_env)
+        card_log = SERVICE_LOG
+        host_name = "coreaudio_host"
+        host_command = [args.bin_dir / "examples" / "coreaudio_host", "--card", CARD_NAME,
+                        "--channels", str(CHANNELS)]
+    else:
+        config_path = out / "soundcard.json"
+        config_path.write_text(json.dumps(config))
+        procs.start("soundcard", [args.bin_dir / f"inferno_soundcard{exe}", "--no-tray"],
+                    dict(card_env, INFERNO_SOUNDCARD_CONFIG=str(config_path)))
+        card_log = out / "soundcard.log"
+        host_name = "wasapi_host"
+        host_command = [args.bin_dir / "examples" / f"wasapi_host{exe}", "--card", CARD_NAME,
+                        "--channels", str(CHANNELS), "--rate", str(SAMPLE_RATE)]
+    host = procs.start(host_name, host_command + ["--play", out / "from_card.raw", "--record", card_recording,
+                                                  "--seconds", "300", "--until-file", stop_file],
                        dict(os.environ))
     rx = procs.start("rx", [args.bin_dir / f"inferno2pipe{exe}", "-c", str(CHANNELS), "-o", rx_recording],
                      device_env(RX_NAME, ip(2), 2))
-    start = time.time()
-    if not wait_for_devices([TX_NAME, CARD_DEVICE_NAME, RX_NAME], start + DISCOVERY_TIMEOUT):
-        log("❌ devices not discovered in time")
-        return False
-    log(f"✅ devices discovered ({time.time() - start:.0f} s)")
-    if not check_clock([out / "tx.log", out / "rx.log", out / "soundcard.log"]):
-        return False
-    if not subscribe(TX_NAME, CARD_DEVICE_NAME) or not subscribe(CARD_DEVICE_NAME, RX_NAME):
-        return False
-    if not check_subscribed([CARD_DEVICE_NAME, RX_NAME]):
-        return False
-    log("✅ subscribed")
-    time.sleep(RECORD_SECONDS)
-    if procs.exited():
-        log(f"❌ a process exited early: {procs.exited()}")
-        return False
-    # the recorder first: once the application stops, the card transmits silence
-    rx.kill()
-    rx.wait()
-    stop_file.write_text("stop")
     try:
-        code = host.wait(timeout=30)
-    except subprocess.TimeoutExpired:
-        log("❌ the WASAPI application didn't stop")
-        return False
-    log((out / "wasapi_host.log").read_text(errors="replace"))
-    if code != 0:
-        log(f"❌ the WASAPI application failed ({code})")
-        return False
-    ok = check_recording(to_card, card_recording, "Pipe2inferno -> sound card microphone")
-    return check_recording(from_card, rx_recording, "sound card speakers -> Inferno2pipe") and ok
+        start = time.time()
+        if not wait_for_devices([TX_NAME, CARD_DEVICE_NAME, RX_NAME], start + DISCOVERY_TIMEOUT):
+            log("❌ devices not discovered in time")
+            return False
+        log(f"✅ devices discovered ({time.time() - start:.0f} s)")
+        if not check_clock([out / "tx.log", out / "rx.log", card_log]):
+            return False
+        if not subscribe(TX_NAME, CARD_DEVICE_NAME) or not subscribe(CARD_DEVICE_NAME, RX_NAME):
+            return False
+        if not check_subscribed([CARD_DEVICE_NAME, RX_NAME]):
+            return False
+        log("✅ subscribed")
+        time.sleep(RECORD_SECONDS)
+        if procs.exited():
+            log(f"❌ a process exited early: {procs.exited()}")
+            return False
+        # the recorder first: once the application stops, the card transmits silence
+        rx.kill()
+        rx.wait()
+        stop_file.write_text("stop")
+        try:
+            code = host.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            log(f"❌ {host_name} didn't stop")
+            return False
+        log((out / f"{host_name}.log").read_text(errors="replace"))
+        if code != 0:
+            log(f"❌ {host_name} failed ({code})")
+            return False
+        ok = check_recording(to_card, card_recording, "Pipe2inferno -> sound card microphone")
+        return check_recording(from_card, rx_recording, "sound card speakers -> Inferno2pipe") and ok
+    finally:
+        if args.installed_soundcard:
+            shutil.copyfile(SERVICE_LOG, out / "soundcard.log")
 
 
 def main():
@@ -399,6 +435,8 @@ def main():
     parser.add_argument("--bin-dir", type=Path, required=True)
     parser.add_argument("--ips", required=True, help="comma-separated addresses of this host for the devices")
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--installed-soundcard", action="store_true",
+                        help="soundcard scenarios: use the installed sound card service (macOS)")
     args = parser.parse_args()
     args.ips = args.ips.split(",")
     if args.scenario == "soundcard-44k":

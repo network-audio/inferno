@@ -1,4 +1,5 @@
-End-to-end test of Inferno on Windows, run by `.github/workflows/windows-e2e.yml`.
+End-to-end tests of Inferno on Windows and macOS, run by `.github/workflows/windows-e2e.yml` and
+`.github/workflows/macos-e2e.yml`.
 
 [`pipe2inferno`](../../pipe2inferno) transmits 150 s of pseudo-random 24-bit audio, [`inferno2pipe`](../../inferno2pipe)
 receives it, routed with [netaudio](https://github.com/chris-ritsen/network-audio-controller) like the Linux
@@ -18,4 +19,11 @@ Run it yourself (Python 3, `pip install netaudio`, two addresses of this host):
 
     cargo build -p pipe2inferno -p inferno2pipe
     cargo build -p inferno_aoip --example ptpv1_test_leader
-    python test/windows_e2e/run_e2e.py --bin-dir target/debug --tx-ip <address> --rx-ip <address> --out-dir e2e-out
+    python test/e2e/run_e2e.py --scenario pipe --bin-dir target/debug --ips <address>,<address> --out-dir e2e-out
+
+The `soundcard` scenarios test the virtual sound cards (`inferno_soundcard`) with a minimal application of the
+operating system's audio API: on Windows the `wasapi_host` example in exclusive mode, the cards attached by
+usbip-win2; on macOS the `coreaudio_host` example, with the sound card service and its Core Audio plug-in
+installed from the package (`packaging/macos/build-pkg.sh`) and `--installed-soundcard`: the script restarts the
+service with its own settings (with `sudo`), and the application needs the microphone permission
+(`grant_microphone.py`, on CI runners).

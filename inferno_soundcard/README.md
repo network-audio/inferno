@@ -38,5 +38,5 @@ Only pages from the settings page itself can change the settings. Requests must 
 `cargo run -p inferno_soundcard -- --no-tray` runs the service without the tray icon. Without usbip-win2 it serves the cards but doesn't attach them.
 
 - `tests/usbip_loopback.rs`, on any platform: a USB/IP client in place of Windows plays and records through a card, bit-exact both ways, with Inferno devices transmitting to and receiving from it.
-- The Windows end-to-end test's `soundcard` scenario (`test/windows_e2e`) installs usbip-win2 and plays and records with the `wasapi_host` example, in exclusive mode, bit-exact.
+- The Windows end-to-end test's `soundcard` scenario (`test/e2e`) installs usbip-win2 and plays and records with the `wasapi_host` example, in exclusive mode, bit-exact.
 - The release workflow builds the installers, installs and uninstalls them on x64 and ARM64, and publishes them for `v*` tags.
