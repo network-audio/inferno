@@ -97,6 +97,12 @@ pub const kAudioFormatLinearPCM: u32 = fourcc(b"lpcm");
 pub const kAudioFormatFlagIsFloat: u32 = 1 << 0;
 pub const kAudioFormatFlagIsPacked: u32 = 1 << 3;
 
+// clients' (the end-to-end test's application)
+pub const kAudioObjectSystemObject: AudioObjectID = 1;
+pub const kAudioHardwarePropertyDevices: u32 = fourcc(b"dev#");
+pub const kAudioDevicePropertyStreamConfiguration: u32 = fourcc(b"slay");
+pub const kAudioDevicePropertyBufferFrameSize: u32 = fourcc(b"fsiz");
+
 // I/O operations
 pub const kAudioServerPlugInIOOperationReadInput: u32 = fourcc(b"read");
 pub const kAudioServerPlugInIOOperationWriteMix: u32 = fourcc(b"rite");
@@ -168,11 +174,11 @@ pub struct AudioTimeStamp {
 pub struct AudioServerPlugInIOCycleInfo {
   pub mIOCycleCounter: u64,
   pub mNominalIOBufferFrameSize: u32,
+  pub mCurrentTime: AudioTimeStamp,
   pub mInputTime: AudioTimeStamp,
   pub mOutputTime: AudioTimeStamp,
-  pub mMainHostTime: AudioTimeStamp,
-  pub mDeviceHostTime: AudioTimeStamp,
-  pub mCurrentTime: AudioTimeStamp,
+  pub mMainHostTicksPerFrame: f64,
+  pub mDeviceHostTicksPerFrame: f64,
 }
 
 /// `CFUUIDBytes`, as COM's `REFIID`.
@@ -333,8 +339,9 @@ mod tests {
     assert_eq!(size_of::<AudioStreamBasicDescription>(), 40);
     assert_eq!(size_of::<AudioStreamRangedDescription>(), 56);
     assert_eq!(size_of::<AudioTimeStamp>(), 64);
-    assert_eq!(size_of::<AudioServerPlugInIOCycleInfo>(), 16 + 5 * 64);
-    assert_eq!(std::mem::offset_of!(AudioServerPlugInIOCycleInfo, mInputTime), 16);
+    assert_eq!(size_of::<AudioServerPlugInIOCycleInfo>(), 224);
+    assert_eq!(std::mem::offset_of!(AudioServerPlugInIOCycleInfo, mInputTime), 80);
+    assert_eq!(std::mem::offset_of!(AudioServerPlugInIOCycleInfo, mOutputTime), 144);
     assert_eq!(size_of::<AudioServerPlugInDriverInterface>(), 23 * size_of::<usize>());
     assert_eq!(fourcc(b"aobj"), 0x616f626a);
   }

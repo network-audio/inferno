@@ -38,11 +38,6 @@ mod host {
   use inferno_coreaudio::abi::*;
   use inferno_soundcard_shm::{f32_to_sample, sample_to_f32};
 
-  const kAudioObjectSystemObject: AudioObjectID = 1;
-  const kAudioHardwarePropertyDevices: u32 = fourcc(b"dev#");
-  const kAudioDevicePropertyStreamConfiguration: u32 = fourcc(b"slay");
-  const kAudioDevicePropertyBufferFrameSize: u32 = fourcc(b"fsiz");
-
   #[repr(C)]
   struct AudioBuffer {
     mNumberChannels: u32,
