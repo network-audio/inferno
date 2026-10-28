@@ -555,12 +555,22 @@ unsafe extern "C" fn do_io_operation(
       kAudioServerPlugInIOOperationReadInput => {
         let channels = card.info().capture_channels as usize;
         let buffer = std::slice::from_raw_parts_mut(main as *mut f32, frames * channels);
-        card.read_input(at(&(*cycle).mInputTime), frames, buffer);
+        let position = at(&(*cycle).mInputTime);
+        let first = card.info().first_capture as usize;
+        let readable = set.region.capture_readable()[first].load(Ordering::Relaxed);
+        device.io.timing.input(readable as i64 - (position + frames) as i64);
+        card.read_input(position, frames, buffer);
       }
       kAudioServerPlugInIOOperationWriteMix => {
         let channels = card.info().playback_channels as usize;
         let buffer = std::slice::from_raw_parts(main as *const f32, frames * channels);
-        card.write_mix(at(&(*cycle).mOutputTime), frames, buffer, set.region.position_now());
+        let position = at(&(*cycle).mOutputTime);
+        let now = set.region.position_now();
+        if let Some(now) = now {
+          let lead = set.region.header().playback_lead as usize;
+          device.io.timing.output((position + lead) as i64 - now as i64);
+        }
+        card.write_mix(position, frames, buffer, now);
       }
       _ => {}
     }
@@ -634,6 +644,8 @@ fn connect() -> Result<Option<Region>, String> {
 fn connection() {
   // what was last logged, not to log it again and again
   let mut last = String::new();
+  // the I/O cycles' timing is logged every 5 s
+  let mut logged = 0u64;
   let mut report = |message: String, error: bool| {
     if last != message {
       log(error, &message);
@@ -666,6 +678,15 @@ fn connection() {
           set_devices(None);
         } else {
           std::thread::sleep(Duration::from_millis(100));
+          logged += 1;
+          if logged % 50 == 0 {
+            let cards = set.region.header().cards();
+            for device in &set.devices {
+              if let Some(timing) = device.io.timing.take() {
+                log(false, &format!("{}: {timing}", cards[device.card].name()));
+              }
+            }
+          }
         }
       }
     }

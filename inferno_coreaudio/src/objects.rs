@@ -7,7 +7,7 @@
 #![allow(non_upper_case_globals)] // Core Audio's names
 
 use std::sync::{
-  atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+  atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering},
   Arc,
 };
 
@@ -39,6 +39,60 @@ pub struct Io {
   pub seed: AtomicU64,
   pub last_sample_time: AtomicU64,
   pub last_host_time: AtomicU64,
+  /// how the I/O cycles fit the media clock, logged now and then
+  pub timing: Timing,
+}
+
+/// The least and most frames, since last taken, that the playback written was ahead of when the transmitter
+/// reads it, and that the receiver had received beyond the input read (negative: late).
+pub struct Timing {
+  pub cycles: AtomicU64,
+  pub output_min: AtomicI64,
+  pub output_max: AtomicI64,
+  pub input_min: AtomicI64,
+  pub input_max: AtomicI64,
+}
+
+impl Default for Timing {
+  fn default() -> Self {
+    Self {
+      cycles: AtomicU64::new(0),
+      output_min: AtomicI64::new(i64::MAX),
+      output_max: AtomicI64::new(i64::MIN),
+      input_min: AtomicI64::new(i64::MAX),
+      input_max: AtomicI64::new(i64::MIN),
+    }
+  }
+}
+
+impl Timing {
+  pub fn output(&self, ahead: i64) {
+    self.cycles.fetch_add(1, Ordering::Relaxed);
+    self.output_min.fetch_min(ahead, Ordering::Relaxed);
+    self.output_max.fetch_max(ahead, Ordering::Relaxed);
+  }
+
+  pub fn input(&self, received: i64) {
+    self.input_min.fetch_min(received, Ordering::Relaxed);
+    self.input_max.fetch_max(received, Ordering::Relaxed);
+  }
+
+  /// What was recorded since last taken, if anything.
+  pub fn take(&self) -> Option<String> {
+    let cycles = self.cycles.swap(0, Ordering::Relaxed);
+    let range = |min: &AtomicI64, max: &AtomicI64| {
+      let (min, max) = (min.swap(i64::MAX, Ordering::Relaxed), max.swap(i64::MIN, Ordering::Relaxed));
+      if min == i64::MAX {
+        "-".to_string()
+      } else {
+        format!("{min}..{max}")
+      }
+    };
+    let output = range(&self.output_min, &self.output_max);
+    let input = range(&self.input_min, &self.input_max);
+    (cycles > 0)
+      .then(|| format!("{cycles} cycles, playback ahead {output} frames, input received ahead {input}"))
+  }
 }
 
 pub struct Device {
