@@ -253,28 +253,39 @@ unsafe fn string_of(s: CFStringRef) -> Option<String> {
   String::from_utf8(buffer).ok()
 }
 
-/// The value of a property, with the UID of `kAudioPlugInPropertyTranslateUIDToDevice` from its qualifier.
+/// The value of a property: with the UID of `kAudioPlugInPropertyTranslateUIDToDevice` from its qualifier,
+/// and the value a level control converts from its data (`data`, converted in place), if given.
 unsafe fn value_of(
   object: AudioObjectID,
   address: &AudioObjectPropertyAddress,
   qualifier_size: u32,
   qualifier: *const c_void,
+  data: Option<(u32, *const c_void)>,
 ) -> Result<Value, OSStatus> {
-  let uid = if address.mSelector == kAudioPlugInPropertyTranslateUIDToDevice {
-    if qualifier.is_null() || (qualifier_size as usize) < size_of::<CFStringRef>() {
-      return Err(kAudioHardwareBadPropertySizeError);
+  let uid;
+  let input = match address.mSelector {
+    kAudioPlugInPropertyTranslateUIDToDevice => {
+      if qualifier.is_null() || (qualifier_size as usize) < size_of::<CFStringRef>() {
+        return Err(kAudioHardwareBadPropertySizeError);
+      }
+      uid = string_of(*(qualifier as *const CFStringRef));
+      uid.as_deref().map_or(Input::None, Input::Uid)
     }
-    string_of(*(qualifier as *const CFStringRef))
-  } else {
-    None
+    kAudioLevelControlPropertyConvertScalarToDecibels
+    | kAudioLevelControlPropertyConvertDecibelsToScalar => match data {
+      Some((size, data)) if size as usize >= size_of::<f32>() => Input::Value(*(data as *const f32)),
+      Some(_) => return Err(kAudioHardwareBadPropertySizeError),
+      None => Input::Value(0.0),
+    },
+    _ => Input::None,
   };
-  property(current().as_deref(), object, address, uid.as_deref())
+  property(current().as_deref(), object, address, input)
 }
 
 /// Bytes of a value: of each element of a list, and of all of it.
 fn sizes(value: &Value) -> (usize, usize) {
   match value {
-    Value::U32(_) => (4, 4),
+    Value::U32(_) | Value::F32(_) => (4, 4),
     Value::F64(_) => (8, 8),
     Value::String(_) => (size_of::<CFStringRef>(), size_of::<CFStringRef>()),
     Value::U32s(v) => (4, 4 * v.len()),
@@ -301,7 +312,7 @@ unsafe extern "C" fn get_property_data_size(
     if address.is_null() || out_size.is_null() {
       return kAudioHardwareIllegalOperationError;
     }
-    match value_of(object, &*address, qualifier_size, qualifier) {
+    match value_of(object, &*address, qualifier_size, qualifier, None) {
       Ok(value) => {
         *out_size = sizes(&value).1 as u32;
         kAudioHardwareNoError
@@ -333,7 +344,7 @@ unsafe extern "C" fn get_property_data(
     if address.is_null() || out_size.is_null() || out.is_null() {
       return kAudioHardwareIllegalOperationError;
     }
-    let value = match value_of(object, &*address, qualifier_size, qualifier) {
+    let value = match value_of(object, &*address, qualifier_size, qualifier, Some((size, out))) {
       Ok(value) => value,
       Err(e) => return e,
     };
@@ -344,6 +355,7 @@ unsafe extern "C" fn get_property_data(
     }
     *out_size = match &value {
       Value::U32(v) => write_items(&[*v], size, out),
+      Value::F32(v) => write_items(&[*v], size, out),
       Value::F64(v) => write_items(&[*v], size, out),
       // the caller releases it
       Value::String(s) => write_items(&[cf_string(s)], size, out),
@@ -380,6 +392,14 @@ unsafe extern "C" fn set_property_data(
       {
         Value::Format(*(data as *const AudioStreamBasicDescription))
       }
+      kAudioLevelControlPropertyScalarValue | kAudioLevelControlPropertyDecibelValue
+        if size as usize >= size_of::<f32>() =>
+      {
+        Value::F32(*(data as *const f32))
+      }
+      kAudioBooleanControlPropertyValue if size as usize >= size_of::<u32>() => {
+        Value::U32(*(data as *const u32))
+      }
       _ => {
         return match is_settable(current().as_deref(), object, address) {
           Ok(_) => kAudioHardwareUnsupportedOperationError,
@@ -387,11 +407,85 @@ unsafe extern "C" fn set_property_data(
         }
       }
     };
-    match set_property(current().as_deref(), object, address, &value) {
-      Ok(()) => kAudioHardwareNoError,
+    let set = current();
+    match set_property(set.as_deref(), object, address, &value) {
+      Ok(changed_selectors) => {
+        if !changed_selectors.is_empty() {
+          changed(object, &changed_selectors);
+          if let Some(set) = &set {
+            save_controls(set, object);
+          }
+        }
+        kAudioHardwareNoError
+      }
       Err(e) => e,
     }
   })
+}
+
+/// The host (Core Audio), if the plug-in has been initialized.
+fn host() -> Option<HostRef> {
+  let host = HOST.load(Ordering::Acquire);
+  (!host.is_null()).then_some(host as HostRef)
+}
+
+/// Saves the control `object`'s value in Core Audio's storage for the plug-in, to have it again when the card
+/// is back (a new configuration, a restart).
+fn save_controls(set: &DeviceSet, object: AudioObjectID) {
+  let Some(host) = host() else { return };
+  let Some(Object::Control(device, direction, kind)) = set.object(object) else { return };
+  let level = device.level(direction);
+  let value = match kind {
+    ControlKind::Volume => level.scalar(),
+    ControlKind::Mute => level.muted() as u32 as f32,
+  };
+  let key = storage_key(set.region.header().cards()[device.card].uid(), direction, kind);
+  let key = cf_string(&key);
+  // safety: a valid key and number; the host keeps its own reference
+  unsafe {
+    let number =
+      CFNumberCreate(std::ptr::null(), kCFNumberFloat32Type, &value as *const f32 as *const c_void);
+    ((*host).WriteToStorage)(host, key, number);
+    CFRelease(number);
+    CFRelease(key);
+  }
+}
+
+/// A value saved by `save_controls`.
+fn saved(host: HostRef, key: &str) -> Option<f32> {
+  let key = cf_string(key);
+  let mut data: CFPropertyListRef = std::ptr::null();
+  // safety: a valid key; the copy is ours to release
+  unsafe {
+    let status = ((*host).CopyFromStorage)(host, key, &mut data);
+    CFRelease(key);
+    if status != kAudioHardwareNoError || data.is_null() {
+      return None;
+    }
+    let mut value = 0f32;
+    let ok = CFGetTypeID(data) == CFNumberGetTypeID()
+      && CFNumberGetValue(data, kCFNumberFloat32Type, &mut value as *mut f32 as *mut c_void) != 0;
+    CFRelease(data);
+    ok.then_some(value)
+  }
+}
+
+/// The cards' controls as they were saved.
+fn load_controls(set: &DeviceSet) {
+  let Some(host) = host() else { return };
+  let cards = set.region.header().cards();
+  for device in &set.devices {
+    for &(_, direction, kind) in &device.controls {
+      let Some(value) = saved(host, &storage_key(cards[device.card].uid(), direction, kind)) else {
+        continue;
+      };
+      let level = device.level(direction);
+      match kind {
+        ControlKind::Volume => level.set_scalar(value),
+        ControlKind::Mute => level.set_muted(value != 0.0),
+      }
+    }
+  }
 }
 
 /// Host time (Mach absolute time) units per nanosecond.
@@ -559,7 +653,7 @@ unsafe extern "C" fn do_io_operation(
         let first = card.info().first_capture as usize;
         let readable = set.region.capture_readable()[first].load(Ordering::Relaxed);
         device.io.timing.input(readable as i64 - (position + frames) as i64);
-        card.read_input(position, frames, buffer);
+        card.read_input(position, frames, buffer, device.input_level.gain());
       }
       kAudioServerPlugInIOOperationWriteMix => {
         let channels = card.info().playback_channels as usize;
@@ -570,7 +664,7 @@ unsafe extern "C" fn do_io_operation(
           let lead = set.region.header().playback_lead as usize;
           device.io.timing.output((position + lead) as i64 - now as i64);
         }
-        card.write_mix(position, frames, buffer, now);
+        card.write_mix(position, frames, buffer, now, device.output_level.gain());
       }
       _ => {}
     }
@@ -658,6 +752,7 @@ fn connection() {
         Ok(Some(region)) => {
           let set = DeviceSet::new(Arc::new(region), NEXT_ID.load(Ordering::Relaxed));
           NEXT_ID.store(set.next_id(), Ordering::Relaxed);
+          load_controls(&set);
           let names: Vec<_> = set.region.header().cards().iter().map(|c| c.name().to_string()).collect();
           report(format!("the sound cards: {}", names.join(", ")), false);
           set_devices(Some(set));

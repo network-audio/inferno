@@ -60,6 +60,26 @@ jobs:
           done
           cat "/Library/Logs/Inferno/soundcard.log"
           grep -q '"Inferno"' devices.txt || { echo "::error::the sound card didn't appear in Core Audio"; exit 1; }
+      - name: Volume and mute, as System Settings sets them
+        if: startsWith(matrix.scenario, 'soundcard')
+        timeout-minutes: 5
+        run: |
+          host=target/debug/examples/coreaudio_host
+          $host --card Inferno --volume 0.5 --mute 1 | tee volume.txt
+          grep -q 'volume 0.5, mute 1' volume.txt || { echo "::error::the output volume wasn't set"; exit 1; }
+          $host --card Inferno --input --volume 0.25 | grep -q 'volume 0.25, mute 0' || { echo "::error::the input volume wasn't set"; exit 1; }
+          # remembered when the card comes back (the service restarted)
+          sudo launchctl kickstart -k system/org.network-audio.inferno.soundcard
+          sleep 5
+          for attempt in $(seq 1 45); do
+            $host --card Inferno --volume > volume.txt 2>&1 && break
+            sleep 2
+          done
+          cat volume.txt
+          grep -q 'volume 0.5, mute 1' volume.txt || { echo "::error::the volume wasn't remembered"; exit 1; }
+          $host --card Inferno --input --volume | grep -q 'volume 0.25' || { echo "::error::the input volume wasn't remembered"; exit 1; }
+          $host --card Inferno --volume 1 --mute 0
+          $host --card Inferno --input --volume 1
       - name: Allow recording
         if: startsWith(matrix.scenario, 'soundcard')
         run: sudo python3 test/e2e/grant_microphone.py "$PWD/target/debug/examples/coreaudio_host" /bin/bash

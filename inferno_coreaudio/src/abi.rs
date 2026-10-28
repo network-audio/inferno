@@ -39,6 +39,11 @@ pub const kAudioObjectClassID: u32 = fourcc(b"aobj");
 pub const kAudioPlugInClassID: u32 = fourcc(b"aplg");
 pub const kAudioDeviceClassID: u32 = fourcc(b"adev");
 pub const kAudioStreamClassID: u32 = fourcc(b"astr");
+pub const kAudioControlClassID: u32 = fourcc(b"actl");
+pub const kAudioLevelControlClassID: u32 = fourcc(b"levl");
+pub const kAudioBooleanControlClassID: u32 = fourcc(b"togl");
+pub const kAudioVolumeControlClassID: u32 = fourcc(b"vlme");
+pub const kAudioMuteControlClassID: u32 = fourcc(b"mute");
 
 // scopes, elements
 pub const kAudioObjectPropertyScopeGlobal: u32 = fourcc(b"glob");
@@ -92,6 +97,16 @@ pub const kAudioStreamPropertyPhysicalFormat: u32 = fourcc(b"pft ");
 pub const kAudioStreamPropertyAvailablePhysicalFormats: u32 = fourcc(b"pfta");
 pub const kAudioStreamTerminalTypeLine: u32 = fourcc(b"line");
 
+// controls
+pub const kAudioControlPropertyScope: u32 = fourcc(b"cscp");
+pub const kAudioControlPropertyElement: u32 = fourcc(b"celm");
+pub const kAudioLevelControlPropertyScalarValue: u32 = fourcc(b"lcsv");
+pub const kAudioLevelControlPropertyDecibelValue: u32 = fourcc(b"lcdv");
+pub const kAudioLevelControlPropertyDecibelRange: u32 = fourcc(b"lcdr");
+pub const kAudioLevelControlPropertyConvertScalarToDecibels: u32 = fourcc(b"lcsd");
+pub const kAudioLevelControlPropertyConvertDecibelsToScalar: u32 = fourcc(b"lcds");
+pub const kAudioBooleanControlPropertyValue: u32 = fourcc(b"bcvl");
+
 // formats
 pub const kAudioFormatLinearPCM: u32 = fourcc(b"lpcm");
 pub const kAudioFormatFlagIsFloat: u32 = 1 << 0;
@@ -102,6 +117,8 @@ pub const kAudioObjectSystemObject: AudioObjectID = 1;
 pub const kAudioHardwarePropertyDevices: u32 = fourcc(b"dev#");
 pub const kAudioDevicePropertyStreamConfiguration: u32 = fourcc(b"slay");
 pub const kAudioDevicePropertyBufferFrameSize: u32 = fourcc(b"fsiz");
+pub const kAudioDevicePropertyVolumeScalar: u32 = fourcc(b"volm");
+pub const kAudioDevicePropertyMute: u32 = fourcc(b"mute");
 
 // I/O operations
 pub const kAudioServerPlugInIOOperationReadInput: u32 = fourcc(b"read");
@@ -192,6 +209,9 @@ pub type CFAllocatorRef = *const c_void;
 pub type CFUUIDRef = *const c_void;
 pub type CFDictionaryRef = *const c_void;
 pub type CFIndex = isize;
+pub type CFNumberRef = *const c_void;
+pub type CFPropertyListRef = *const c_void;
+pub const kCFNumberFloat32Type: CFIndex = 5;
 pub const kCFStringEncodingUTF8: u32 = 0x0800_0100;
 
 pub type DriverRef = *mut *const AudioServerPlugInDriverInterface;
@@ -205,8 +225,10 @@ pub struct AudioServerPlugInHostInterface {
     count: u32,
     addresses: *const AudioObjectPropertyAddress,
   ) -> OSStatus,
-  pub CopyFromStorage: *const c_void,
-  pub WriteToStorage: *const c_void,
+  pub CopyFromStorage:
+    unsafe extern "C" fn(host: HostRef, key: CFStringRef, out: *mut CFPropertyListRef) -> OSStatus,
+  pub WriteToStorage:
+    unsafe extern "C" fn(host: HostRef, key: CFStringRef, data: CFPropertyListRef) -> OSStatus,
   pub DeleteFromStorage: *const c_void,
   pub RequestDeviceConfigurationChange: *const c_void,
 }
@@ -328,6 +350,10 @@ extern "C" {
   pub fn CFStringGetCString(s: CFStringRef, buffer: *mut u8, size: CFIndex, encoding: u32) -> Boolean;
   pub fn CFUUIDGetUUIDBytes(uuid: CFUUIDRef) -> CFUUIDBytes;
   pub fn CFRelease(cf: CFTypeRef);
+  pub fn CFGetTypeID(cf: CFTypeRef) -> usize;
+  pub fn CFNumberGetTypeID() -> usize;
+  pub fn CFNumberCreate(alloc: CFAllocatorRef, kind: CFIndex, value: *const c_void) -> CFNumberRef;
+  pub fn CFNumberGetValue(number: CFNumberRef, kind: CFIndex, value: *mut c_void) -> Boolean;
 }
 
 #[cfg(test)]

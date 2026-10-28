@@ -45,7 +45,7 @@ fn core_audio(
     while clock.position().is_none_or(|now| (now as isize - wake as isize) < 0) {
       std::thread::sleep(Duration::from_micros(500));
     }
-    card.read_input(origin + sample_time, IO_FRAMES, &mut input);
+    card.read_input(origin + sample_time, IO_FRAMES, &mut input, 1.0);
     {
       let mut checker = captured.lock().unwrap();
       for (i, &s) in input.iter().enumerate() {
@@ -57,7 +57,7 @@ fn core_audio(
       *s = sample_to_f32(signal(i % CHANNELS, (sample_time + i / CHANNELS) as u64));
     }
     let output_at = origin + sample_time + IO_FRAMES + 2 * SAFETY;
-    card.write_mix(output_at, IO_FRAMES, &mix, clock.position());
+    card.write_mix(output_at, IO_FRAMES, &mix, clock.position(), 1.0);
     cycle += 1;
   }
 }

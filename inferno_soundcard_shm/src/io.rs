@@ -40,9 +40,9 @@ impl<'a> CardIo<'a> {
   }
 
   /// Plays `frames` interleaved frames of `mix` (the card's playback channels), the frames of position
-  /// `position`: they're transmitted the playback lead later. `now`: the position now, to tell whether they
-  /// came too late to be transmitted.
-  pub fn write_mix(&self, position: usize, frames: usize, mix: &[f32], now: Option<usize>) {
+  /// `position`, at `gain` (the volume: 1 leaves them exactly as they are): they're transmitted the playback
+  /// lead later. `now`: the position now, to tell whether they came too late to be transmitted.
+  pub fn write_mix(&self, position: usize, frames: usize, mix: &[f32], now: Option<usize>, gain: f32) {
     let channels = self.card.playback_channels as usize;
     if channels == 0 {
       return;
@@ -54,7 +54,7 @@ impl<'a> CardIo<'a> {
     for i in 0..channels {
       let ch = self.card.first_playback as usize + i;
       let ring = self.region.playback_ring(ch);
-      write_playback(ring, &written[ch], start, frames, |f| f32_to_sample(mix[f * channels + i]));
+      write_playback(ring, &written[ch], start, frames, |f| f32_to_sample(mix[f * channels + i] * gain));
     }
     // the transmitter reads a position as soon as it's due: audio written after that goes out as silence
     if now.is_some_and(|now| now as isize - start as isize > 0) {
@@ -63,8 +63,8 @@ impl<'a> CardIo<'a> {
   }
 
   /// Records `frames` interleaved frames (the card's recording channels) from position `position` into
-  /// `input`: what the receiver has received, silence where it hasn't.
-  pub fn read_input(&self, position: usize, frames: usize, input: &mut [f32]) {
+  /// `input`, at `gain` (1: exactly as received): what the receiver has received, silence where it hasn't.
+  pub fn read_input(&self, position: usize, frames: usize, input: &mut [f32], gain: f32) {
     let channels = self.card.capture_channels as usize;
     if channels == 0 {
       return;
@@ -77,7 +77,7 @@ impl<'a> CardIo<'a> {
       let ring = self.region.capture_ring(ch);
       let silenced =
         read_captured(ring, readable[ch].load(Ordering::Acquire), position, frames, |f, s| {
-          input[f * channels + i] = sample_to_f32(s)
+          input[f * channels + i] = sample_to_f32(s) * gain
         });
       unreceived |= silenced > 0 && silenced < frames;
     }
@@ -123,12 +123,12 @@ mod tests {
     let b = CardIo::new(&region, 1).unwrap();
     let mix =
       [sample_to_f32(1 << 8), sample_to_f32(2 << 8), sample_to_f32(3 << 8), sample_to_f32(4 << 8)];
-    b.write_mix(1000, 2, &mix, Some(1000));
+    b.write_mix(1000, 2, &mix, Some(1000), 1.0);
     let at = |ch: usize, p: usize| region.playback_ring(ch)[p].load(Ordering::Relaxed);
     assert_eq!([at(1, 1100), at(2, 1100), at(1, 1101), at(2, 1101)], [1 << 8, 2 << 8, 3 << 8, 4 << 8]);
     assert_eq!(at(0, 1100), 0, "not card A's");
     assert_eq!(region.header().late_playback.load(Ordering::Relaxed), 0);
-    b.write_mix(1002, 2, &mix, Some(1200));
+    b.write_mix(1002, 2, &mix, Some(1200), 1.0);
     assert_eq!(region.header().late_playback.load(Ordering::Relaxed), 1, "too late");
 
     for ch in 0..3 {
@@ -136,8 +136,16 @@ mod tests {
       region.capture_readable()[ch].store(501, Ordering::Relaxed);
     }
     let mut input = [9.0; 4];
-    b.read_input(500, 2, &mut input);
+    b.read_input(500, 2, &mut input, 1.0);
     assert_eq!(input.map(f32_to_sample), [2 << 8, 3 << 8, 0, 0], "the second frame isn't received yet");
     assert_eq!(region.header().unreceived_capture.load(Ordering::Relaxed), 1);
+
+    // the volume scales both ways
+    b.read_input(500, 1, &mut input, 0.5);
+    assert_eq!(f32_to_sample(input[0]), 1 << 8);
+    b.write_mix(2000, 1, &[sample_to_f32(0x40_0000 << 8), 0.0], None, 0.25);
+    assert_eq!(region.playback_ring(1)[2100].load(Ordering::Relaxed), 0x10_0000 << 8);
+    b.write_mix(2001, 1, &[sample_to_f32(0x12_3456 << 8), 0.0], None, 0.0);
+    assert_eq!(region.playback_ring(1)[2101].load(Ordering::Relaxed), 0, "muted");
   }
 }

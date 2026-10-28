@@ -1,13 +1,14 @@
 //! The plug-in's Core Audio objects and their properties, independent of Core Audio (and so testable anywhere).
 //!
 //! The plug-in object owns a device per card of the service's region, each with an input stream (the card's
-//! recording channels) and an output stream (its playback channels), if it has those channels. Their object
-//! ids are new whenever the cards are (a new region): the old ones are gone.
+//! recording channels) and an output stream (its playback channels), if it has those channels, and a volume
+//! and a mute control for each (System Settings' sliders, the volume keys). Their object ids are new whenever
+//! the cards are (a new region): the old ones are gone.
 
 #![allow(non_upper_case_globals)] // Core Audio's names
 
 use std::sync::{
-  atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+  atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering},
   Arc,
 };
 
@@ -22,6 +23,93 @@ pub const ZERO_TIME_STAMP_PERIOD: u32 = 16384;
 pub const SAFETY_OFFSET: u32 = 32;
 pub const MANUFACTURER: &str = "Inferno";
 pub const MODEL_UID: &str = "org.network-audio.inferno.soundcard";
+
+/// Object ids per card: the device, its two streams and its four controls (see `DeviceSet::new`).
+const IDS_PER_CARD: u32 = 7;
+/// The volume controls' range: the slider's bottom is this, then silence at 0.
+pub const MIN_DB: f32 = -64.0;
+
+/// Decibels of a volume slider's position (0 to 1): the gain is its square, a taper like other devices'.
+pub fn scalar_to_db(scalar: f32) -> f32 {
+  if scalar <= 0.0 {
+    MIN_DB
+  } else {
+    (40.0 * scalar.min(1.0).log10()).max(MIN_DB)
+  }
+}
+
+/// The slider position of `db` decibels (`MIN_DB` and below: 0).
+pub fn db_to_scalar(db: f32) -> f32 {
+  if db <= MIN_DB {
+    0.0
+  } else {
+    10f32.powf(db.min(0.0) / 40.0)
+  }
+}
+
+/// A direction's volume and mute, as Core Audio's controls set them.
+pub struct Level {
+  /// f32 bits of the slider's position, 0 to 1
+  scalar: AtomicU32,
+  muted: AtomicBool,
+}
+
+impl Default for Level {
+  fn default() -> Self {
+    Self { scalar: AtomicU32::new(1f32.to_bits()), muted: AtomicBool::new(false) }
+  }
+}
+
+impl Level {
+  pub fn scalar(&self) -> f32 {
+    f32::from_bits(self.scalar.load(Ordering::Relaxed))
+  }
+
+  pub fn set_scalar(&self, scalar: f32) {
+    let scalar = if scalar.is_nan() { 1.0 } else { scalar.clamp(0.0, 1.0) };
+    self.scalar.store(scalar.to_bits(), Ordering::Relaxed);
+  }
+
+  pub fn muted(&self) -> bool {
+    self.muted.load(Ordering::Relaxed)
+  }
+
+  pub fn set_muted(&self, muted: bool) {
+    self.muted.store(muted, Ordering::Relaxed);
+  }
+
+  /// The gain applied to the audio: exactly 1 at full volume (the audio passes unchanged), 0 when muted or at
+  /// the bottom.
+  pub fn gain(&self) -> f32 {
+    let scalar = self.scalar();
+    if self.muted() || scalar <= 0.0 {
+      0.0
+    } else if scalar >= 1.0 {
+      1.0
+    } else {
+      scalar * scalar
+    }
+  }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlKind {
+  Volume,
+  Mute,
+}
+
+/// A card's volume and mute controls, saved under these keys in Core Audio's storage for the plug-in.
+pub fn storage_key(card_uid: &str, direction: Direction, kind: ControlKind) -> String {
+  let direction = match direction {
+    Direction::Input => "input",
+    Direction::Output => "output",
+  };
+  let kind = match kind {
+    ControlKind::Volume => "volume",
+    ControlKind::Mute => "mute",
+  };
+  format!("{}.{direction}.{kind}", device_uid(card_uid))
+}
 
 /// Device UIDs: unique on the computer.
 pub fn device_uid(card_uid: &str) -> String {
@@ -104,6 +192,31 @@ pub struct Device {
   /// the card's index in the region
   pub card: usize,
   pub io: Io,
+  /// the volume and mute controls, of the directions it has
+  pub controls: Vec<(AudioObjectID, Direction, ControlKind)>,
+  pub input_level: Level,
+  pub output_level: Level,
+}
+
+impl Device {
+  pub fn level(&self, direction: Direction) -> &Level {
+    match direction {
+      Direction::Input => &self.input_level,
+      Direction::Output => &self.output_level,
+    }
+  }
+
+  fn controls_in(&self, scope: u32) -> impl Iterator<Item = u32> + '_ {
+    self.controls.iter().filter(move |(_, d, _)| in_scope(*d, scope)).map(|(id, _, _)| *id)
+  }
+}
+
+/// Whether `direction` is in `scope` (the global scope has both).
+fn in_scope(direction: Direction, scope: u32) -> bool {
+  match direction {
+    Direction::Input => scope != kAudioObjectPropertyScopeOutput,
+    Direction::Output => scope != kAudioObjectPropertyScopeInput,
+  }
 }
 
 /// The devices of a region.
@@ -122,12 +235,24 @@ pub enum Object<'a> {
   PlugIn,
   Device(&'a Device),
   Stream(&'a Device, Direction),
+  Control(&'a Device, Direction, ControlKind),
+}
+
+/// What a property query comes with, besides its address.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Input<'a> {
+  None,
+  /// `kAudioPlugInPropertyTranslateUIDToDevice`'s qualifier
+  Uid(&'a str),
+  /// the value to convert (`kAudioLevelControlPropertyConvert...`)
+  Value(f32),
 }
 
 /// A property's value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
   U32(u32),
+  F32(f32),
   F64(f64),
   /// a CFString
   String(String),
@@ -139,7 +264,8 @@ pub enum Value {
 }
 
 impl DeviceSet {
-  /// Devices for the cards of `region`, with ids from `first_id` (3 per card).
+  /// Devices for the cards of `region`, with ids from `first_id` (`IDS_PER_CARD` per card): the device, its
+  /// input and output streams, then the input's volume and mute, and the output's.
   pub fn new(region: Arc<Region>, first_id: AudioObjectID) -> Self {
     let devices = region
       .header()
@@ -147,13 +273,30 @@ impl DeviceSet {
       .iter()
       .enumerate()
       .map(|(card, info)| {
-        let id = first_id + 3 * card as u32;
+        let id = first_id + IDS_PER_CARD * card as u32;
+        let (has_input, has_output) = (info.capture_channels > 0, info.playback_channels > 0);
+        let mut controls = vec![];
+        if has_input {
+          controls.extend([
+            (id + 3, Direction::Input, ControlKind::Volume),
+            (id + 4, Direction::Input, ControlKind::Mute),
+          ]);
+        }
+        if has_output {
+          controls.extend([
+            (id + 5, Direction::Output, ControlKind::Volume),
+            (id + 6, Direction::Output, ControlKind::Mute),
+          ]);
+        }
         Device {
           id,
-          input: (info.capture_channels > 0).then_some(id + 1),
-          output: (info.playback_channels > 0).then_some(id + 2),
+          input: has_input.then_some(id + 1),
+          output: has_output.then_some(id + 2),
           card,
           io: Io::default(),
+          controls,
+          input_level: Level::default(),
+          output_level: Level::default(),
         }
       })
       .collect();
@@ -162,7 +305,7 @@ impl DeviceSet {
 
   /// The ids this set uses, from its first: the next set's first.
   pub fn next_id(&self) -> AudioObjectID {
-    self.devices.last().map(|d| d.id + 3).unwrap_or(0)
+    self.devices.last().map(|d| d.id + IDS_PER_CARD).unwrap_or(0)
   }
 
   pub fn device(&self, id: AudioObjectID) -> Option<&Device> {
@@ -181,7 +324,10 @@ impl DeviceSet {
       } else if d.output == Some(id) {
         Some(Object::Stream(d, Direction::Output))
       } else {
-        None
+        d.controls
+          .iter()
+          .find(|(c, _, _)| *c == id)
+          .map(|&(_, direction, kind)| Object::Control(d, direction, kind))
       }
     })
   }
@@ -227,8 +373,8 @@ impl DeviceSet {
   }
 
   fn streams(device: &Device, scope: u32) -> Vec<u32> {
-    let input = (scope != kAudioObjectPropertyScopeOutput).then_some(device.input).flatten();
-    let output = (scope != kAudioObjectPropertyScopeInput).then_some(device.output).flatten();
+    let input = in_scope(Direction::Input, scope).then_some(device.input).flatten();
+    let output = in_scope(Direction::Output, scope).then_some(device.output).flatten();
     input.into_iter().chain(output).collect()
   }
 }
@@ -275,6 +421,20 @@ fn has(object: &Object, selector: u32) -> bool {
       kAudioDevicePropertyZeroTimeStampPeriod,
     ]
     .contains(&selector),
+    Object::Control(_, _, ControlKind::Volume) => [
+      kAudioControlPropertyScope,
+      kAudioControlPropertyElement,
+      kAudioLevelControlPropertyScalarValue,
+      kAudioLevelControlPropertyDecibelValue,
+      kAudioLevelControlPropertyDecibelRange,
+      kAudioLevelControlPropertyConvertScalarToDecibels,
+      kAudioLevelControlPropertyConvertDecibelsToScalar,
+    ]
+    .contains(&selector),
+    Object::Control(_, _, ControlKind::Mute) => {
+      [kAudioControlPropertyScope, kAudioControlPropertyElement, kAudioBooleanControlPropertyValue]
+        .contains(&selector)
+    }
     Object::Stream(..) => [
       kAudioStreamPropertyIsActive,
       kAudioStreamPropertyDirection,
@@ -317,15 +477,22 @@ pub fn is_settable(
   if !has(&object, address.mSelector) {
     return Err(kAudioHardwareUnknownPropertyError);
   }
-  Ok(false)
+  Ok(matches!(object, Object::Control(..)) && SETTABLE.contains(&address.mSelector))
 }
 
-/// The value of a property. `uid`: the qualifier of `kAudioPlugInPropertyTranslateUIDToDevice`.
+/// The properties that can be set to another value: the controls'.
+const SETTABLE: [u32; 3] = [
+  kAudioLevelControlPropertyScalarValue,
+  kAudioLevelControlPropertyDecibelValue,
+  kAudioBooleanControlPropertyValue,
+];
+
+/// The value of a property.
 pub fn property(
   set: Option<&DeviceSet>,
   id: AudioObjectID,
   address: &AudioObjectPropertyAddress,
-  uid: Option<&str>,
+  input: Input,
 ) -> Result<Value, OSStatus> {
   let object = object_of(set, id).ok_or(kAudioHardwareBadObjectError)?;
   let selector = address.mSelector;
@@ -343,6 +510,10 @@ pub fn property(
       kAudioObjectPropertyManufacturer => Value::String(MANUFACTURER.into()),
       kAudioObjectPropertyOwnedObjects | kAudioPlugInPropertyDeviceList => Value::U32s(device_ids()),
       kAudioPlugInPropertyTranslateUIDToDevice => {
+        let uid = match input {
+          Input::Uid(uid) => Some(uid),
+          _ => None,
+        };
         let found = set.zip(uid).and_then(|(set, uid)| {
           let cards = set.region.header().cards();
           set.devices.iter().find(|d| device_uid(cards[d.card].uid()) == uid).map(|d| d.id)
@@ -370,9 +541,10 @@ pub fn property(
         kAudioObjectPropertyOwner => Value::U32(kAudioObjectPlugInObject),
         kAudioObjectPropertyName => Value::String(card.name().into()),
         kAudioObjectPropertyManufacturer => Value::String(MANUFACTURER.into()),
-        kAudioObjectPropertyOwnedObjects | kAudioDevicePropertyStreams => {
-          Value::U32s(DeviceSet::streams(device, scope))
-        }
+        kAudioObjectPropertyOwnedObjects => Value::U32s(
+          DeviceSet::streams(device, scope).into_iter().chain(device.controls_in(scope)).collect(),
+        ),
+        kAudioDevicePropertyStreams => Value::U32s(DeviceSet::streams(device, scope)),
         kAudioDevicePropertyDeviceUID => Value::String(device_uid(card.uid())),
         kAudioDevicePropertyModelUID => Value::String(MODEL_UID.into()),
         kAudioDevicePropertyTransportType => Value::U32(kAudioDeviceTransportTypeVirtual),
@@ -389,7 +561,7 @@ pub fn property(
           kAudioObjectPropertyScopeOutput => header.output_latency + header.playback_lead,
           _ => 0,
         }),
-        kAudioObjectPropertyControlList => Value::U32s(vec![]),
+        kAudioObjectPropertyControlList => Value::U32s(device.controls_in(scope).collect()),
         kAudioDevicePropertySafetyOffset => Value::U32(SAFETY_OFFSET),
         kAudioDevicePropertyNominalSampleRate => Value::F64(set.sample_rate()),
         kAudioDevicePropertyAvailableNominalSampleRates => Value::Ranges(vec![AudioValueRange {
@@ -405,6 +577,35 @@ pub fn property(
           Value::U32s(if channels >= 2 { vec![1, 2] } else { vec![1, 1] })
         }
         kAudioDevicePropertyZeroTimeStampPeriod => Value::U32(ZERO_TIME_STAMP_PERIOD),
+        _ => return unknown,
+      }
+    }
+    Object::Control(device, direction, kind) => {
+      let level = device.level(direction);
+      let value_in = match input {
+        Input::Value(value) => value,
+        _ => 0.0,
+      };
+      match (kind, selector) {
+        (ControlKind::Volume, kAudioObjectPropertyBaseClass) => Value::U32(kAudioLevelControlClassID),
+        (ControlKind::Volume, kAudioObjectPropertyClass) => Value::U32(kAudioVolumeControlClassID),
+        (ControlKind::Mute, kAudioObjectPropertyBaseClass) => Value::U32(kAudioBooleanControlClassID),
+        (ControlKind::Mute, kAudioObjectPropertyClass) => Value::U32(kAudioMuteControlClassID),
+        (_, kAudioObjectPropertyOwner) => Value::U32(device.id),
+        (_, kAudioObjectPropertyOwnedObjects) => Value::U32s(vec![]),
+        (_, kAudioControlPropertyScope) => Value::U32(match direction {
+          Direction::Input => kAudioObjectPropertyScopeInput,
+          Direction::Output => kAudioObjectPropertyScopeOutput,
+        }),
+        (_, kAudioControlPropertyElement) => Value::U32(kAudioObjectPropertyElementMain),
+        (_, kAudioLevelControlPropertyScalarValue) => Value::F32(level.scalar()),
+        (_, kAudioLevelControlPropertyDecibelValue) => Value::F32(scalar_to_db(level.scalar())),
+        (_, kAudioLevelControlPropertyDecibelRange) => {
+          Value::Ranges(vec![AudioValueRange { mMinimum: MIN_DB as f64, mMaximum: 0.0 }])
+        }
+        (_, kAudioLevelControlPropertyConvertScalarToDecibels) => Value::F32(scalar_to_db(value_in)),
+        (_, kAudioLevelControlPropertyConvertDecibelsToScalar) => Value::F32(db_to_scalar(value_in)),
+        (_, kAudioBooleanControlPropertyValue) => Value::U32(level.muted() as u32),
         _ => return unknown,
       }
     }
@@ -435,16 +636,38 @@ pub fn property(
   })
 }
 
-/// Sets a property: only to what it is (e.g. a client setting the format it read).
+/// Sets a property: a control's value, otherwise only to what it is (e.g. a client setting the format it read).
+/// Returns the properties of the object that changed.
 pub fn set_property(
   set: Option<&DeviceSet>,
   id: AudioObjectID,
   address: &AudioObjectPropertyAddress,
   value: &Value,
-) -> Result<(), OSStatus> {
-  let current = property(set, id, address, None)?;
+) -> Result<Vec<u32>, OSStatus> {
+  if let Some(object @ Object::Control(device, direction, _)) = object_of(set, id) {
+    if !has(&object, address.mSelector) {
+      return Err(kAudioHardwareUnknownPropertyError);
+    }
+    let level = device.level(direction);
+    return match (address.mSelector, value) {
+      (kAudioLevelControlPropertyScalarValue, &Value::F32(scalar)) => {
+        level.set_scalar(scalar);
+        Ok(vec![kAudioLevelControlPropertyScalarValue, kAudioLevelControlPropertyDecibelValue])
+      }
+      (kAudioLevelControlPropertyDecibelValue, &Value::F32(db)) => {
+        level.set_scalar(db_to_scalar(db));
+        Ok(vec![kAudioLevelControlPropertyScalarValue, kAudioLevelControlPropertyDecibelValue])
+      }
+      (kAudioBooleanControlPropertyValue, &Value::U32(muted)) => {
+        level.set_muted(muted != 0);
+        Ok(vec![kAudioBooleanControlPropertyValue])
+      }
+      _ => Err(kAudioHardwareUnsupportedOperationError),
+    };
+  }
+  let current = property(set, id, address, Input::None)?;
   if &current == value {
-    return Ok(());
+    return Ok(vec![]);
   }
   Err(match address.mSelector {
     kAudioStreamPropertyVirtualFormat | kAudioStreamPropertyPhysicalFormat => {
@@ -511,8 +734,8 @@ mod tests {
   fn a_device_per_card_with_its_streams() {
     let set = set();
     let set = Some(&set);
-    let get = |id, a: AudioObjectPropertyAddress| property(set, id, &a, None);
-    assert_eq!(get(1, global(kAudioPlugInPropertyDeviceList)), Ok(Value::U32s(vec![10, 13])));
+    let get = |id, a: AudioObjectPropertyAddress| property(set, id, &a, Input::None);
+    assert_eq!(get(1, global(kAudioPlugInPropertyDeviceList)), Ok(Value::U32s(vec![10, 17])));
     assert_eq!(get(10, global(kAudioObjectPropertyName)), Ok(Value::String("Stage".into())));
     assert_eq!(
       get(10, global(kAudioDevicePropertyDeviceUID)),
@@ -524,19 +747,19 @@ mod tests {
       Ok(Value::U32s(vec![11]))
     );
     assert_eq!(
-      get(13, global(kAudioDevicePropertyStreams)),
-      Ok(Value::U32s(vec![15])),
+      get(17, global(kAudioDevicePropertyStreams)),
+      Ok(Value::U32s(vec![19])),
       "no recording channels"
     );
-    assert_eq!(get(14, global(kAudioObjectPropertyClass)), Err(kAudioHardwareBadObjectError));
+    assert_eq!(get(18, global(kAudioObjectPropertyClass)), Err(kAudioHardwareBadObjectError));
     assert_eq!(get(11, global(kAudioStreamPropertyDirection)), Ok(Value::U32(1)), "input");
     assert_eq!(get(12, global(kAudioObjectPropertyOwner)), Ok(Value::U32(10)));
     let Ok(Value::Format(format)) = get(12, global(kAudioStreamPropertyPhysicalFormat)) else { panic!() };
     assert_eq!((format.mChannelsPerFrame, format.mBytesPerFrame, format.mSampleRate), (8, 32, 48000.0));
     let domain = |id| get(id, global(kAudioDevicePropertyClockDomain));
-    assert_eq!(domain(10), domain(13), "one clock");
+    assert_eq!(domain(10), domain(17), "one clock");
     assert_eq!(
-      get(13, address(kAudioDevicePropertyDeviceCanBeDefaultDevice, kAudioObjectPropertyScopeInput)),
+      get(17, address(kAudioDevicePropertyDeviceCanBeDefaultDevice, kAudioObjectPropertyScopeInput)),
       Ok(Value::U32(0)),
       "not a default input without recording channels"
     );
@@ -544,16 +767,20 @@ mod tests {
       get(10, address(kAudioDevicePropertyLatency, kAudioObjectPropertyScopeOutput)),
       Ok(Value::U32(720))
     );
-    let translate = |uid| property(set, 1, &global(kAudioPlugInPropertyTranslateUIDToDevice), Some(uid));
-    assert_eq!(translate("inferno-00ab-2"), Ok(Value::U32(13)));
+    let translate =
+      |uid| property(set, 1, &global(kAudioPlugInPropertyTranslateUIDToDevice), Input::Uid(uid));
+    assert_eq!(translate("inferno-00ab-2"), Ok(Value::U32(17)));
     assert_eq!(translate("other"), Ok(Value::U32(kAudioObjectUnknown)));
   }
 
   #[test]
   fn without_the_service_there_are_no_devices() {
-    assert_eq!(property(None, 1, &global(kAudioPlugInPropertyDeviceList), None), Ok(Value::U32s(vec![])));
     assert_eq!(
-      property(None, 10, &global(kAudioObjectPropertyName), None),
+      property(None, 1, &global(kAudioPlugInPropertyDeviceList), Input::None),
+      Ok(Value::U32s(vec![]))
+    );
+    assert_eq!(
+      property(None, 10, &global(kAudioObjectPropertyName), Input::None),
       Err(kAudioHardwareBadObjectError)
     );
     assert!(!has_property(None, 10, &global(kAudioObjectPropertyName)));
@@ -564,7 +791,7 @@ mod tests {
     let set = set();
     let set = Some(&set);
     let rate = global(kAudioDevicePropertyNominalSampleRate);
-    assert_eq!(set_property(set, 10, &rate, &Value::F64(48000.0)), Ok(()));
+    assert_eq!(set_property(set, 10, &rate, &Value::F64(48000.0)), Ok(vec![]));
     assert_eq!(
       set_property(set, 10, &rate, &Value::F64(44100.0)),
       Err(kAudioHardwareUnsupportedOperationError)
@@ -575,6 +802,77 @@ mod tests {
 
   #[test]
   fn ids_of_the_next_set_follow() {
-    assert_eq!(set().next_id(), 16);
+    assert_eq!(set().next_id(), 24);
+  }
+
+  #[test]
+  fn volume_and_mute_controls_of_each_direction() {
+    let set = set();
+    let set_ref = Some(&set);
+    let get = |id, a: AudioObjectPropertyAddress| property(set_ref, id, &a, Input::None);
+    // Stage: input volume 13, input mute 14, output volume 15, output mute 16; Monitor: output only
+    assert_eq!(get(10, global(kAudioObjectPropertyControlList)), Ok(Value::U32s(vec![13, 14, 15, 16])));
+    assert_eq!(
+      get(10, address(kAudioObjectPropertyOwnedObjects, kAudioObjectPropertyScopeOutput)),
+      Ok(Value::U32s(vec![12, 15, 16]))
+    );
+    assert_eq!(get(17, global(kAudioObjectPropertyControlList)), Ok(Value::U32s(vec![22, 23])));
+    assert_eq!(get(15, global(kAudioObjectPropertyClass)), Ok(Value::U32(kAudioVolumeControlClassID)));
+    assert_eq!(get(15, global(kAudioObjectPropertyBaseClass)), Ok(Value::U32(kAudioLevelControlClassID)));
+    assert_eq!(get(16, global(kAudioObjectPropertyClass)), Ok(Value::U32(kAudioMuteControlClassID)));
+    assert_eq!(
+      get(13, global(kAudioControlPropertyScope)),
+      Ok(Value::U32(kAudioObjectPropertyScopeInput))
+    );
+    assert_eq!(
+      get(15, global(kAudioLevelControlPropertyScalarValue)),
+      Ok(Value::F32(1.0)),
+      "full volume"
+    );
+    assert_eq!(get(15, global(kAudioLevelControlPropertyDecibelValue)), Ok(Value::F32(0.0)));
+    assert_eq!(set.devices[0].output_level.gain(), 1.0, "audio unchanged");
+    assert_eq!(is_settable(set_ref, 15, &global(kAudioLevelControlPropertyScalarValue)), Ok(true));
+
+    let scalar = global(kAudioLevelControlPropertyScalarValue);
+    assert_eq!(
+      set_property(set_ref, 15, &scalar, &Value::F32(0.5)),
+      Ok(vec![kAudioLevelControlPropertyScalarValue, kAudioLevelControlPropertyDecibelValue])
+    );
+    assert_eq!(set.devices[0].output_level.gain(), 0.25, "the square of the slider");
+    let Ok(Value::F32(db)) = get(15, global(kAudioLevelControlPropertyDecibelValue)) else { panic!() };
+    assert!((db - -12.04).abs() < 0.01, "{db} dB");
+    assert_eq!(set.devices[0].input_level.gain(), 1.0, "the input's own");
+    set_property(set_ref, 15, &global(kAudioLevelControlPropertyDecibelValue), &Value::F32(-6.0))
+      .unwrap();
+    assert!((set.devices[0].output_level.gain() - 0.501).abs() < 0.001, "-6 dB");
+    set_property(set_ref, 15, &scalar, &Value::F32(7.0)).unwrap();
+    assert_eq!(set.devices[0].output_level.scalar(), 1.0, "clipped to full");
+
+    set_property(set_ref, 16, &global(kAudioBooleanControlPropertyValue), &Value::U32(1)).unwrap();
+    assert_eq!(get(16, global(kAudioBooleanControlPropertyValue)), Ok(Value::U32(1)));
+    assert_eq!(set.devices[0].output_level.gain(), 0.0, "muted");
+    assert_eq!(
+      set_property(set_ref, 16, &scalar, &Value::F32(0.5)),
+      Err(kAudioHardwareUnknownPropertyError)
+    );
+
+    let convert = |selector, value| property(set_ref, 15, &global(selector), Input::Value(value));
+    assert_eq!(convert(kAudioLevelControlPropertyConvertScalarToDecibels, 0.0), Ok(Value::F32(MIN_DB)));
+    assert_eq!(convert(kAudioLevelControlPropertyConvertDecibelsToScalar, MIN_DB), Ok(Value::F32(0.0)));
+    assert_eq!(convert(kAudioLevelControlPropertyConvertDecibelsToScalar, 0.0), Ok(Value::F32(1.0)));
+  }
+
+  #[test]
+  fn decibels_and_slider_positions_convert_both_ways() {
+    // the slider's bottom, MIN_DB, is at about 0.025: silence below
+    assert_eq!(db_to_scalar(scalar_to_db(0.01)), 0.0);
+    for scalar in [0.03f32, 0.1, 0.3, 0.5, 0.9, 1.0] {
+      let back = db_to_scalar(scalar_to_db(scalar));
+      assert!((back - scalar).abs() < 1e-4, "{scalar}: {back}");
+    }
+    assert_eq!(
+      storage_key("00ab-1", Direction::Output, ControlKind::Volume),
+      "inferno-00ab-1.output.volume"
+    );
   }
 }

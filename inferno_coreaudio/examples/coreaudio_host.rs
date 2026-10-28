@@ -3,6 +3,9 @@
 //!
 //! `coreaudio_host --list`: lists the audio devices.
 //!
+//! `coreaudio_host --card NAME --volume [VALUE] [--mute 0|1] [--input]`: prints the device's output (or input)
+//! volume (0 to 1) and mute, as applications and System Settings see them, after setting them if given.
+//!
 //! `coreaudio_host --card NAME --channels 2 --play FILE --record FILE --seconds S [--until-file F] [--buffer 512]`:
 //! waits for the device named NAME, plays FILE from its start and records until S seconds have passed or F
 //! exists.
@@ -240,12 +243,61 @@ mod host {
     0
   }
 
+  /// The device named `name`.
+  fn find(name: &str) -> Result<Option<AudioObjectID>, String> {
+    Ok(devices()?.into_iter().find(|&d| string(d, kAudioObjectPropertyName).is_ok_and(|n| n == name)))
+  }
+
+  /// A 4-byte property of `device` in `scope`.
+  fn get_u32(device: AudioObjectID, selector: u32, scope: u32) -> Result<u32, String> {
+    let data = bytes(device, selector, scope)?;
+    Ok(u32::from_ne_bytes(data[..4].try_into().map_err(|_| "too short")?))
+  }
+
+  fn set_u32(device: AudioObjectID, selector: u32, scope: u32, value: u32) -> Result<(), String> {
+    let address = address(selector, scope);
+    // safety: valid pointers
+    check("AudioObjectSetPropertyData", unsafe {
+      AudioObjectSetPropertyData(
+        device,
+        &address,
+        0,
+        std::ptr::null(),
+        4,
+        &value as *const u32 as *const c_void,
+      )
+    })
+  }
+
+  fn volume(args: &[String], card: &str) -> Result<(), String> {
+    let device = find(card)?.ok_or_else(|| format!("no device {card:?}"))?;
+    let scope = if args.iter().any(|a| a == "--input") {
+      kAudioObjectPropertyScopeInput
+    } else {
+      kAudioObjectPropertyScopeOutput
+    };
+    if let Some(value) = arg(args, "--volume").filter(|v| !v.starts_with("--")) {
+      let value: f32 = value.parse().map_err(|_| "--volume: a number from 0 to 1")?;
+      set_u32(device, kAudioDevicePropertyVolumeScalar, scope, value.to_bits())?;
+    }
+    if let Some(muted) = arg(args, "--mute") {
+      set_u32(device, kAudioDevicePropertyMute, scope, (muted == "1") as u32)?;
+    }
+    let volume = f32::from_bits(get_u32(device, kAudioDevicePropertyVolumeScalar, scope)?);
+    let muted = get_u32(device, kAudioDevicePropertyMute, scope)?;
+    println!("volume {volume}, mute {muted}");
+    Ok(())
+  }
+
   pub fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--list") {
       return list();
     }
     let card = arg(&args, "--card").ok_or("--card")?;
+    if args.iter().any(|a| a == "--volume" || a == "--mute") {
+      return volume(&args, &card);
+    }
     let channels: usize =
       arg(&args, "--channels").unwrap_or("2".into()).parse().map_err(|_| "--channels")?;
     let source =

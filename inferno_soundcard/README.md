@@ -45,6 +45,7 @@ Each sound card is a Core Audio device of the Inferno HAL plug-in ([`inferno_cor
 - The plug-in does no networking. The sound card service runs the Inferno device, as on Windows, as a launchd daemon in an account of its own without privileges (`_inferno`). Its rings, addressed by the Dante media clock, are in memory it shares with the plug-in ([`inferno_soundcard_shm`](../inferno_soundcard_shm)), handed over through the service's Mach service (only to Core Audio): the plug-in plays and records there directly, and Inferno's receiver and transmitter use the same memory.
 - The plug-in gives Core Audio the time of every frame from the media clock the service publishes there, so Core Audio plays and records at the network's rate, without resampling. All cards are of one clock domain.
 - Recording gets what the receiver made readable, silence where it hasn't. Playback is transmitted the playback margin later than Core Audio plays it. The devices report the network's latency (and the margin), for applications' latency compensation.
+- Each card has a volume and a mute control for playback and for recording: System Settings' sliders, the volume keys and applications' volume controls work. At full volume (the default) the audio passes bit-exact; below, the gain is the square of the slider's position (to -64 dB, then silence). Core Audio keeps them, per card, across restarts.
 - When the service restarts the cards (new settings) or stops, the devices go, and come back when it has them again.
 
 ### Install
