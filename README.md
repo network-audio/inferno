@@ -383,6 +383,7 @@ If you want to contribute but can't code or don't know where to start because th
 * the end-to-end test (now `test/e2e`) also runs on macOS
 * macOS: the PTPv1 follower (`CLOCK_SOURCE=ptpv1`) works without root privileges: its multicast receivers bind PTP's ports (below 1024) to the unspecified address, the only one macOS allows unprivileged processes
 * macOS: the media clock is over `CLOCK_MONOTONIC_RAW`, not NTP-slewed `CLOCK_MONOTONIC` (by thousands of ppm on CI runners): it ticks with the system's host time, as audio APIs do
+* receivers: a gap longer than the ring (a stall, or nothing received for that long) is silence, not partly audio of a ring's lap ago: marking it unready, and closing it with silence, covered only its length modulo the ring
 
 ## 0.8.0
 * sound cards at 44.1 kHz (and other sample rates that aren't multiples of 8 kHz): USB packets carry 5 or 6 frames per 125 µs, as the clock dictates. Tested on Windows in CI (shared and exclusive mode, up to 64 channels) and end-to-end, bit-exact both ways
