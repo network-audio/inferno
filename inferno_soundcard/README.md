@@ -19,9 +19,9 @@ Download the installer for your architecture from the [releases page](https://gi
 
 Click the tray icon, or open `http://127.0.0.1:47800/`. Changes apply right away: the cards restart.
 
-- **Sound cards:** a name, playback channels and recording channels for each, up to 128 each at 48 kHz.
+- **Sound cards:** a name, playback channels and recording channels for each, up to 128 each at 44.1 or 48 kHz, 64 at 88.2 or 96 kHz.
 - **Playback margin** (1 to 100 ms): raise it if the log warns that playback arrived late, at the cost of as much latency.
-- **Name** on the Dante network, and further [settings](../README.md#settings) as `KEY=VALUE` lines, e.g. `BIND_IP` for the network interface or `RX_LATENCY_NS`. The channel counts are the cards'. The sample rate must be a multiple of 8 kHz (48 or 96 kHz): USB Audio 2.0 at high speed carries whole frames per 125 µs.
+- **Name** on the Dante network, and further [settings](../README.md#settings) as `KEY=VALUE` lines, e.g. `BIND_IP` for the network interface or `RX_LATENCY_NS`. The channel counts are the cards'. The sound cards run at the network's sample rate (`SAMPLE_RATE`, 48 kHz by default; 44.1 kHz works too): Windows converts other rates for shared-mode applications.
 
 The configuration is `%APPDATA%\Inferno\soundcard.json` (or `INFERNO_SOUNDCARD_CONFIG`), and `INFERNO_*` environment variables complete it. The log is `%LOCALAPPDATA%\Inferno\soundcard.log`.
 

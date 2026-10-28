@@ -11,7 +11,7 @@ use crate::engine::CardChannels;
 /// Windows' shared-mode audio engine opens at most this many channels of a device; more are only usable by
 /// applications opening it in exclusive mode.
 pub const SHARED_MODE_CHANNELS: u16 = 32;
-/// At 48 kHz, as many as fit into a high-speed USB isochronous endpoint.
+/// At 44.1 or 48 kHz, as many as fit into a high-speed USB isochronous endpoint.
 pub const MAX_CHANNELS: u16 = 128;
 pub const DEFAULT_UI_PORT: u16 = 47800;
 pub const DEFAULT_PLAYBACK_MARGIN_MS: u32 = 10;
@@ -226,9 +226,14 @@ mod tests {
     assert!(with(vec![card("A", 0, 0)]).validate().is_err(), "no channels");
     assert!(with(vec![card("A", 200, 0)]).validate().is_err());
     assert!(with(vec![card("A", 64, 0), card("B", 0, 8)]).validate().is_ok());
-    let bad_setting =
-      Config { settings: [("SAMPLE_RATE".into(), "44100".into())].into(), ..Config::default() };
-    assert!(bad_setting.validate().is_err(), "USB audio 2.0 needs a multiple of 8 kHz");
+    let rate =
+      |rate: &str| Config { settings: [("SAMPLE_RATE".into(), rate.into())].into(), ..Config::default() };
+    assert!(rate("44100").validate().is_ok());
+    assert!(rate("96000").validate().is_ok());
+    assert!(with(vec![card("A", 128, 128)]).validate().is_ok(), "128 channels at 48 kHz");
+    let mut too_fast = rate("96000");
+    too_fast.cards = vec![card("A", 128, 0)];
+    assert!(too_fast.validate().is_err(), "128 channels don't fit at 96 kHz");
     let unknown =
       Config { settings: [("BIND_IPP".into(), "1.2.3.4".into())].into(), ..Config::default() };
     assert!(unknown.validate().unwrap_err().contains("BIND_IPP"));

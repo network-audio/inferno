@@ -23,7 +23,7 @@ jobs:
         # the runner's (netaudio then lists and subscribes them, but skips their status probes). The runner's
         # own adapter mustn't be changed: that cuts the runner off.
         network: [loopback-adapter, shared-ip]
-        scenario: [pipe, asio, soundcard, pipe-leader]
+        scenario: [pipe, asio, soundcard, soundcard-44k, pipe-leader]
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -42,7 +42,7 @@ jobs:
           cargo build -p inferno_soundcard --example wasapi_host
       - run: pip install netaudio
       - name: Install usbip-win2, allow recording
-        if: matrix.scenario == 'soundcard'
+        if: startsWith(matrix.scenario, 'soundcard')
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'

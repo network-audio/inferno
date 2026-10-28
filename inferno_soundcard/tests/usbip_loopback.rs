@@ -27,7 +27,6 @@ use inferno_soundcard::{
 };
 use usbip_audio::{uac2::Uac2Device, Server};
 
-const RATE: u32 = 48000;
 const CHANNELS: usize = 2;
 /// Frames of the transmitted signal (power of 2), about 22 s.
 const SIGNAL_FRAMES: usize = 1 << 20;
@@ -35,14 +34,14 @@ const SIGNAL_FRAMES: usize = 1 << 20;
 const PACKETS: usize = 8;
 const QUEUED: usize = 3;
 
-fn settings(name: &str, process_id: u16, port: u16, rx: usize, tx: usize) -> Settings {
+fn settings(name: &str, process_id: u16, port: u16, rx: usize, tx: usize, rate: u32) -> Settings {
   let mut config = BTreeMap::new();
   for (k, v) in [
     ("NAME", name.to_string()),
     ("PROCESS_ID", process_id.to_string()),
     ("ALT_PORT", port.to_string()),
     ("BIND_IP", "127.0.0.1".into()),
-    ("SAMPLE_RATE", RATE.to_string()),
+    ("SAMPLE_RATE", rate.to_string()),
     ("RX_CHANNELS", rx.to_string()),
     ("TX_CHANNELS", tx.to_string()),
     ("TX_SOURCE_BIT_DEPTH", "24".into()),
@@ -91,9 +90,7 @@ impl Checker {
         let silent_run = std::mem::take(&mut self.silent_run[ch]);
         if s == signal(ch, p) {
           self.matched += 1;
-        } else if let Some(at) =
-          (p.saturating_sub(silent_run)..p + RATE as u64).find(|&q| signal(ch, q) == s)
-        {
+        } else if let Some(at) = (p.saturating_sub(silent_run)..p + 48000).find(|&q| signal(ch, q) == s) {
           self.matched += 1;
           self.skips += 1;
           self.next[ch] = Some(at + 1);
@@ -111,24 +108,34 @@ fn be32(bytes: &[u8]) -> u32 {
   u32::from_be_bytes(bytes[..4].try_into().unwrap())
 }
 
-fn submit(seq: u32, direction: u32, ep: u32, payload: &[u8], packet_len: usize) -> Vec<u8> {
+/// An isochronous CMD_SUBMIT of packets of `lengths`.
+fn submit(seq: u32, direction: u32, ep: u32, payload: &[u8], lengths: &[usize]) -> Vec<u8> {
   let mut out = vec![];
-  let length = (PACKETS * packet_len) as u32;
-  for value in [1, seq, 0x0001_0001, direction, ep, 0, length, 0, PACKETS as u32, 1] {
+  let length = lengths.iter().sum::<usize>() as u32;
+  for value in [1, seq, 0x0001_0001, direction, ep, 0, length, 0, lengths.len() as u32, 1] {
     out.extend_from_slice(&u32::to_be_bytes(value));
   }
   out.extend_from_slice(&[0; 8]);
   out.extend_from_slice(payload);
-  for i in 0..PACKETS {
-    for value in [(i * packet_len) as u32, packet_len as u32, 0, 0] {
+  let mut offset = 0;
+  for &len in lengths {
+    for value in [offset as u32, len as u32, 0, 0] {
       out.extend_from_slice(&value.to_be_bytes());
     }
+    offset += len;
   }
   out
 }
 
+/// Frames Windows plays in microframe `m`: whole frames, `rate / 8000` on average, in a pattern of its own
+/// (a few microframes out of phase with the card's clock).
+fn played_frames(m: u64, rate: u32) -> usize {
+  const PHASE: u64 = 3;
+  (((m + 1 + PHASE) * rate as u64 / 8000) - ((m + PHASE) * rate as u64 / 8000)) as usize
+}
+
 /// Plays the signal to the card and checks what it records, until `stop`.
-fn windows_client(port: u16, stop: Arc<AtomicBool>, captured: Arc<Mutex<Checker>>) {
+fn windows_client(port: u16, stop: Arc<AtomicBool>, captured: Arc<Mutex<Checker>>, rate: u32) {
   let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
   stream.set_nodelay(true).unwrap();
   stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -140,17 +147,23 @@ fn windows_client(port: u16, stop: Arc<AtomicBool>, captured: Arc<Mutex<Checker>
   stream.read_exact(&mut reply).unwrap();
   assert_eq!(be32(&reply[4..8]), 0, "imported");
 
-  let packet_len = 6 * CHANNELS * 4;
-  let mut played = 0u64;
+  // capture packets: room for the most frames a microframe carries
+  let capture_lengths = [rate.div_ceil(8000) as usize * CHANNELS * 4; PACKETS];
+  let (mut played, mut microframe) = (0u64, 0u64);
   let mut play = |seq: u32| {
-    let mut payload = vec![];
-    for _ in 0..PACKETS * 6 {
-      for ch in 0..CHANNELS {
-        payload.extend_from_slice(&signal(ch, played).to_le_bytes());
+    let (mut payload, mut lengths) = (vec![], vec![]);
+    for _ in 0..PACKETS {
+      let frames = played_frames(microframe, rate);
+      microframe += 1;
+      lengths.push(frames * CHANNELS * 4);
+      for _ in 0..frames {
+        for ch in 0..CHANNELS {
+          payload.extend_from_slice(&signal(ch, played).to_le_bytes());
+        }
+        played += 1;
       }
-      played += 1;
     }
-    submit(seq, 0, 1, &payload, packet_len)
+    submit(seq, 0, 1, &payload, &lengths)
   };
   let mut seq = 0;
   let mut kinds = HashMap::new();
@@ -158,7 +171,7 @@ fn windows_client(port: u16, stop: Arc<AtomicBool>, captured: Arc<Mutex<Checker>
     for direction in [0, 1] {
       seq += 1;
       kinds.insert(seq, direction);
-      let message = if direction == 0 { play(seq) } else { submit(seq, 1, 2, &[], packet_len) };
+      let message = if direction == 0 { play(seq) } else { submit(seq, 1, 2, &[], &capture_lengths) };
       stream.write_all(&message).unwrap();
     }
   }
@@ -180,7 +193,7 @@ fn windows_client(port: u16, stop: Arc<AtomicBool>, captured: Arc<Mutex<Checker>
     }
     seq += 1;
     kinds.insert(seq, direction);
-    let message = if direction == 0 { play(seq) } else { submit(seq, 1, 2, &[], packet_len) };
+    let message = if direction == 0 { play(seq) } else { submit(seq, 1, 2, &[], &capture_lengths) };
     stream.write_all(&message).unwrap();
   }
 }
@@ -194,10 +207,20 @@ async fn plays_and_records_through_usbip() {
   let state_home =
     std::env::temp_dir().join(format!("inferno_soundcard_test_state_{}", std::process::id()));
   std::env::set_var("XDG_STATE_HOME", &state_home);
+  // 44.1 kHz: microframes carry 5 or 6 frames
+  for (i, rate) in [48000, 44100].into_iter().enumerate() {
+    println!("== {rate} Hz");
+    plays_and_records_at(rate, i as u16).await;
+  }
+  let _ = std::fs::remove_dir_all(&state_home);
+}
+
+async fn plays_and_records_at(rate: u32, run: u16) {
   let clock: Arc<dyn ClockSource> = Arc::new(FreeRunningClockSource::new());
+  let (pid, port) = (41 + run * 3, 10100 + run * 300);
 
   // transmitter of the signal, at its ring positions
-  let tx_settings = settings("soundcard_test_tx", 41, 10100, 0, CHANNELS);
+  let tx_settings = settings(&format!("soundcard_test_tx_{rate}"), pid, port, 0, CHANNELS, rate);
   let tx_hostname = tx_settings.self_info.friendly_hostname.clone();
   let mut tx = DeviceServer::try_start_with_clock(tx_settings, clock.clone()).await.unwrap();
   let rings: Arc<Vec<Vec<AtomicSample>>> = Arc::new(
@@ -218,7 +241,7 @@ async fn plays_and_records_through_usbip() {
     let mut media_clock = MediaClock::new(false);
     if let Some(overlay) = clock_rx.get() {
       media_clock.update_overlay(*overlay);
-      if let Some(now) = media_clock.wrapping_now_in_timebase(RATE as u64) {
+      if let Some(now) = media_clock.wrapping_now_in_timebase(rate as u64) {
         break now;
       }
     }
@@ -228,7 +251,8 @@ async fn plays_and_records_through_usbip() {
     .await;
 
   // the card's recording channels subscribed to it, as saved by a controller's routing
-  let card_settings = settings("soundcard_test_card", 42, 10200, CHANNELS, CHANNELS);
+  let card_settings =
+    settings(&format!("soundcard_test_card_{rate}"), pid + 1, port + 100, CHANNELS, CHANNELS, rate);
   let card_hostname = card_settings.self_info.friendly_hostname.clone();
   let dir = std::path::PathBuf::from(state_dir(&card_settings.self_info));
   std::fs::create_dir_all(&dir).unwrap();
@@ -244,24 +268,26 @@ async fn plays_and_records_through_usbip() {
   let clock_for_engine = clock.clone();
   let (engine, server) = tokio::task::spawn_blocking(move || {
     let channels = [CardChannels { playback: CHANNELS, capture: CHANNELS }];
-    let lead = Config::default().playback_lead(RATE);
+    let lead = Config::default().playback_lead(rate);
     let mut engine = Engine::new(card_settings, &channels, lead, Some(clock_for_engine)).unwrap();
     let card_clock = engine.start().unwrap();
     let server = Server::start(0, card_clock).unwrap();
     let card = CardConfig { name: "Test card".into(), playback_channels: 2, capture_channels: 2 };
     let streams = engine.card_streams().pop().unwrap();
     server
-      .add("1-1", Arc::new(Uac2Device::new(card_uac2_config(&card, 0, "test", RATE), streams).unwrap()));
+      .add("1-1", Arc::new(Uac2Device::new(card_uac2_config(&card, 0, "test", rate), streams).unwrap()));
     (engine, server)
   })
   .await
   .unwrap();
 
   // receiver of the card's playback
-  let mut rx =
-    DeviceServer::try_start_with_clock(settings("soundcard_test_rx", 43, 10300, CHANNELS, 0), clock)
-      .await
-      .unwrap();
+  let mut rx = DeviceServer::try_start_with_clock(
+    settings(&format!("soundcard_test_rx_{rate}"), pid + 2, port + 200, CHANNELS, 0, rate),
+    clock,
+  )
+  .await
+  .unwrap();
   let played = Arc::new(Mutex::new(Checker::default()));
   let checker = played.clone();
   rx.receive_with_callback(Box::new(move |count: usize, channels: &Vec<Vec<Sample>>| {
@@ -281,11 +307,11 @@ async fn plays_and_records_through_usbip() {
   let captured = Arc::new(Mutex::new(Checker::default()));
   let client = {
     let (port, stop, captured) = (server.port(), stop.clone(), captured.clone());
-    std::thread::spawn(move || windows_client(port, stop, captured))
+    std::thread::spawn(move || windows_client(port, stop, captured, rate))
   };
   let enough = || {
-    played.lock().unwrap().matched >= CHANNELS * RATE as usize * 2
-      && captured.lock().unwrap().matched >= CHANNELS * RATE as usize * 2
+    played.lock().unwrap().matched >= CHANNELS * rate as usize * 2
+      && captured.lock().unwrap().matched >= CHANNELS * rate as usize * 2
   };
   let deadline = Instant::now() + Duration::from_secs(30);
   while !enough() && Instant::now() < deadline {
@@ -301,7 +327,6 @@ async fn plays_and_records_through_usbip() {
   })
   .await
   .unwrap();
-  let _ = std::fs::remove_dir_all(&state_home);
 
   let (played, captured) = (played.lock().unwrap(), captured.lock().unwrap());
   println!(
@@ -310,8 +335,8 @@ async fn plays_and_records_through_usbip() {
   );
   assert_eq!(captured.mismatch, None, "recorded exactly what was transmitted, or silence");
   assert_eq!(played.mismatch, None, "transmitted exactly what was played, or silence");
-  assert!(captured.matched >= CHANNELS * RATE as usize * 2, "two seconds recorded exactly");
-  assert!(played.matched >= CHANNELS * RATE as usize * 2, "two seconds played exactly");
+  assert!(captured.matched >= CHANNELS * rate as usize * 2, "{rate} Hz: two seconds recorded exactly");
+  assert!(played.matched >= CHANNELS * rate as usize * 2, "{rate} Hz: two seconds played exactly");
   // shared CI machines stall threads now and then: only that may make audio late (silence)
   assert!(played.silent <= played.matched / 10, "played audio mostly on time");
 }

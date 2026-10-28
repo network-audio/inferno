@@ -1,7 +1,9 @@
 //! A minimal WASAPI application for the end-to-end test: plays a file to a sound card and records one, in
-//! exclusive mode, so that the samples pass bit-exact (24 bits in 32-bit integers, interleaved, 48 kHz).
+//! exclusive mode, so that the samples pass bit-exact (24 bits in 32-bit integers, interleaved, at the card's
+//! rate).
 //!
-//! `wasapi_host --card NAME --channels 2 --play FILE --record FILE --seconds S [--until-file F]`: waits for
+//! `wasapi_host --card NAME --channels 2 [--rate 48000] --play FILE --record FILE --seconds S [--until-file F]`:
+//! waits for
 //! the card's endpoints (`Speakers (NAME)`, `Microphone (NAME)`), plays FILE from its start and records until
 //! S seconds have passed or F exists.
 
@@ -41,7 +43,6 @@ mod host {
     },
   };
 
-  const RATE: u32 = 48000;
   const PCM: GUID = GUID::from_u128(0x00000001_0000_0010_8000_00aa00389b71);
 
   fn at(call: &'static str) -> impl Fn(windows::core::Error) -> String {
@@ -70,14 +71,14 @@ mod host {
     Ok(None)
   }
 
-  fn open(device: &IMMDevice, channels: u16) -> Result<IAudioClient, String> {
+  fn open(device: &IMMDevice, channels: u16, rate: u32) -> Result<IAudioClient, String> {
     let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }.map_err(at("Activate"))?;
     let format = WAVEFORMATEXTENSIBLE {
       Format: WAVEFORMATEX {
         wFormatTag: 0xfffe,
         nChannels: channels,
-        nSamplesPerSec: RATE,
-        nAvgBytesPerSec: RATE * 4 * channels as u32,
+        nSamplesPerSec: rate,
+        nAvgBytesPerSec: rate * 4 * channels as u32,
         nBlockAlign: 4 * channels,
         wBitsPerSample: 32,
         cbSize: 22,
@@ -99,6 +100,7 @@ mod host {
     let card = arg(&args, "--card").ok_or("--card")?;
     let channels: u16 =
       arg(&args, "--channels").unwrap_or("2".into()).parse().map_err(|_| "--channels")?;
+    let rate: u32 = arg(&args, "--rate").unwrap_or("48000".into()).parse().map_err(|_| "--rate")?;
     let source =
       std::fs::read(arg(&args, "--play").ok_or("--play")?).map_err(|e| format!("--play: {e}"))?;
     let mut recording = std::fs::File::create(arg(&args, "--record").ok_or("--record")?)
@@ -119,8 +121,8 @@ mod host {
       std::thread::sleep(Duration::from_millis(500));
     };
     println!("found {speakers} and {microphone} after {:.1} s", waiting.elapsed().as_secs_f64());
-    let render = open(&render_device, channels)?;
-    let capture = open(&capture_device, channels)?;
+    let render = open(&render_device, channels, rate)?;
+    let capture = open(&capture_device, channels, rate)?;
     let render_client: IAudioRenderClient =
       unsafe { render.GetService() }.map_err(at("GetService render"))?;
     let capture_client: IAudioCaptureClient =
@@ -128,7 +130,7 @@ mod host {
     let buffer = unsafe { render.GetBufferSize() }.map_err(at("GetBufferSize"))?;
     let mut period = 0i64;
     unsafe { render.GetDevicePeriod(Some(&mut period), None) }.map_err(at("GetDevicePeriod"))?;
-    let period_frames = (period as u64 * RATE as u64 / 10_000_000).max(1) as u32;
+    let period_frames = (period as u64 * rate as u64 / 10_000_000).max(1) as u32;
     let frame_bytes = 4 * channels as usize;
     unsafe { capture.Start() }.map_err(at("Start capture"))?;
     unsafe { render.Start() }.map_err(at("Start render"))?;

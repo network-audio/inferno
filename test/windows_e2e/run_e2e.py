@@ -8,6 +8,7 @@ Scenarios:
 * soundcard: a virtual sound card (inferno_soundcard, attached through usbip-win2), played and recorded in
   exclusive mode by a minimal WASAPI application (the `wasapi_host` example): Pipe2inferno -> the card's
   microphone, recorded; another signal played to the card's speakers -> Inferno2pipe
+* soundcard-44k: as soundcard, with the devices at 44.1 kHz (the card's microframes carry 5 or 6 frames)
 * pipe-leader: as pipe, without the simulated leader: one of the devices (leader candidates by default,
   CLOCK_LEADER=auto) leads the clock
 
@@ -28,7 +29,7 @@ import sys
 import time
 from pathlib import Path
 
-SAMPLE_RATE = 48000
+SAMPLE_RATE = 48000  # 44100 in soundcard-44k
 CHANNELS = 2
 SOURCE_SECONDS = 150
 # audio to record once subscribed
@@ -313,7 +314,8 @@ def soundcard_scenario(args, procs, exe):
     procs.start("soundcard", [args.bin_dir / f"inferno_soundcard{exe}", "--no-tray"],
                 dict(device_env(CARD_DEVICE_NAME, ip(1), 3), INFERNO_SOUNDCARD_CONFIG=str(config)))
     host = procs.start("wasapi_host", [args.bin_dir / "examples" / f"wasapi_host{exe}", "--card", CARD_NAME,
-                                       "--channels", str(CHANNELS), "--play", out / "from_card.raw",
+                                       "--channels", str(CHANNELS), "--rate", str(SAMPLE_RATE),
+                                       "--play", out / "from_card.raw",
                                        "--record", card_recording, "--seconds", "300", "--until-file", stop_file],
                        dict(os.environ))
     rx = procs.start("rx", [args.bin_dir / f"inferno2pipe{exe}", "-c", str(CHANNELS), "-o", rx_recording],
@@ -355,12 +357,16 @@ def main():
     # the Windows console's code page can't print ✅/❌
     sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scenario", choices=["pipe", "asio", "soundcard", "pipe-leader"], default="pipe")
+    parser.add_argument("--scenario", choices=["pipe", "asio", "soundcard", "soundcard-44k", "pipe-leader"],
+                        default="pipe")
     parser.add_argument("--bin-dir", type=Path, required=True)
     parser.add_argument("--ips", required=True, help="comma-separated addresses of this host for the devices")
     parser.add_argument("--out-dir", type=Path, required=True)
     args = parser.parse_args()
     args.ips = args.ips.split(",")
+    if args.scenario == "soundcard-44k":
+        global SAMPLE_RATE
+        SAMPLE_RATE = 44100
     args.out_dir.mkdir(parents=True, exist_ok=True)
     exe = ".exe" if sys.platform == "win32" else ""
 
@@ -371,7 +377,7 @@ def main():
     ok = False
     try:
         scenarios = {"pipe": pipe_scenario, "asio": asio_scenario, "soundcard": soundcard_scenario,
-                     "pipe-leader": pipe_scenario}
+                     "soundcard-44k": soundcard_scenario, "pipe-leader": pipe_scenario}
         ok = scenarios[args.scenario](args, procs, exe)
         return 0 if ok else 1
     finally:
