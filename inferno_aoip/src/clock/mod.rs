@@ -34,8 +34,12 @@ pub struct ClockOverlay {
 }
 
 /// `clock_id` of the platform's monotonic clock, see [`ClockOverlay`].
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub const MONOTONIC_CLOCK_ID: i64 = libc::CLOCK_MONOTONIC as i64;
+/// `clock_id` of the platform's monotonic clock, see [`ClockOverlay`]: on macOS the raw one, which NTP doesn't
+/// slew (`CLOCK_MONOTONIC` is), ticking with Core Audio's host time (`mach_absolute_time`).
+#[cfg(target_os = "macos")]
+pub const MONOTONIC_CLOCK_ID: i64 = libc::CLOCK_MONOTONIC_RAW as i64;
 /// `clock_id` of the platform's monotonic clock, see [`ClockOverlay`].
 #[cfg(not(unix))]
 pub const MONOTONIC_CLOCK_ID: i64 = 1;
@@ -257,6 +261,24 @@ mod tests {
       ClockOverlay { clock_id: MONOTONIC_CLOCK_ID, last_sync: 1000, shift: 50, freq_scale: 0.001 };
     assert_eq!(overlay.underlying_to_overlay_ns(1000), 1050);
     assert_eq!(overlay.underlying_to_overlay_ns(1_001_000), 1_001_000 + 50 + 1000);
+  }
+
+  /// The media clock must tick at the rate of the computer's own clock, which audio APIs time by (Core
+  /// Audio's host time on macOS): not slewed by NTP, which on macOS `CLOCK_MONOTONIC` is (on CI runners'
+  /// virtual machines by thousands of ppm).
+  #[test]
+  #[cfg(target_os = "macos")]
+  fn monotonic_clock_ticks_with_the_host_clock() {
+    let mut timebase = libc::mach_timebase_info { numer: 0, denom: 0 };
+    unsafe { libc::mach_timebase_info(&mut timebase) };
+    let host_ns =
+      || unsafe { libc::mach_absolute_time() } as f64 * timebase.numer as f64 / timebase.denom as f64;
+    let overlay = ClockOverlay::monotonic();
+    let (clock_start, host_start) = (overlay.now_ns(), host_ns());
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let (clock, host) = ((overlay.now_ns() - clock_start) as f64, host_ns() - host_start);
+    let ppm = (clock / host - 1.0) * 1e6;
+    assert!(ppm.abs() < 100.0, "the monotonic clock runs {ppm:.0} ppm off the host clock");
   }
 
   #[test]
