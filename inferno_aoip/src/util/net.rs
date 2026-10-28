@@ -116,12 +116,19 @@ pub fn multicast_receiver(
   let socket = Socket::new(Domain::IPV4, Type::DGRAM, None)?;
   // each receiver gets a copy of the group's packets
   socket.set_reuse_address(true)?;
-  // bound to the group address: only this group's packets, not other groups' on the same port
-  #[cfg(not(windows))]
-  socket.bind(&group.into())?;
-  // Windows can't bind to a multicast address: it receives other joined groups' packets on this port too
-  #[cfg(windows)]
-  socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, group.port()).into())?;
+  // Windows can't bind to a multicast address, and macOS lets processes without root privileges bind ports
+  // below 1024 (PTP's) only to the unspecified address: those receive other joined groups' packets on this
+  // port too (and unicast)
+  let unspecified = cfg!(windows) || (cfg!(target_os = "macos") && group.port() < 1024);
+  if unspecified {
+    // on macOS several sockets bound to the unspecified address share a port only with SO_REUSEPORT
+    #[cfg(target_os = "macos")]
+    socket.set_reuse_port(true)?;
+    socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, group.port()).into())?;
+  } else {
+    // bound to the group address: only this group's packets, not other groups' on the same port
+    socket.bind(&group.into())?;
+  }
   socket.join_multicast_v4(group.ip(), &interface_ip)?;
   socket.set_nonblocking(true)?;
   Ok(socket.into())
@@ -132,10 +139,8 @@ mod multicast_tests {
   use super::*;
   use std::time::{Duration, Instant};
 
-  /// Several devices (or other software) on one host receive the same multicast flow.
-  #[test]
-  fn two_receivers_of_one_multicast_group_on_one_host() {
-    let group = SocketAddrV4::new(Ipv4Addr::new(239, 255, 77, 1), 4321);
+  /// Two receivers of `group` on the loopback interface, both getting a packet sent to it.
+  fn two_receivers_get(group: SocketAddrV4) {
     let lo = Ipv4Addr::LOCALHOST;
     let a = multicast_receiver(group, lo).expect("first receiver");
     let b = multicast_receiver(group, lo).expect("second receiver of the same group and port");
@@ -162,5 +167,19 @@ mod multicast_tests {
         }
       }
     }
+  }
+
+  /// Several devices (or other software) on one host receive the same multicast flow.
+  #[test]
+  fn two_receivers_of_one_multicast_group_on_one_host() {
+    two_receivers_get(SocketAddrV4::new(Ipv4Addr::new(239, 255, 77, 1), 4321));
+  }
+
+  /// PTP's multicast group on its event port, below 1024: macOS lets processes without root privileges use
+  /// those ports on the unspecified address only (Linux not at all, by default).
+  #[test]
+  #[cfg(target_os = "macos")]
+  fn privileged_ports_without_root() {
+    two_receivers_get(SocketAddrV4::new(Ipv4Addr::new(224, 0, 1, 129), 319));
   }
 }

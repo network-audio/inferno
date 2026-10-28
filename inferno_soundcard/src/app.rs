@@ -1,21 +1,22 @@
-//! Runs the configured sound cards: the engine, the USB/IP server exporting a USB audio device per card, and
-//! their attachment through usbip-win2. Rebuilt whenever the configuration changes.
+//! Runs the configured sound cards: the engine, and how the cards reach the operating system's audio (the
+//! transport): on Windows, a USB/IP server exporting a USB audio device per card, attached through
+//! usbip-win2; on macOS, the memory shared with the Core Audio plug-in. Rebuilt whenever the configuration
+//! changes.
 
 use std::{
-  path::PathBuf,
   sync::{mpsc, Arc, Mutex},
   time::{Duration, Instant},
 };
 
 use inferno_driver_core::DeviceError;
-use log::{error, info, warn};
+use log::{error, info};
 use serde::Serialize;
-use usbip_audio::{uac2::Uac2Device, usbip_exe, Server};
 
-use crate::{
-  config::{card_uac2_config, Config},
-  engine::Engine,
-};
+#[cfg(target_os = "macos")]
+use crate::coreaudio as transport;
+#[cfg(not(target_os = "macos"))]
+use crate::usbip as transport;
+use crate::{config::Config, engine::Engine};
 
 /// Waiting for the device's clock, how long before trying again (with a fresh device).
 const CLOCK_TIMEOUT: Duration = Duration::from_secs(60);
@@ -46,31 +47,17 @@ pub struct CardStatus {
   pub tx_channels: Option<(usize, usize)>,
   /// the device's RX channels the card records from
   pub rx_channels: Option<(usize, usize)>,
-  /// the usbip-win2 port it's attached to
+  /// the usbip-win2 port it's attached to (Windows)
+  #[serde(skip_serializing_if = "Option::is_none")]
   pub usbip_port: Option<u32>,
 }
 
 pub type SharedStatus = Arc<Mutex<Status>>;
 
-/// The running cards; detached and stopped when dropped.
+/// The running cards: the transport is stopped first, then the engine.
 struct Running {
-  // dropped in this order: detached, unexported, then the device stopped
-  usbip: Option<PathBuf>,
-  attached: Vec<u32>,
-  _server: Server,
+  _transport: transport::Exported,
   _engine: Engine,
-}
-
-impl Drop for Running {
-  fn drop(&mut self) {
-    if let Some(usbip) = &self.usbip {
-      for &port in &self.attached {
-        if let Err(e) = usbip_exe::detach(usbip, port) {
-          warn!("{e}");
-        }
-      }
-    }
-  }
 }
 
 fn set_state(status: &SharedStatus, state: impl Into<String>) {
@@ -96,8 +83,9 @@ fn start(
   let device_id: String =
     settings.self_info.factory_device_id.iter().map(|b| format!("{b:02x}")).collect();
   let sample_rate = settings.self_info.sample_rate;
+  let lead = config.playback_lead(sample_rate);
   let mut engine =
-    Engine::new(settings, &config.card_channels(), config.playback_lead(sample_rate), None)
+    Engine::with_memory(settings, &config.region_cards(&device_id), lead, None, transport::allocate())
       .map_err(|e| fail(e.to_string()))?;
 
   set_state(status, "waiting for the clock");
@@ -117,64 +105,36 @@ fn start(
     }
   };
 
-  let server = Server::start(0, clock).map_err(|e| fail(format!("USB/IP server: {e}")))?;
-  let mut cards = vec![];
   let (mut rx, mut tx) = (0, 0);
-  for (index, (card, streams)) in config.cards.iter().zip(engine.card_streams()).enumerate() {
-    let device = Uac2Device::new(card_uac2_config(card, index, &device_id, sample_rate), streams)
-      .map_err(|e| fail(format!("{}: {e}", card.name)))?;
-    let busid = format!("1-{}", index + 1);
-    server.add(&busid, Arc::new(device));
-    let range = |start: usize, count: u16| (count > 0).then(|| (start + 1, start + count as usize));
-    cards.push((
-      busid,
-      CardStatus {
+  let mut cards: Vec<CardStatus> = config
+    .cards
+    .iter()
+    .map(|card| {
+      let range = |start: usize, count: u16| (count > 0).then(|| (start + 1, start + count as usize));
+      let status = CardStatus {
         name: card.name.trim().into(),
         playback_channels: card.playback_channels,
         capture_channels: card.capture_channels,
         tx_channels: range(tx, card.playback_channels),
         rx_channels: range(rx, card.capture_channels),
         usbip_port: None,
-      },
-    ));
-    (rx, tx) = (rx + card.capture_channels as usize, tx + card.playback_channels as usize);
-  }
-
-  let usbip = usbip_exe::find();
-  let mut running = Running { usbip: usbip.clone(), attached: vec![], _server: server, _engine: engine };
-  match &usbip {
-    Some(usbip) => {
-      for (busid, card) in &mut cards {
-        match usbip_exe::attach(usbip, running._server.port(), busid) {
-          Ok(port) => {
-            info!("{} attached to usbip-win2 port {port}", card.name);
-            card.usbip_port = Some(port);
-            running.attached.push(port);
-          }
-          Err(e) => error!("{}: {e}", card.name),
-        }
-      }
-    }
-    None => warn!(
-      "usbip-win2 (usbip.exe) not found: the cards are served on 127.0.0.1:{}, but not attached",
-      running._server.port()
-    ),
-  }
-  let attached = cards.iter().filter(|(_, c)| c.usbip_port.is_some()).count();
+      };
+      (rx, tx) = (rx + card.capture_channels as usize, tx + card.playback_channels as usize);
+      status
+    })
+    .collect();
+  let (exported, state) =
+    transport::export(&engine, clock, config, &device_id, &mut cards, status).map_err(fail)?;
   let mut s = status.lock().unwrap();
   *s = Status {
-    state: if attached == cards.len() {
-      "running".into()
-    } else {
-      format!("running, {} of {} cards attached", attached, cards.len())
-    },
+    state,
     running: true,
     device_name: Some(device_name),
     sample_rate: Some(sample_rate),
-    cards: cards.into_iter().map(|(_, c)| c).collect(),
+    cards,
   };
   info!("{}", s.state);
-  Ok(running)
+  Ok(Running { _transport: exported, _engine: engine })
 }
 
 /// Runs the configured cards until `Command::Quit`.

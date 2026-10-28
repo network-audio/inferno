@@ -1,0 +1,106 @@
+name: macOS end-to-end
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    # Inferno devices on one Mac, routed with netaudio (see test/e2e):
+    # pipe: Pipe2inferno -> Inferno2pipe; pipe-leader: the same, one of them leading the clock;
+    # soundcard: Pipe2inferno -> sound card (the installed service and Core Audio plug-in) -> Core Audio
+    # application -> Inferno2pipe
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [pipe, pipe-leader, soundcard, soundcard-44k]
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: |
+          cargo build -p pipe2inferno -p inferno2pipe
+          cargo build -p inferno_aoip --example ptpv1_test_leader
+          cargo build -p inferno_coreaudio --example coreaudio_host
+      - run: pip install netaudio
+      - name: Device addresses
+        run: |
+          # netaudio 0.4 keys devices by IP: they share the runner's
+          interface=$(route -n get default | awk '/interface:/ { print $2 }')
+          ip=$(ipconfig getifaddr "$interface")
+          echo "interface $interface, address $ip"
+          echo "IPS=$ip,$ip,$ip" >> "$GITHUB_ENV"
+          echo "BIND_IP=$ip" >> "$GITHUB_ENV"
+      - name: Install the sound cards
+        if: startsWith(matrix.scenario, 'soundcard')
+        timeout-minutes: 10
+        run: |
+          packaging/macos/build-pkg.sh --debug --out inferno-soundcard-macos.pkg
+          sudo installer -pkg inferno-soundcard-macos.pkg -target /
+          # the service on the runner's address, leading the clock (no Dante devices here)
+          echo "{\"settings\": {\"BIND_IP\": \"$BIND_IP\"}}" | sudo tee "/Library/Application Support/Inferno/soundcard.json"
+          sudo launchctl kickstart -k system/org.network-audio.inferno.soundcard
+          sudo launchctl print system/org.network-audio.inferno.soundcard | head -n 40
+          # the default card appears in Core Audio once the service has a clock
+          for attempt in $(seq 1 45); do
+            target/debug/examples/coreaudio_host --list | tee devices.txt
+            grep -q '"Inferno"' devices.txt && break
+            sleep 2
+          done
+          cat "/Library/Logs/Inferno/soundcard.log"
+          grep -q '"Inferno"' devices.txt || { echo "::error::the sound card didn't appear in Core Audio"; exit 1; }
+      - name: Volume and mute, as System Settings sets them
+        if: startsWith(matrix.scenario, 'soundcard')
+        timeout-minutes: 5
+        run: |
+          host=target/debug/examples/coreaudio_host
+          $host --card Inferno --volume 0.5 --mute 1 | tee volume.txt
+          grep -q 'volume 0.5, mute 1' volume.txt || { echo "::error::the output volume wasn't set"; exit 1; }
+          $host --card Inferno --input --volume 0.25 | grep -q 'volume 0.25, mute 0' || { echo "::error::the input volume wasn't set"; exit 1; }
+          # remembered when the card comes back (the service restarted)
+          sudo launchctl kickstart -k system/org.network-audio.inferno.soundcard
+          sleep 5
+          for attempt in $(seq 1 45); do
+            $host --card Inferno --volume > volume.txt 2>&1 && break
+            sleep 2
+          done
+          cat volume.txt
+          grep -q 'volume 0.5, mute 1' volume.txt || { echo "::error::the volume wasn't remembered"; exit 1; }
+          $host --card Inferno --input --volume | grep -q 'volume 0.25' || { echo "::error::the input volume wasn't remembered"; exit 1; }
+          $host --card Inferno --volume 1 --mute 0
+          $host --card Inferno --input --volume 1
+      - name: Allow recording
+        if: startsWith(matrix.scenario, 'soundcard')
+        run: sudo python3 test/e2e/grant_microphone.py "$PWD/target/debug/examples/coreaudio_host" /bin/bash
+      - timeout-minutes: 10
+        run: |
+          installed=$([[ "${{ matrix.scenario }}" == soundcard* ]] && echo --installed-soundcard || true)
+          # as root: macOS's local network privacy blocks the runner's processes from multicast ("No route to
+          # host"); root processes (and launchd daemons, like the sound card service) are allowed
+          sudo -E env "PATH=$PATH" python test/e2e/run_e2e.py --scenario ${{ matrix.scenario }} --bin-dir target/debug --ips "$IPS" --out-dir e2e-out $installed
+      - name: Collect the system's logs
+        if: failure()
+        run: |
+          sudo mkdir -p e2e-out
+          sudo chown -R "$(id -u)" e2e-out
+          cp "/Library/Logs/Inferno/soundcard.log" e2e-out/ 2>/dev/null || true
+          log show --last 20m --style compact --predicate 'eventMessage CONTAINS "Inferno" OR process == "coreaudiod" OR process CONTAINS "Core Audio"' > e2e-out/system.log || true
+          tail -n 200 e2e-out/system.log || true
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-e2e-logs-${{ matrix.scenario }}
+          path: |
+            e2e-out/*.log
+            e2e-out/*recording.raw

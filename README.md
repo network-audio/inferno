@@ -4,7 +4,7 @@
 
 This project is named after [a place](https://en.wikipedia.org/wiki/Inferno_(Dante)) destined for those who create undocumented network protocols.
 
-Inferno makes a Linux or Windows computer a Dante device: applications play to and record from the Dante network through a virtual soundcard, routed with Dante Controller or [NetAudio](https://netaudio.app/), its open source alternative ([network-audio-controller](https://github.com/chris-ritsen/network-audio-controller)), like any other device.
+Inferno makes a Linux, Windows or macOS computer a Dante device: applications play to and record from the Dante network through a virtual soundcard, routed with Dante Controller or [NetAudio](https://netaudio.app/), its open source alternative ([network-audio-controller](https://github.com/chris-ritsen/network-audio-controller)), like any other device.
 
 Big thanks to [Project Pendulum](https://github.com/pendulum-project) (by [Trifecta Tech Foundation](https://trifectatech.org/)) for creating and maintaining [Statime](https://github.com/pendulum-project/statime) and collaboration on features needed for audiovisual networks functionality! Audio transmission would be much more difficult to implement without it.
 
@@ -18,9 +18,9 @@ Big thanks to [Project Pendulum](https://github.com/pendulum-project) (by [Trife
 |   | **Inferno** | [DVS](https://www.getdante.com/products/software-essentials/dante-virtual-soundcard) | [AES67 Linux daemon](https://github.com/bondagit/aes67-linux-daemon) |
 |---|---|---|---|
 | Maturity | ✅ Used in production | ✅ Production-ready | ✅ Probably stable |
-| Platforms | Linux, Windows | Mac, Windows  | Linux |
+| Platforms | Linux, Windows, macOS | Mac, Windows  | Linux |
 | Supported protocols | Dante | Dante | AES67 |
-| Directly supported audio backends | ALSA, ASIO, Windows sound devices | CoreAudio, ASIO, WDM | ALSA |
+| Directly supported audio backends | ALSA, ASIO, Windows sound devices, Core Audio | CoreAudio, ASIO, WDM | ALSA |
 | Works with DAWs | ✅ Yes ([tested with Ardour](alsa_pcm_inferno/README.md#daws)) | ✅ Yes | ✅ Yes |
 | Route audio using Dante Controller patchbay | ✅ Yes! | ✅ Yes | 🚫 AES67->Dante only |
 | Configurable using Dante Controller | ⏳ A bit (channel names, TX multicasts) | ✅ Yes | 🚫 No |
@@ -52,6 +52,8 @@ Big thanks to [Project Pendulum](https://github.com/pendulum-project) (by [Trife
   * Inferno's built-in PTPv1 follower (`CLOCK_SOURCE=ptpv1`) timestamps on the monotonic clock, so NTP doesn't affect it. Its timestamps are taken in user space, so they're less precise than the kernel's or the network card's.
   * with hardware timestamping, use the network card's clock: `CLOCK_PATH=/dev/ptp0` with our Statime fork (PTPv1, `hardware-clock = "auto"`), or with a [PTP daemon that doesn't use the system clock](https://gitlab.freedesktop.org/pipewire/pipewire/-/wikis/AES67#setting-up-ptp-time-sync) such as ptp4l, which needs PTPv2 (AES67) enabled on one of the Dante devices (see [Hardware timestamping](#hardware-timestamping)).
   * stop NTP synchronization while using Inferno.
+* macOS 15 and later ask for **Local Network** access for programs sending to the local network: allow it for the terminal running Inferno2pipe or Pipe2inferno (System Settings > Privacy & Security > Local Network), or they can't send PTP or multicast ("No route to host"). The sound card service, a launchd daemon, needs no permission.
+* macOS: the sound card service, like Windows, uses the built-in PTPv1 follower and needs a clock leader (a Dante device or an Inferno device). The cards run at the network's sample rate; Core Audio converts other rates for applications.
 * Windows: Inferno uses its built-in PTPv1 follower, so it needs a clock leader on the network: a Dante device or, without one, an Inferno device (see [`CLOCK_LEADER`](#settings)). It also needs UDP 319 and 320 allowed through the firewall. The sound cards appear, and the ASIO driver starts, once the device has the clock. The sound cards run at the network's sample rate (e.g. 44.1, 48 or 96 kHz); Windows converts other rates for most applications (shared mode).
 * Inferno2pipe records what it receives, and silence while nothing is connected or a transmitter stops: a channel that has received nothing for 200 ms no longer holds the recording back, which goes on along the media clock. Before the device has a clock it records only what it receives.
 
@@ -111,6 +113,22 @@ Big thanks to [Project Pendulum](https://github.com/pendulum-project) (by [Trife
 * ASIO driver: the control panel button opens `%APPDATA%\Inferno\inferno_asio.conf`, `KEY=VALUE` lines with the [settings](#settings), e.g. `NAME`, `RX_CHANNELS`, `TX_CHANNELS`. Restart the application after changing them. The log is `%TEMP%\inferno_asio.log`.
 * Most Windows applications (shared mode) open at most 32 channels of a sound card; larger cards work with applications that open them in exclusive mode.
 * Device state (subscriptions, channel names, multicast flows) is saved in `%LOCALAPPDATA%\inferno_aoip\<device ID>`.
+
+## macOS
+**Features:**
+* [sound cards](inferno_soundcard/README.md#macos) (`inferno_soundcard` and `inferno_coreaudio`): Core Audio devices for any Mac application, DAWs included, as many cards as you like, each with its own playback and recording channels. Set up on the same settings page as on Windows. They're devices of a Core Audio plug-in (a user-space driver, no kernel extension), which plays and records through memory shared with the sound card service
+* built-in PTPv1 clock: no PTP daemon needed (as on Windows)
+* `Inferno2pipe` and `pipe2inferno` build and run too (with `CLOCK_SOURCE=ptpv1`)
+
+**Install:** build the package and install it (Rust and the Xcode command line tools needed):
+```
+git clone --recursive https://github.com/network-audio/inferno.git
+cd inferno && packaging/macos/build-pkg.sh
+sudo installer -pkg inferno-soundcard-macos.pkg -target /
+```
+It installs the Core Audio plug-in, starts the sound card service (a launchd daemon in an account of its own, `_inferno`) and has Core Audio load the plug-in.
+
+**Configuration:** open **Inferno Sound Cards** from Applications, or `http://127.0.0.1:47800/`. The configuration is saved in `/Library/Application Support/Inferno/soundcard.json`, the log in `/Library/Logs/Inferno/soundcard.log`. `sudo "/Library/Application Support/Inferno/uninstall.sh"` removes them (`--purge` also removes the settings).
 
 ## Routing
 Inferno devices appear on the network like any Dante device: route their channels with Dante Controller or [NetAudio](https://netaudio.app/), an open source alternative ([network-audio-controller](https://github.com/chris-ritsen/network-audio-controller)). NetAudio runs on Linux, macOS and Windows as a command line tool, web app and daemon (`uv tool install netaudio`), and on iPhone and iPad (beta). For example, to subscribe an Inferno device's receive channels to a transmitter's channels, and list the subscriptions:
@@ -215,11 +233,13 @@ This project is dual licensed under the GPLv3-or-later and AGPLv3-or-later. You 
 * `inferno_driver_core` - platform-neutral core of virtual soundcard drivers: the device shared by an application's streams, and the stream lifecycle (prepare, start, stop, restart without dropping flows, waiting for the clock). **Start here if you want to write a driver for another audio API** (CoreAudio, Windows): translate its callbacks to a `Stream`'s, like `alsa_pcm_inferno` does
 * `pipe2inferno` - the opposite of `inferno2pipe`: transmits interleaved 32-bit integer samples from a file or a pipe (`-` for stdin). For testing, and for sending audio without an audio stack
 * `asio_inferno` - ASIO driver: a virtual soundcard for Windows DAWs and other ASIO hosts (see [its README](asio_inferno/README.md))
-* `inferno_soundcard` - Windows sound cards on the Dante network, for any Windows application: USB audio devices served over USB/IP, attached by the signed usbip-win2 driver, with a settings page and tray icon (see [its README](inferno_soundcard/README.md); installers are on the [releases page](https://github.com/network-audio/inferno/releases))
+* `inferno_soundcard` - Windows and macOS sound cards on the Dante network, for any application, with a settings page: on Windows USB audio devices served over USB/IP, attached by the signed usbip-win2 driver, with a tray icon; on macOS the devices of the Core Audio plug-in (see [its README](inferno_soundcard/README.md); Windows installers are on the [releases page](https://github.com/network-audio/inferno/releases))
+* `inferno_coreaudio` - the macOS sound cards' Core Audio HAL plug-in (an AudioServerPlugIn): plays and records through memory shared with the sound card service, clocked by the Dante media clock
+* `inferno_soundcard_shm` - what the sound card service and the Core Audio plug-in share: the cards' rings, positions and the media clock, and the Mach service that hands them over
 * `alsa_pcm_inferno` - virtual soundcard for ALSA. **Start here if you've ever dreamed of Dante Virtual Soundcard for Linux**
 * `searchfire` - fork of [Searchlight](https://github.com/WilliamVenner/searchlight) mDNS crate, modified for compatibility with Dante's mDNS
 
-`inferno_aoip`, `inferno_driver_core`, `inferno2pipe` and `pipe2inferno` build for Linux, macOS and Windows; the ALSA plugin and `inferno-doctor` are Linux-only, the ASIO driver and the sound cards Windows-only (the sound cards' engine and USB/IP server build and are tested anywhere). The media clock comes from a `ClockSource` (`inferno_aoip::clock`), chosen by [`CLOCK_SOURCE`](#settings): on Unix the default is a PTP daemon at `CLOCK_PATH` (see below), on Windows Inferno's own PTPv1 follower. Applications can also give a device their own with `DeviceServer::try_start_with_clock` (or `Stream::with_clock_source`).
+`inferno_aoip`, `inferno_driver_core`, `inferno2pipe` and `pipe2inferno` build for Linux, macOS and Windows; the ALSA plugin and `inferno-doctor` are Linux-only, the ASIO driver Windows-only, the sound cards Windows and macOS (their engine, the USB/IP server and the Core Audio plug-in's I/O build and are tested anywhere). The media clock comes from a `ClockSource` (`inferno_aoip::clock`), chosen by [`CLOCK_SOURCE`](#settings): on Unix the default is a PTP daemon at `CLOCK_PATH` (see below), on Windows Inferno's own PTPv1 follower. Applications can also give a device their own with `DeviceServer::try_start_with_clock` (or `Stream::with_clock_source`).
 
 
 # Clocking options
@@ -354,6 +374,16 @@ If you want to contribute but can't code or don't know where to start because th
 
 
 # Changelog
+
+## 0.9.0
+* macOS sound cards: Core Audio devices on the Dante network, for any application, configured on the settings page like on Windows. A Core Audio HAL plug-in (`inferno_coreaudio`, user space) plays and records through Mach shared memory with the sound card service (a launchd daemon in an unprivileged account), clocked by the Dante media clock: Core Audio runs at the network's rate. No 32-channel limit, nor USB's bandwidth limit at 96 kHz. Installer package built by `packaging/macos/build-pkg.sh`. Tested in CI: the plug-in's I/O loopback on every platform, and on macOS Pipe2inferno -> card -> Core Audio application -> Inferno2pipe, bit-exact
+* macOS sound cards: volume and mute controls for playback and recording (System Settings' sliders, the volume keys), remembered per card; full volume is bit-exact
+* macOS: the release package is signed with a Developer ID and notarized (the release workflow, with the repository's signing secrets)
+* sound cards: one engine for both platforms, the rings in a shared region (`inferno_soundcard_shm`)
+* the end-to-end test (now `test/e2e`) also runs on macOS
+* macOS: the PTPv1 follower (`CLOCK_SOURCE=ptpv1`) works without root privileges: its multicast receivers bind PTP's ports (below 1024) to the unspecified address, the only one macOS allows unprivileged processes
+* macOS: the media clock is over `CLOCK_MONOTONIC_RAW`, not NTP-slewed `CLOCK_MONOTONIC` (by thousands of ppm on CI runners): it ticks with the system's host time, as audio APIs do
+* receivers: a gap longer than the ring (a stall, or nothing received for that long) is silence, not partly audio of a ring's lap ago: marking it unready, and closing it with silence, covered only its length modulo the ring
 
 ## 0.8.0
 * sound cards at 44.1 kHz (and other sample rates that aren't multiples of 8 kHz): USB packets carry 5 or 6 frames per 125 µs, as the clock dictates. Tested on Windows in CI (shared and exclusive mode, up to 64 channels) and end-to-end, bit-exact both ways

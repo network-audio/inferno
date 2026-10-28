@@ -176,14 +176,25 @@ impl<T> ProxyToBuffer<T> for ExternalBuffer<T> {
 
 impl ProxyToSamplesBuffer for ExternalBuffer<Atomic<Sample>> {}
 
+/// Positions a ring buffer can report to, e.g. a table in memory shared with another process.
+pub trait PositionTable: Send + Sync {
+  fn position(&self, index: usize) -> &AtomicUsize;
+}
+
+impl PositionTable for Vec<AtomicUsize> {
+  fn position(&self, index: usize) -> &AtomicUsize {
+    &self[index]
+  }
+}
+
 #[derive(Clone)]
 pub struct PositionReportDestination {
-  tab: Arc<Vec<AtomicUsize>>,
+  tab: Arc<dyn PositionTable>,
   offset: usize,
 }
 
 impl PositionReportDestination {
-  pub fn new(tab: Arc<Vec<AtomicUsize>>, offset: usize) -> Self {
+  pub fn new(tab: Arc<impl PositionTable + 'static>, offset: usize) -> Self {
     Self { tab, offset }
   }
 }
@@ -232,10 +243,10 @@ impl<T, P: ProxyToBuffer<Atomic<T>>> RingBufferShared<T, P> {
   #[inline(always)]
   fn commit_readable_pos(&self) {
     if let Some(dest) = &self.readable_pos_dest {
-      dest.tab[dest.offset].store(self.readable_pos.load(Ordering::Relaxed), Ordering::Release);
+      dest.tab.position(dest.offset).store(self.readable_pos.load(Ordering::Relaxed), Ordering::Release);
     }
     if let Some(dest) = &self.written_pos_dest {
-      dest.tab[dest.offset].store(self.writing_pos.load(Ordering::Relaxed), Ordering::Release);
+      dest.tab.position(dest.offset).store(self.writing_pos.load(Ordering::Relaxed), Ordering::Release);
     }
   }
 
@@ -266,6 +277,13 @@ fn for_in_ring(length: usize, start: usize, end: usize, mut cb: impl FnMut(usize
       cb(i);
     }
   }
+}
+
+/// `for_in_ring` over the last `length` items of `start..end` at most: a range longer than the ring covers
+/// each of its slots once (masked, it would only cover the remainder, leaving slots of earlier laps as they were).
+fn for_last_in_ring(length: usize, start: usize, end: usize, cb: impl FnMut(usize)) {
+  let start = if wrapsub(end, start) > length as isize { end.wrapping_sub(length) } else { start };
+  for_in_ring(length, start, end, cb);
 }
 
 impl<P: ProxyToBuffer<Atomic<Sample>>> RingBufferShared<Sample, P> {
@@ -322,7 +340,7 @@ impl<T: Default + NoUninit, P: ProxyToBuffer<Atomic<T>>> RBInput<T, P> {
     let mut hole = wrapsub(start_timestamp, self.rb.writing_pos.load(Ordering::Relaxed)) > 0;
     if hole {
       // Mark it appropriately.
-      for_in_ring(
+      for_last_in_ring(
         self.rb.items_size,
         self.rb.writing_pos.load(Ordering::Relaxed),
         start_timestamp,
@@ -381,7 +399,7 @@ impl<T: Default + NoUninit, P: ProxyToBuffer<Atomic<T>>> RBInput<T, P> {
       let mut hole = false;
       let mut filled = 0usize;
       self.rb.buffer.map(|buffer| {
-        for_in_ring(
+        for_last_in_ring(
           self.rb.items_size,
           self.rb.readable_pos.load(Ordering::Relaxed),
           close_until_pos,
@@ -447,7 +465,7 @@ impl<T: Default + NoUninit, P: ProxyToBuffer<Atomic<T>>> RBInput<T, P> {
       self.rb.writing_pos.store(need_until_pos, Ordering::SeqCst);
       //debug!("storing defaults {until_pos}..{need_until_pos}");
       self.rb.buffer.map(|buffer| {
-        for_in_ring(self.rb.items_size, until_pos, need_until_pos, |i| {
+        for_last_in_ring(self.rb.items_size, until_pos, need_until_pos, |i| {
           buffer[i * self.rb.stride].store(T::default(), Ordering::Relaxed);
           self.item_ready.set(i, true);
         })
@@ -1404,5 +1422,40 @@ mod tests {
       .chain(70..74)
       .collect();
     assert_eq!(buf3, expected);
+  }
+
+  /// Writes 0..12 with a hole fixed on the way, so that the ring's slots 4..12 are marked ready.
+  fn lap_with_ready_slots(
+  ) -> (RBInput<i32, OwnedBuffer<Atomic<i32>>>, RBOutput<i32, OwnedBuffer<Atomic<i32>>>) {
+    let (mut input, output) = new_owned(16, 0, 4);
+    input.write_from_at(0, 0..4);
+    input.write_from_at(6, 6..12);
+    input.write_from_at(4, 4..6);
+    assert_eq!(output.readable_until(), 12);
+    (input, output)
+  }
+
+  #[test]
+  fn a_hole_longer_than_the_ring_is_silence() {
+    // e.g. the receiver stalled for longer than its ring: none of the last lap is audio of this one
+    let (mut input, output) = lap_with_ready_slots();
+    input.write_from_at(32, 32..36);
+    input.write_from_at(36, 36..40);
+    assert_eq!(output.readable_until(), 40);
+    let mut read = vec![-1; 16];
+    assert_eq!(output.read_at(24, &mut read), ReadResult { useful_start_index: 0, useful_end_index: 16 });
+    assert_eq!(read[..8], [0; 8], "positions 24..32 never arrived");
+    assert_eq!(read[8..], [32, 33, 34, 35, 36, 37, 38, 39]);
+  }
+
+  #[test]
+  fn closing_more_than_a_ring_ahead_is_silence() {
+    // nothing received for longer than the ring: what it holds is a lap (or more) old
+    let (mut input, output) = lap_with_ready_slots();
+    input.close_items_until(40);
+    assert_eq!(output.readable_until(), 40);
+    let mut read = vec![-1; 16];
+    assert_eq!(output.read_at(24, &mut read), ReadResult { useful_start_index: 0, useful_end_index: 16 });
+    assert_eq!(read, vec![0; 16]);
   }
 }

@@ -50,7 +50,8 @@ pub use crate::clock::{clock_path_or_default, diagnose_missing_clock};
 pub use crate::clock::{ClockOverlay, FreeRunningClockSource};
 pub use crate::media_clock::{MediaClock, RealTimeClockReceiver};
 pub use crate::ring_buffer::{
-  new_owned, BuffersValid, ExternalBufferParameters, PositionReportDestination, RBInput, WrittenFrom,
+  new_owned, BuffersValid, ExternalBufferParameters, PositionReportDestination, PositionTable, RBInput,
+  WrittenFrom,
 };
 pub use crate::state_storage::state_dir;
 pub use settings::{Settings, SettingsError};

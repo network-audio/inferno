@@ -6,7 +6,7 @@ uses the driver. Route its channels with Dante Controller or [NetAudio](https://
 [network-audio-controller](https://github.com/chris-ritsen/network-audio-controller)).
 
 It's tested in CI with a minimal ASIO host against other Inferno devices and a simulated PTP leader (see
-[`test/windows_e2e`](../test/windows_e2e)).
+[`test/e2e`](../test/e2e)).
 
 ## Install
 

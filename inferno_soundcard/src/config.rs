@@ -3,15 +3,15 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
 use inferno_aoip::device_server::Settings;
+use inferno_soundcard_shm::{RegionCard, MAX_CARDS};
 use serde::{Deserialize, Serialize};
 use usbip_audio::uac2::Uac2Config;
-
-use crate::engine::CardChannels;
 
 /// Windows' shared-mode audio engine opens at most this many channels of a device; more are only usable by
 /// applications opening it in exclusive mode.
 pub const SHARED_MODE_CHANNELS: u16 = 32;
-/// At 44.1 or 48 kHz, as many as fit into a high-speed USB isochronous endpoint.
+/// Channels of a card in each direction. On Windows, at 44.1 or 48 kHz, as many as fit into a high-speed USB
+/// isochronous endpoint.
 pub const MAX_CHANNELS: u16 = 128;
 pub const DEFAULT_UI_PORT: u16 = 47800;
 pub const DEFAULT_PLAYBACK_MARGIN_MS: u32 = 10;
@@ -62,10 +62,14 @@ impl Default for Config {
   }
 }
 
-/// `INFERNO_SOUNDCARD_CONFIG`, or `%APPDATA%\Inferno\soundcard.json`.
+/// `INFERNO_SOUNDCARD_CONFIG`, or `%APPDATA%\Inferno\soundcard.json` (Windows),
+/// `/Library/Application Support/Inferno/soundcard.json` (macOS: the cards are the whole computer's).
 pub fn config_path() -> PathBuf {
   if let Some(path) = std::env::var_os("INFERNO_SOUNDCARD_CONFIG") {
     return path.into();
+  }
+  if cfg!(target_os = "macos") {
+    return PathBuf::from("/Library/Application Support/Inferno/soundcard.json");
   }
   let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
   base.join("Inferno").join("soundcard.json")
@@ -103,6 +107,10 @@ impl Config {
     if let Some(name) = self.name.as_deref().filter(|n| !n.trim().is_empty()) {
       config.insert("NAME".into(), name.trim().into());
     }
+    // Inferno's own PTPv1 follower, as on Windows: no PTP daemon to install (the Unix default is Statime)
+    if cfg!(target_os = "macos") && std::env::var_os("INFERNO_CLOCK_SOURCE").is_none() {
+      config.entry("CLOCK_SOURCE".into()).or_insert_with(|| "ptpv1".into());
+    }
     let unknown = Settings::unknown_keys(&config, &["SOUNDCARD_CONFIG"]);
     if !unknown.is_empty() {
       return Err(format!("unknown settings: {}", unknown.join(", ")));
@@ -110,26 +118,34 @@ impl Config {
     Settings::try_new("Inferno Sound Card", "soundcard", None, &config).map_err(|e| e.to_string())
   }
 
-  pub fn card_channels(&self) -> Vec<CardChannels> {
+  /// The cards of the device `device_id`, each with an id unique to it, the same whenever it's started (by
+  /// which the operating system remembers the card's settings).
+  pub fn region_cards(&self, device_id: &str) -> Vec<RegionCard> {
     self
       .cards
       .iter()
-      .map(|c| CardChannels {
-        playback: c.playback_channels as usize,
-        capture: c.capture_channels as usize,
+      .enumerate()
+      .map(|(index, c)| RegionCard {
+        name: c.name.trim().into(),
+        uid: card_uid(device_id, index),
+        playback_channels: c.playback_channels as usize,
+        capture_channels: c.capture_channels as usize,
       })
       .collect()
   }
 
-  /// What's wrong with the configuration, if anything.
   /// The playback margin in frames at `sample_rate`.
   pub fn playback_lead(&self, sample_rate: u32) -> usize {
     self.playback_margin_ms as usize * sample_rate as usize / 1000
   }
 
+  /// What's wrong with the configuration, if anything.
   pub fn validate(&self) -> Result<(), String> {
     if self.cards.is_empty() {
       return Err("add a sound card".into());
+    }
+    if self.cards.len() > MAX_CARDS {
+      return Err(format!("at most {MAX_CARDS} sound cards"));
     }
     if !(1..=MAX_PLAYBACK_MARGIN_MS).contains(&self.playback_margin_ms) {
       return Err(format!("the playback margin must be 1 to {MAX_PLAYBACK_MARGIN_MS} ms"));
@@ -144,13 +160,24 @@ impl Config {
       if !names.insert(name.to_lowercase()) {
         return Err(format!("two sound cards are named {name:?}"));
       }
+      if card.playback_channels == 0 && card.capture_channels == 0 {
+        return Err(format!("{name}: no channels"));
+      }
       if card.playback_channels > MAX_CHANNELS || card.capture_channels > MAX_CHANNELS {
         return Err(format!("{name}: at most {MAX_CHANNELS} channels"));
       }
-      card_uac2_config(card, 0, "", sample_rate).validate().map_err(|e| format!("{name}: {e}"))?;
+      // USB's bandwidth limits the cards on Windows
+      if !cfg!(target_os = "macos") {
+        card_uac2_config(card, 0, "", sample_rate).validate().map_err(|e| format!("{name}: {e}"))?;
+      }
     }
     Ok(())
   }
+}
+
+/// Card `index` of the device `device_id`: the USB serial number on Windows, the Core Audio device UID on macOS.
+pub fn card_uid(device_id: &str, index: usize) -> String {
+  format!("{device_id}-{}", index + 1)
 }
 
 /// pid.codes test ids, until the project has its own
@@ -171,7 +198,7 @@ pub fn card_uac2_config(
     bcd_device: 0x0100,
     manufacturer: "Inferno".into(),
     product: card.name.trim().into(),
-    serial: format!("{device_id}-{}", index + 1),
+    serial: card_uid(device_id, index),
     sample_rate,
     playback_channels: card.playback_channels,
     capture_channels: card.capture_channels,
@@ -187,8 +214,25 @@ mod tests {
   #[test]
   fn default_is_one_stereo_card() {
     let config = Config::default();
-    assert_eq!(config.card_channels(), vec![CardChannels { playback: 2, capture: 2 }]);
+    let cards = config.region_cards("0011");
+    assert_eq!(
+      cards,
+      [RegionCard {
+        name: "Inferno".into(),
+        uid: "0011-1".into(),
+        playback_channels: 2,
+        capture_channels: 2
+      }]
+    );
     config.validate().unwrap();
+  }
+
+  #[test]
+  #[cfg(any(windows, target_os = "macos"))]
+  fn the_clock_is_inferno_s_own_ptpv1_follower() {
+    use inferno_aoip::clock::ClockSourceKind;
+    let settings = Config::default().device_settings().unwrap();
+    assert_eq!(settings.clock_source, ClockSourceKind::Ptpv1);
   }
 
   #[test]
@@ -233,7 +277,10 @@ mod tests {
     assert!(with(vec![card("A", 128, 128)]).validate().is_ok(), "128 channels at 48 kHz");
     let mut too_fast = rate("96000");
     too_fast.cards = vec![card("A", 128, 0)];
-    assert!(too_fast.validate().is_err(), "128 channels don't fit at 96 kHz");
+    // USB's bandwidth (Windows)
+    assert_eq!(too_fast.validate().is_ok(), cfg!(target_os = "macos"), "128 channels at 96 kHz");
+    let many = (0..=MAX_CARDS).map(|i| card(&format!("{i}"), 2, 2)).collect();
+    assert!(with(many).validate().is_err(), "too many cards");
     let unknown =
       Config { settings: [("BIND_IPP".into(), "1.2.3.4".into())].into(), ..Config::default() };
     assert!(unknown.validate().unwrap_err().contains("BIND_IPP"));

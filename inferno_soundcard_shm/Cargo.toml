@@ -1,0 +1,13 @@
+[package]
+name = "inferno_soundcard_shm"
+description = "Memory shared by the Inferno sound card service and the macOS Core Audio plug-in: the cards' rings and the media clock"
+authors = ["Teo <teodly@lumifaza.org>"]
+license = "GPL-3.0-or-later OR AGPL-3.0-or-later"
+version = "0.1.0"
+edition = "2021"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.4"

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stops the running sound card service before its files are replaced.
+launchctl bootout system/org.network-audio.inferno.soundcard 2>/dev/null || true
+exit 0

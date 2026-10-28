@@ -52,7 +52,7 @@
 <body>
 <main>
   <h1>Inferno Sound Cards</h1>
-  <p class="lead">Windows sound devices on the Dante network. Route their channels with Dante Controller or <a href="https://netaudio.app/" target="_blank" rel="noopener">NetAudio</a>.</p>
+  <p class="lead">{{OS}} sound devices on the Dante network. Route their channels with Dante Controller or <a href="https://netaudio.app/" target="_blank" rel="noopener">NetAudio</a>.</p>
 
   <section>
     <div class="status"><span class="dot" id="dot"></span><strong id="state">Loading…</strong><span id="device" class="note"></span></div>
@@ -65,7 +65,7 @@
       <tbody id="cards"></tbody>
     </table>
     <div class="actions" style="margin-top: 10px"><button id="add">Add a sound card</button></div>
-    <p class="note">Playback channels are what Windows plays to the card: they're transmitted. Recording channels are received, for Windows to record.</p>
+    <p class="note">Playback channels are what {{OS}} plays to the card: they're transmitted. Recording channels are received, for {{OS}} to record.</p>
     <p class="note warn" id="limit" hidden>Most Windows apps (shared mode) can only open up to 32 channels of a device. Larger cards work with apps that open them in exclusive mode; split them into several cards for the others.</p>
   </section>
 
@@ -75,7 +75,7 @@
     <input id="name" autocomplete="off" spellcheck="false">
     <label for="settings" style="margin-top: 12px">More settings, one <code>KEY=VALUE</code> per line (e.g. <code>BIND_IP</code>, <code>RX_LATENCY_NS</code>, <code>SAMPLE_RATE</code>)</label>
     <textarea id="settings" spellcheck="false"></textarea>
-    <label for="margin" style="margin-top: 12px">Playback margin in milliseconds: how late Windows' audio may be before it's transmitted as silence (adds as much latency)</label>
+    <label for="margin" style="margin-top: 12px">Playback margin in milliseconds: how late {{OS_POSSESSIVE}} audio may be before it's transmitted as silence (adds as much latency)</label>
     <input id="margin" type="number" min="1" max="100" style="max-width: 110px">
   </section>
 
@@ -112,8 +112,12 @@ function readCards() {
   }));
 }
 
+// the channels shared-mode applications can open (Windows), 0: no such limit
+const SHARED_MODE_CHANNELS = {{SHARED_MODE_CHANNELS}};
+
 function updateLimit() {
-  $("limit").hidden = !readCards().some((c) => c.playback_channels > 32 || c.capture_channels > 32);
+  $("limit").hidden = !SHARED_MODE_CHANNELS ||
+    !readCards().some((c) => c.playback_channels > SHARED_MODE_CHANNELS || c.capture_channels > SHARED_MODE_CHANNELS);
 }
 
 function show(c) {

@@ -1,0 +1,54 @@
+#!/bin/sh
+# Creates the service's account and directories, starts the service and has Core Audio load the plug-in.
+set -eu
+
+LABEL=org.network-audio.inferno.soundcard
+DIR="/Library/Application Support/Inferno"
+LOGS=/Library/Logs/Inferno
+ACCOUNT=_inferno
+
+# a hidden account without privileges for the service, with a free id below 500 (for both user and group)
+if ! dscl . -read "/Users/$ACCOUNT" >/dev/null 2>&1; then
+  id=300
+  while [ "$id" -lt 500 ]; do
+    if ! dscl . -search /Users UniqueID "$id" | grep -q . && ! dscl . -search /Groups PrimaryGroupID "$id" | grep -q .; then
+      break
+    fi
+    id=$((id + 1))
+  done
+  if [ "$id" -ge 500 ]; then
+    echo "no free account id for $ACCOUNT" >&2
+    exit 1
+  fi
+  dscl . -create "/Groups/$ACCOUNT"
+  dscl . -create "/Groups/$ACCOUNT" PrimaryGroupID "$id"
+  dscl . -create "/Groups/$ACCOUNT" RealName "Inferno sound cards"
+  dscl . -create "/Groups/$ACCOUNT" Password '*'
+  dscl . -create "/Users/$ACCOUNT"
+  dscl . -create "/Users/$ACCOUNT" UniqueID "$id"
+  dscl . -create "/Users/$ACCOUNT" PrimaryGroupID "$id"
+  dscl . -create "/Users/$ACCOUNT" RealName "Inferno sound cards"
+  dscl . -create "/Users/$ACCOUNT" NFSHomeDirectory "$DIR"
+  dscl . -create "/Users/$ACCOUNT" UserShell /usr/bin/false
+  dscl . -create "/Users/$ACCOUNT" Password '*'
+  dscl . -create "/Users/$ACCOUNT" IsHidden 1
+fi
+
+# the service writes its settings and the device's state there; the programs stay root's
+mkdir -p "$DIR" "$LOGS"
+chown "$ACCOUNT:$ACCOUNT" "$DIR" "$LOGS"
+chown -R root:wheel "$DIR/bin" "$DIR/uninstall.sh"
+
+# Dante needs incoming UDP: allowed if the application firewall is on
+FIREWALL=/usr/libexec/ApplicationFirewall/socketfilterfw
+if [ -x "$FIREWALL" ]; then
+  "$FIREWALL" --add "$DIR/bin/inferno_soundcard" >/dev/null 2>&1 || true
+  "$FIREWALL" --unblockapp "$DIR/bin/inferno_soundcard" >/dev/null 2>&1 || true
+fi
+
+launchctl bootout "system/$LABEL" 2>/dev/null || true
+launchctl bootstrap system "/Library/LaunchDaemons/$LABEL.plist"
+
+# Core Audio loads plug-ins when it starts (launchd restarts it)
+killall coreaudiod 2>/dev/null || true
+exit 0

@@ -20,6 +20,19 @@ use crate::{
 };
 
 const PAGE: &str = include_str!("ui.html");
+
+/// The page, for this operating system.
+fn page() -> String {
+  let (os, possessive, shared_mode_channels) = if cfg!(target_os = "macos") {
+    ("Mac", "the Mac's", 0)
+  } else {
+    ("Windows", "Windows'", crate::config::SHARED_MODE_CHANNELS)
+  };
+  PAGE
+    .replace("{{OS}}", os)
+    .replace("{{OS_POSSESSIVE}}", possessive)
+    .replace("{{SHARED_MODE_CHANNELS}}", &shared_mode_channels.to_string())
+}
 const MAX_BODY: usize = 64 * 1024;
 pub const CHANGE_HEADER: &str = "x-inferno-soundcard";
 
@@ -92,7 +105,7 @@ pub fn handle(
   }
   match (request.method.as_str(), request.path.as_str()) {
     ("GET", "/") => {
-      Response { status: 200, content_type: "text/html; charset=utf-8", body: PAGE.as_bytes().to_vec() }
+      Response { status: 200, content_type: "text/html; charset=utf-8", body: page().into_bytes() }
     }
     ("GET", "/api/status") => json(200, &*status.lock().unwrap()),
     ("GET", "/api/config") => match Config::load() {
@@ -184,6 +197,7 @@ mod tests {
     let (commands, _rx) = mpsc::channel();
     let ok = handle(&request("GET", "/", &[("host", "127.0.0.1:47800")], ""), 47800, &status, &commands);
     assert_eq!(ok.status, 200);
+    assert!(!String::from_utf8(ok.body).unwrap().contains("{{"), "every placeholder filled in");
     let rebound = handle(
       &request("GET", "/api/status", &[("host", "evil.example:47800")], ""),
       47800,

@@ -13,7 +13,7 @@ env:
 
 jobs:
   e2e:
-    # Inferno devices on one Windows host, routed with netaudio (see test/windows_e2e):
+    # Inferno devices on one Windows host, routed with netaudio (see test/e2e):
     # pipe: Pipe2inferno -> Inferno2pipe; asio: Pipe2inferno -> ASIO driver -> Inferno2pipe;
     # soundcard: Pipe2inferno -> virtual sound card (usbip-win2) -> WASAPI application -> Inferno2pipe
     strategy:
@@ -104,7 +104,7 @@ jobs:
           Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 | Format-Table IPAddress, PrefixOrigin, AddressState
           Get-NetUDPEndpoint -LocalPort 5353 -ErrorAction SilentlyContinue | Format-Table LocalAddress, OwningProcess
       - timeout-minutes: 10
-        run: python test/windows_e2e/run_e2e.py --scenario ${{ matrix.scenario }} --bin-dir target/debug --ips ${{ env.IPS }} --out-dir e2e-out
+        run: python test/e2e/run_e2e.py --scenario ${{ matrix.scenario }} --bin-dir target/debug --ips ${{ env.IPS }} --out-dir e2e-out
       - if: failure()
         uses: actions/upload-artifact@v4
         with:
