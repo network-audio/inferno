@@ -363,7 +363,8 @@ impl DeviceServer {
     self.receive_with_callback_impl(samples_callback, None).await
   }
   /// Like [`receive_with_callback`](Self::receive_with_callback), but time goes on along the media clock: silence
-  /// while nothing is received (nothing subscribed, a transmitter gone), after waiting 200 ms for late audio.
+  /// while nothing is received (nothing subscribed, a transmitter gone): a channel which has received nothing
+  /// for 200 ms no longer holds it back.
   pub async fn receive_with_callback_clocked(&mut self, samples_callback: SamplesCallback) {
     let clock = self.get_realtime_clock_receiver();
     self.receive_with_callback_impl(samples_callback, Some(clock)).await

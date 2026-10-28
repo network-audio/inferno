@@ -1,4 +1,8 @@
-use std::{pin::Pin, sync::Arc, time::Duration};
+use std::{
+  pin::Pin,
+  sync::Arc,
+  time::{Duration, Instant},
+};
 
 use crate::{
   common::*,
@@ -201,6 +205,8 @@ struct PeriodicSamplesCollector<P: ProxyToSamplesBuffer> {
   clock: MediaClock,
   /// `None`: only as far as the channels have received
   clock_recv: Option<RealTimeBoxReceiver<Option<ClockOverlay>>>,
+  /// per channel: how far it had received when last checked, and since when
+  progress: Vec<Option<(Clock, Instant)>>,
   sample_rate: u32,
   latency_samples: Clock,
 }
@@ -222,32 +228,47 @@ fn get_min_max_end_timestamps<'a, P: ProxyToSamplesBuffer + 'a>(
 impl<P: ProxyToSamplesBuffer> PeriodicSamplesCollector<P> {
   /// Where to read up to, from `position` (where the last read ended, if any): as far as the connected channels
   /// have received. If following the clock, channels which have received nothing past `position` for
-  /// `CLOCK_MARGIN_MS` (after the receive latency: the largest of the device's and the connected flows') don't
-  /// hold it back, and without any channel holding it back, the clock does: time goes on, in silence, while
-  /// nothing is received. A channel still receiving holds it back even when late (e.g. the packets queued
-  /// while its flow started, written in a burst), so that it's read whole.
+  /// `CLOCK_MARGIN_MS` don't hold it back, and without any channel holding it back, the clock does (minus the
+  /// receive latency, the largest of the device's and the connected flows', and the margin): time goes on, in
+  /// silence, while nothing is received. A channel still receiving holds it back even when late (e.g. the
+  /// packets queued while its flow started, written in a burst), so that it's read whole.
   fn readable_until(&mut self, position: Option<Clock>) -> Option<Clock> {
+    let now = Instant::now();
+    for (progress, channel) in self.progress.iter_mut().zip(&self.channels) {
+      let end = channel.as_ref().map(|ch| ch.source.readable_until());
+      *progress = match (*progress, end) {
+        (Some((last, since)), Some(end)) if last == end => Some((last, since)),
+        (_, end) => end.map(|end| (end, now)),
+      };
+    }
     let Some(clock) = self.clock_position() else {
-      return self.received_until(|_| true);
+      return self.received_until(|_, _| true);
     };
     let Some(position) = position else {
       // the first read: from the clock, or what's been received since
-      return match self.received_until(|_| true) {
+      return match self.received_until(|_, _| true) {
         Some(received) if wrapped_diff(received, clock) > 0 => Some(received),
         _ => Some(clock),
       };
     };
-    let overdue = |until: Clock| wrapped_diff(until, position) <= 0 && wrapped_diff(until, clock) < 0;
-    match self.received_until(|until| !overdue(until)) {
+    let margin = Duration::from_millis(CLOCK_MARGIN_MS as u64);
+    let stalled = |chi: usize, end: Clock| {
+      wrapped_diff(end, position) <= 0
+        && self.progress[chi].is_some_and(|(_, since)| now - since > margin)
+    };
+    match self.received_until(|chi, end| !stalled(chi, end)) {
       Some(received) => Some(received),
       None if wrapped_diff(clock, position) > 0 => Some(clock),
       None => None,
     }
   }
-  /// As far as the channels whose received position `holds` have received.
-  fn received_until(&self, holds: impl Fn(Clock) -> bool) -> Option<Clock> {
-    let ends =
-      self.channels.iter().flatten().map(|ch| ch.source.readable_until()).filter(|&end| holds(end)).collect_vec();
+  /// As far as the channels which `hold` (channel index, received position) have received.
+  fn received_until(&self, hold: impl Fn(usize, Clock) -> bool) -> Option<Clock> {
+    let ends = (self.channels.iter().enumerate())
+      .filter_map(|(chi, ch)| Some((chi, ch.as_ref()?.source.readable_until())))
+      .filter(|&(chi, end)| hold(chi, end))
+      .map(|(_, end)| end)
+      .collect_vec();
     let min_end_ts = *ends.iter().min_by(|&&a, &&b| wrapped_diff(a, b).cmp(&0))?;
     let max_end_ts = *ends.iter().max_by(|&&a, &&b| wrapped_diff(a, b).cmp(&0))?;
     // lag prevention logic to prevent abruptly disconnected transmitters from causing buffer overrun
@@ -374,6 +395,7 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static> SamplesCollector<P> {
     let mut internal = PeriodicSamplesCollector {
       commands_receiver: rx,
       channels: (0..self_info.rx_channels.len()).map(|_| None).collect(),
+      progress: vec![None; self_info.rx_channels.len()],
       callback,
       clock: MediaClock::new(false /* TODO */),
       clock_recv,
@@ -466,13 +488,17 @@ mod tests {
     (col, recorded, clock)
   }
 
-  /// A clocked collector with channels received until `ends`, relative to its clock position (returned).
-  fn collector_receiving_until(ends: &[isize]) -> (PeriodicSamplesCollector<OwnedBuffer<Atomic<Sample>>>, Clock) {
+  /// A clocked collector with channels received until `ends` (relative to its clock position, returned), which
+  /// have received nothing new for `idle`.
+  fn collector_receiving_until(
+    ends: &[(isize, Duration)],
+  ) -> (PeriodicSamplesCollector<OwnedBuffer<Atomic<Sample>>>, Clock) {
     let (_, clock_recv) = real_time_box_channel::channel(Box::new(Some(ClockOverlay::monotonic())));
     let (_, rx) = mpsc::channel(1);
     let mut collector = PeriodicSamplesCollector {
       commands_receiver: rx,
       channels: vec![],
+      progress: vec![],
       callback: Box::new(|_, _| {}),
       clock: MediaClock::new(false),
       clock_recv: Some(clock_recv),
@@ -480,12 +506,13 @@ mod tests {
       latency_samples: 0,
     };
     let clock = collector.clock_position().unwrap();
-    for (id, &end) in ends.iter().enumerate() {
+    for (id, &(end, idle)) in ends.iter().enumerate() {
       let start = clock.wrapping_add_signed(end - 1000);
       let (mut sink, source) = ring_buffer::new_owned::<Sample>(1 << 16, start, 0);
       sink.write_from_at(start, std::iter::repeat(1).take(1000));
       let channel = Channel { id, source, prev_holes_count: 0, latency_samples: 0, was_connected: true };
       collector.channels.push(Some(channel));
+      collector.progress.push(Some((start.wrapping_add(1000), Instant::now() - idle)));
     }
     (collector, clock)
   }
@@ -493,22 +520,25 @@ mod tests {
   #[test]
   fn clocked_reading_waits_for_channels_still_receiving() {
     // positions relative to the clock's, far apart: it moves on while the test runs
-    let read = |ends: &[isize], position: isize| {
+    let read = |ends: &[(isize, Duration)], position: isize| {
       let (mut collector, clock) = collector_receiving_until(ends);
       let until = collector.readable_until(Some(clock.wrapping_add_signed(position)));
-      (until.map(|u| wrapped_diff(u, clock)), clock)
+      until.map(|u| wrapped_diff(u, clock))
     };
+    let (fresh, stalled) = (Duration::ZERO, Duration::from_millis(300));
     // a flow's start, written in a burst: late, but received past the position: wait for it
-    assert_eq!(read(&[-5_000, 2_000], -8_000).0, Some(-5_000));
-    // a channel with nothing new, for longer than the margin, doesn't hold it back
-    assert_eq!(read(&[-40_000, 5_000], -40_000).0, Some(5_000));
-    // nothing new, not yet overdue (the position is ahead of the clock): wait
-    assert_eq!(read(&[20_000], 20_000).0, Some(20_000));
+    assert_eq!(read(&[(-5_000, fresh), (2_000, fresh)], -8_000), Some(-5_000));
+    // midway through the burst: one channel written up to the position, the other further: wait for the first
+    assert_eq!(read(&[(-8_000, fresh), (-7_968, fresh)], -8_000), Some(-8_000));
+    // a channel with nothing new for longer than the margin doesn't hold it back
+    assert_eq!(read(&[(-40_000, stalled), (5_000, fresh)], -40_000), Some(5_000));
+    // nothing new, not stalled yet: wait
+    assert_eq!(read(&[(20_000, fresh)], 20_000), Some(20_000));
     // nothing received for longer than the margin: the clock
-    let until = read(&[-40_000], -40_000).0.unwrap();
+    let until = read(&[(-40_000, stalled)], -40_000).unwrap();
     assert!((0..4800).contains(&until), "{until}");
     // no channels: the clock
-    let until = read(&[], -40_000).0.unwrap();
+    let until = read(&[], -40_000).unwrap();
     assert!((0..4800).contains(&until), "{until}");
   }
 
