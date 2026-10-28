@@ -355,6 +355,12 @@ If you want to contribute but can't code or don't know where to start because th
 
 # Changelog
 
+## 0.8.0
+* sound cards at 44.1 kHz (and other sample rates that aren't multiples of 8 kHz): USB packets carry 5 or 6 frames per 125 µs, as the clock dictates. Tested on Windows in CI (shared and exclusive mode, up to 64 channels) and end-to-end, bit-exact both ways
+* Inferno2pipe: no longer loses a few frames when a flow starts (it never reads past the present, where the receiver fills ahead with silence that late packets still overwrite); a channel holds the recording back until it has received nothing for 200 ms
+* the Windows installers build with NSIS from its own (pinned) release
+* docs: [NetAudio](https://netaudio.app/), the open source alternative to Dante Controller
+
 ## 0.7.0
 * Inferno2pipe records silence while nothing is connected or a transmitter stops, along the media clock, instead of pausing the recording
 * sound cards: the playback margin (how late Windows' audio may be) is a setting, 10 ms by default (was 5 ms): runners' audio engines were late by 10-15 ms now and then
