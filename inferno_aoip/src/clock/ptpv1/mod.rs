@@ -1,9 +1,10 @@
 //! PTPv1 (IEEE 1588-2002) follower: the clock of Dante networks, followed without a PTP daemon.
 //!
 //! Listens for the leader's Sync and Follow_Up messages, measures the path delay with Delay_Req, and
-//! publishes the leader's time as a [`ClockOverlay`] over the local monotonic clock. Timestamps are taken in
-//! software, as packets are received and sent, so precision depends on scheduling (tens of microseconds),
-//! well within the network latency Dante receivers buffer.
+//! publishes the leader's time as a [`ClockOverlay`] over the local monotonic clock. Received messages have the
+//! kernel's timestamps on macOS and Linux (the time they arrived, however late this thread wakes up), and the
+//! time they were read elsewhere; sent ones are timestamped in software as they're sent. Precision: tens of
+//! microseconds, well within the network latency Dante receivers buffer.
 //!
 //! As a leader candidate ([`Ptpv1Config::leader`]), it leads the clock when there's no better leader: after
 //! hearing none for [`Ptpv1Config::leader_timeout`], when its leader goes silent that long, or when it's
@@ -27,6 +28,7 @@ use super::{ClockOverlay, ClockSource, MONOTONIC_CLOCK_ID};
 use crate::net_utils::multicast_receiver;
 
 pub mod messages;
+mod rx_timestamp;
 mod servo;
 #[doc(hidden)]
 pub mod test_leader;
@@ -125,11 +127,12 @@ fn receive_thread(
   stats: Arc<Stats>,
 ) {
   let _ = crate::utils::set_current_thread_realtime(70);
+  // the time a message arrived, not when this thread got to it (late now and then, e.g. on CI runners)
+  let socket = rx_timestamp::TimestampingSocket::new(socket);
   let mut buf = [0u8; 512];
   while !stop.load(Ordering::Relaxed) {
     match socket.recv(&mut buf) {
-      Ok(len) => {
-        let local = local_now();
+      Ok((len, local)) => {
         if let Some(message) = messages::parse(&buf[..len]) {
           stats.messages.fetch_add(1, Ordering::Relaxed);
           if tx.send(Received { message, local }).is_err() {

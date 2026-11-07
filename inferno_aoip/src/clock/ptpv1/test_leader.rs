@@ -115,13 +115,14 @@ impl TestLeader {
 
     let thread_stop = stop.clone();
     std::thread::Builder::new().name("PTP test leader delay".into()).spawn(move || {
+      let delay_req_socket = super::rx_timestamp::TimestampingSocket::new(delay_req_socket);
       let mut buf = [0u8; 512];
       let mut sequence_id: u16 = 0;
       while !thread_stop.load(Ordering::Relaxed) {
-        let Ok(len) = delay_req_socket.recv(&mut buf) else {
+        let Ok((len, local)) = delay_req_socket.recv(&mut buf) else {
           continue;
         };
-        let received = clock.now();
+        let received = clock.at(local);
         let Some(message) = messages::parse(&buf[..len]) else {
           continue;
         };

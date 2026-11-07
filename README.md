@@ -376,6 +376,7 @@ If you want to contribute but can't code or don't know where to start because th
 # Changelog
 
 ## Unreleased
+* PTPv1 follower: received messages have the kernel's timestamps on macOS and Linux (`SO_TIMESTAMP_MONOTONIC`, `SO_TIMESTAMPNS`), the time they arrived rather than the time the receiving thread got to them: on macOS CI runners that was late enough now and then to throw the frequency off by 15-30 ppm
 * the Docker test suite also tests two devices sharing one IP (`aplayrec3`), as netaudio tells them apart since 0.5; it runs for 60 s (was 120), as netaudio 0.5 discovers devices in seconds. Its controller image installs netaudio's own wheels (Debian): netaudio 0.5 doesn't build on Alpine (musl)
 * macOS: the flows threads (transmitter and receiver) are time-constraint threads, like Core Audio's I/O threads: with FIFO priority alone their sleeps woke up to tens of milliseconds late now and then, more than the network latency (late packets, dropouts; the PTPv1 loopback test failed on most CI runs)
 
