@@ -24,6 +24,25 @@ jobs:
       # searchfire's own test needs mDNS multicast on the host network.
       - run: cargo test --workspace --exclude searchfire -- --test-threads=1
 
+  docker-suite:
+    # test/dockerized_trx: Inferno in ALSA (Alpine, Debian), JACK, PipeWire (Fedora) and Inferno2pipe
+    # containers, two devices sharing an IP among them, routed with netaudio; recordings compared bit-exact
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Docker test suite
+        working-directory: test/dockerized_trx
+        # amd64: GitHub's runners can't resolve names in the i386 Debian build (the default on x86 hosts)
+        run: DEBIAN_PLATFORM=linux/amd64 ARTIFACTS_DIR=$PWD/artifacts ./run_test.sh
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-suite
+          path: test/dockerized_trx/artifacts
+
   portable:
     # the crates other drivers build on (the ALSA plugin and inferno-doctor are Linux-only)
     strategy:

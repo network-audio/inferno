@@ -7,7 +7,8 @@ Uses [WavDiff from diff_tools](https://github.com/aspt/diff_tools) for sample-pe
 ## How to use
 
 Run `run_test.sh`, it handles everything including building Docker images. It exits with the test result;
-set `ARTIFACTS_DIR=<dir>` to keep the recordings and reports.
+set `ARTIFACTS_DIR=<dir>` to keep the recordings and reports. CI runs it on every push to `dev` and every pull request (`docker-suite` in
+`.github/workflows/ci.yml`), with the Debian image for amd64: GitHub's runners can't resolve names in the i386 build.
 
 Each `alpine_aplay_arecord` container runs two Inferno devices on one host (aplay and arecord, separated by
 `PROCESS_ID` and `ALT_PORT`). In `aplayrec1` and `aplayrec2` the capture device binds to a second address
