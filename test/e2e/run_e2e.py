@@ -44,6 +44,8 @@ DISCOVERY_TIMEOUT = 120
 # how long the devices may take to have a clock once discovered: in pipe-leader, a device leads it only after 5 s
 # without a leader, and the others then need a few Sync messages (netaudio may discover them sooner)
 CLOCK_TIMEOUT = 30
+# a clock following a new leader, after leading it: some Sync messages (4 per second)
+HANDOVER_SETTLE_SECONDS = 3
 LATENCY_NS = 40_000_000
 TX_NAME = "wine2etx"
 RX_NAME = "wine2erx"
@@ -256,11 +258,25 @@ def check_clock(log_paths):
 
 
 def check_one_leader(log_paths):
-    leading = [path.name for path in log_paths if "leading the clock as" in path.read_text(errors="replace")]
-    if not leading:
-        log("❌ no device leads the clock")
-        return False
-    log(f"✅ leading the clock: {', '.join(leading)}")
+    """Waits for the election to settle: devices started together may all start leading after 5 s without a
+    leader, then all but one step down and follow it (their clock resynchronises)."""
+    deadline = time.time() + CLOCK_TIMEOUT
+    while True:
+        texts = {path.name: path.read_text(errors="replace") for path in log_paths}
+        leading = [name for name, text in texts.items()
+                   if text.rfind("leading the clock as") > text.rfind("no longer leading the clock")]
+        stepped_down = [name for name, text in texts.items() if "no longer leading the clock" in text]
+        if len(leading) == 1:
+            break
+        if time.time() >= deadline:
+            log(f"❌ {len(leading)} devices lead the clock: {', '.join(leading)}")
+            return False
+        time.sleep(0.5)
+    if stepped_down:
+        # their servo starts again from the new leader's Sync messages
+        time.sleep(HANDOVER_SETTLE_SECONDS)
+        log(f"stepped down, following the leader: {', '.join(stepped_down)}")
+    log(f"✅ leading the clock: {leading[0]}")
     return True
 
 
