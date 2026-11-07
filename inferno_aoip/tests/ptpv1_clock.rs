@@ -47,7 +47,9 @@ fn follower_locks_to_leader_time_and_frequency() {
   let mut worst = 0i64;
   for _ in 0..20 {
     let overlay = rx.borrow_and_update().unwrap();
-    let error = overlay.now_ns() - leader.clock().now();
+    // both clocks at the same instant: reading them one after the other would count an interruption in between
+    let local = ClockOverlay::monotonic().now_underlying_ns();
+    let error = overlay.underlying_to_overlay_ns(local) - leader.clock().at(local);
     worst = worst.max(error.abs());
     std::thread::sleep(Duration::from_millis(50));
   }

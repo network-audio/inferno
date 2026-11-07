@@ -104,16 +104,16 @@ impl TestLeader {
       let mut sequence_id: u16 = 0;
       while !thread_stop.load(Ordering::Relaxed) {
         sequence_id = sequence_id.wrapping_add(1);
-        let sync = messages::sync(me, sequence_id, clock.now(), true, &grandmaster, -3);
-        // like a leading follower: no Follow_Up when the time the Sync went out is uncertain
-        if let Ok(Some(sent)) = super::timed_send(local_now, || socket.send_to(&sync, event)) {
-          let _ =
-            socket.send_to(&messages::follow_up(me, sequence_id, sequence_id, clock.at(sent)), general);
-        }
+        // its Follow_Up is sent as the Sync comes back (multicast loop), with the time it did
+        let _ = socket.send_to(&messages::sync(me, sequence_id, clock.now(), true, &grandmaster, -3), event);
         std::thread::sleep(config.sync_interval);
       }
     })?;
 
+    // Receives on the event port: Delay_Req messages, and its own Syncs looped back, timestamped by the kernel
+    // as they're delivered to the local sockets (the followers' too). That's when the Sync went out, as precisely
+    // as a hardware timestamp: the time a send started was up to a few hundred microseconds off on CI runners
+    // (multicast to several local sockets), enough to throw a follower's frequency off by 10 ppm and more.
     let thread_stop = stop.clone();
     std::thread::Builder::new().name("PTP test leader delay".into()).spawn(move || {
       let delay_req_socket = super::rx_timestamp::TimestampingSocket::new(delay_req_socket);
@@ -127,6 +127,13 @@ impl TestLeader {
         let Some(message) = messages::parse(&buf[..len]) else {
           continue;
         };
+        if let Body::Sync { .. } = message.body {
+          if message.header.source == me {
+            let sequence_id = message.header.sequence_id;
+            let _ = send_socket.send_to(&messages::follow_up(me, sequence_id, sequence_id, received), general);
+          }
+          continue;
+        }
         if message.body != Body::DelayReq {
           continue;
         }
