@@ -204,6 +204,7 @@ pub fn card_uac2_config(
     capture_channels: card.capture_channels,
     playback_name: None,
     capture_name: None,
+    capture_connector: false,
   }
 }
 

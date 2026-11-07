@@ -10,7 +10,7 @@ edition = "2021"
 inferno_aoip = { path = "../inferno_aoip" }
 inferno_driver_core = { path = "../inferno_driver_core" }
 inferno_soundcard_shm = { path = "../inferno_soundcard_shm" }
-usbip-audio = { git = "https://github.com/network-audio/usbip-audio", rev = "1c0b8c378890e6cd2d8683e299a6091eebfea5ed" }
+usbip-audio = { git = "https://github.com/network-audio/usbip-audio", rev = "d9e4461cb7c0035e089ad004f3c0245d383db321" }
 env_logger = "0.11"
 log = "0.4.20"
 serde = { version = "1", features = ["derive"] }
