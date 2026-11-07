@@ -41,6 +41,9 @@ SOURCE_SECONDS = 150
 RECORD_SECONDS = 20
 MIN_MATCHING_SECONDS = 15
 DISCOVERY_TIMEOUT = 120
+# how long the devices may take to have a clock once discovered: in pipe-leader, a device leads it only after 5 s
+# without a leader, and the others then need a few Sync messages (netaudio may discover them sooner)
+CLOCK_TIMEOUT = 30
 LATENCY_NS = 40_000_000
 TX_NAME = "wine2etx"
 RX_NAME = "wine2erx"
@@ -223,23 +226,33 @@ def subscribe(tx, rx):
 
 
 def check_subscribed(rx_names):
-    code, output = netaudio("subscription", "list")
+    # a receiver resolves its subscriptions' transmitters after a moment (e.g. restored ones, before it hears them)
+    deadline = time.time() + CLOCK_TIMEOUT
+    while True:
+        code, output = netaudio("subscription", "list")
+        missing = [rx for rx in rx_names
+                   if len([line for line in output.splitlines() if rx in line and "Subscribed" in line]) < CHANNELS]
+        if not missing or time.time() >= deadline:
+            break
+        time.sleep(1)
     log(output)
-    for rx in rx_names:
-        subscribed = [line for line in output.splitlines() if rx in line and "Subscribed" in line]
-        if len(subscribed) < CHANNELS:
-            log(f"❌ expected {CHANNELS} subscribed channels of {rx}")
-            return False
+    if missing:
+        log(f"❌ expected {CHANNELS} subscribed channels of {missing[0]}")
+        return False
     return True
 
 
 def check_clock(log_paths):
-    for path in log_paths:
-        if "clock available from PTPv1" not in path.read_text(errors="replace"):
-            log(f"❌ {path.name}: the device doesn't follow the PTPv1 leader")
+    deadline = time.time() + CLOCK_TIMEOUT
+    while True:
+        missing = [p for p in log_paths if "clock available from PTPv1" not in p.read_text(errors="replace")]
+        if not missing:
+            log("✅ all devices follow the PTPv1 leader")
+            return True
+        if time.time() >= deadline:
+            log(f"❌ {missing[0].name}: the device doesn't follow the PTPv1 leader")
             return False
-    log("✅ all devices follow the PTPv1 leader")
-    return True
+        time.sleep(0.5)
 
 
 def check_one_leader(log_paths):
