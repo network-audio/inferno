@@ -375,11 +375,11 @@ If you want to contribute but can't code or don't know where to start because th
 
 # Changelog
 
-## Unreleased
+## 0.9.1
+* macOS: the flows threads (transmitter and receiver) are time-constraint threads, like Core Audio's I/O threads: with FIFO priority alone their sleeps woke up to tens of milliseconds late now and then, more than the network latency (late packets, dropouts; the PTPv1 loopback test failed on most CI runs)
 * PTPv1 follower: received messages have the kernel's timestamps on macOS and Linux (`SO_TIMESTAMP_MONOTONIC`, `SO_TIMESTAMPNS`), the time they arrived rather than the time the receiving thread got to them: on macOS CI runners that was late enough now and then to throw the frequency off by 15-30 ppm
 * PTPv1: the Syncs (when leading) and Delay_Reqs it sends are timestamped by their looped-back copies (multicast loop, with the kernel's receive timestamps), as they went out, rather than as the send started: sends to several local sockets took up to hundreds of microseconds on CI runners
 * the Docker test suite runs in CI (`docker-suite`), and also tests two devices sharing one IP (`aplayrec3`), as netaudio tells them apart since 0.5; it runs for 60 s (was 120), as netaudio 0.5 discovers devices in seconds. Its controller image installs netaudio's own wheels (Debian): netaudio 0.5 doesn't build on Alpine (musl)
-* macOS: the flows threads (transmitter and receiver) are time-constraint threads, like Core Audio's I/O threads: with FIFO priority alone their sleeps woke up to tens of milliseconds late now and then, more than the network latency (late packets, dropouts; the PTPv1 loopback test failed on most CI runs)
 
 ## 0.9.0
 * macOS sound cards: Core Audio devices on the Dante network, for any application, configured on the settings page like on Windows. A Core Audio HAL plug-in (`inferno_coreaudio`, user space) plays and records through Mach shared memory with the sound card service (a launchd daemon in an unprivileged account), clocked by the Dante media clock: Core Audio runs at the network's rate. No 32-channel limit, nor USB's bandwidth limit at 96 kHz. Installer package built by `packaging/macos/build-pkg.sh`. Tested in CI: the plug-in's I/O loopback on every platform, and on macOS Pipe2inferno -> card -> Core Audio application -> Inferno2pipe, bit-exact
