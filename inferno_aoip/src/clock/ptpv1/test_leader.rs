@@ -105,7 +105,8 @@ impl TestLeader {
       while !thread_stop.load(Ordering::Relaxed) {
         sequence_id = sequence_id.wrapping_add(1);
         // its Follow_Up is sent as the Sync comes back (multicast loop), with the time it did
-        let _ = socket.send_to(&messages::sync(me, sequence_id, clock.now(), true, &grandmaster, -3), event);
+        let _ =
+          socket.send_to(&messages::sync(me, sequence_id, clock.now(), true, &grandmaster, -3), event);
         std::thread::sleep(config.sync_interval);
       }
     })?;
@@ -130,7 +131,8 @@ impl TestLeader {
         if let Body::Sync { .. } = message.body {
           if message.header.source == me {
             let sequence_id = message.header.sequence_id;
-            let _ = send_socket.send_to(&messages::follow_up(me, sequence_id, sequence_id, received), general);
+            let _ =
+              send_socket.send_to(&messages::follow_up(me, sequence_id, sequence_id, received), general);
           }
           continue;
         }

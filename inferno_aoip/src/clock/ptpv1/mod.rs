@@ -98,24 +98,6 @@ fn local_now() -> i64 {
   ClockOverlay::monotonic().now_underlying_ns()
 }
 
-/// How long a send may take for its software timestamp to be used: a thread interrupted around the send (by
-/// milliseconds now and then on CI runners) would otherwise put the interruption into the time the message
-/// reports. Sends themselves take up to a few hundred microseconds (multicast to several local sockets on macOS).
-const MAX_SEND_BRACKET_NS: i64 = 1_000_000;
-
-/// Sends with `send`, timestamped by `now` as it starts, or `None` if it took more than [`MAX_SEND_BRACKET_NS`]
-/// (it was interrupted: the time it went out is uncertain, so don't use it).
-fn timed_send(
-  now: impl Fn() -> i64,
-  send: impl FnOnce() -> std::io::Result<usize>,
-) -> std::io::Result<Option<i64>> {
-  let before = now();
-  send()?;
-  let after = now();
-  let bracket = after.wrapping_sub(before);
-  Ok((0..=MAX_SEND_BRACKET_NS).contains(&bracket).then_some(before))
-}
-
 /// A message, and the local time it was received at.
 struct Received {
   message: Message,
@@ -187,8 +169,8 @@ struct Follower {
   /// Sync waiting for its Follow_Up: (sequence ID, local receive time)
   pending_sync: Option<(u16, i64)>,
   delay_req_sequence: u16,
-  /// Delay_Req waiting for its response: (sequence ID, local send time)
-  pending_delay_req: Option<(u16, i64)>,
+  /// the Delay_Req waiting for its time and its response
+  pending_delay_req: Option<PendingDelayReq>,
   next_delay_req: Instant,
   /// as a leader candidate, what we announce
   candidate: Option<Grandmaster>,
@@ -197,10 +179,21 @@ struct Follower {
   leading: Option<Leading>,
 }
 
+/// A Delay_Req sent: its send time comes with its looped-back copy (multicast loop: the kernel timestamps it as
+/// it's sent, unlike the time `send_to` started, up to hundreds of microseconds earlier), its receipt with the
+/// leader's Delay_Resp, in either order.
+struct PendingDelayReq {
+  sequence_id: u16,
+  sent: Option<i64>,
+  receipt: Option<i64>,
+}
+
 /// Leading the clock: our time, and the messages' sequence IDs.
 struct Leading {
   overlay: ClockOverlay,
   sync_sequence: u16,
+  /// the Sync sent last, until its looped-back copy gives its time for the Follow_Up
+  pending_follow_up: Option<u16>,
   delay_resp_sequence: u16,
   next_sync: Instant,
 }
@@ -239,7 +232,20 @@ impl Follower {
   fn handle(&mut self, received: Received) {
     let Received { message: Message { header, body }, local } = received;
     if header.source == self.me {
-      return; // own Delay_Req, looped back
+      // our own messages, looped back: the time they were sent
+      match body {
+        Body::Sync { .. } => self.send_follow_up(header.sequence_id, local),
+        Body::DelayReq => {
+          if let Some(pending) =
+            self.pending_delay_req.as_mut().filter(|p| p.sequence_id == header.sequence_id)
+          {
+            pending.sent = Some(local);
+          }
+          self.complete_delay_req();
+        }
+        _ => {}
+      }
+      return;
     }
     match body {
       Body::Sync { origin, grandmaster } => {
@@ -286,12 +292,12 @@ impl Follower {
         if requester != self.me || self.leader.map(|(s, _)| s) != Some(header.source) {
           return;
         }
-        if let Some((sequence_id, sent)) = self.pending_delay_req {
-          if sequence_id == requester_sequence_id {
-            self.pending_delay_req = None;
-            self.servo.add_delay(sent, receipt);
-          }
+        if let Some(pending) =
+          self.pending_delay_req.as_mut().filter(|p| p.sequence_id == requester_sequence_id)
+        {
+          pending.receipt = Some(receipt);
         }
+        self.complete_delay_req();
       }
       Body::DelayReq => self.answer_delay_req(header.source, header.sequence_id, local),
     }
@@ -331,8 +337,13 @@ impl Follower {
     self.servo.reset();
     self.sender.send_replace(Some(overlay));
     self.stats.leading.store(true, Ordering::Relaxed);
-    self.leading =
-      Some(Leading { overlay, sync_sequence: 0, delay_resp_sequence: 0, next_sync: Instant::now() });
+    self.leading = Some(Leading {
+      overlay,
+      sync_sequence: 0,
+      pending_follow_up: None,
+      delay_resp_sequence: 0,
+      next_sync: Instant::now(),
+    });
   }
 
   fn send_sync(&mut self) {
@@ -349,18 +360,24 @@ impl Follower {
     leading.sync_sequence = leading.sync_sequence.wrapping_add(1);
     let sequence_id = leading.sync_sequence;
     let overlay = leading.overlay;
-    // two-step: the Sync carries an approximate time, the Follow_Up the time it was sent (software timestamp)
+    // two-step: the Sync carries an approximate time, the Follow_Up the time it went out, which its looped-back
+    // copy gives (send_follow_up)
     let approximate = overlay.underlying_to_overlay_ns(local_now());
     let sync = messages::sync(self.me, sequence_id, approximate, true, &mine, LOG_SYNC_INTERVAL);
     let event = SocketAddrV4::new(self.config.group, self.config.event_port);
-    let sent = match timed_send(local_now, || self.send_socket.send_to(&sync, event)) {
-      Ok(Some(sent)) => overlay.underlying_to_overlay_ns(sent),
-      Ok(None) => return, // no Follow_Up: followers skip this Sync
-      Err(e) => {
-        log::warn!("can't send PTP Sync: {e}");
-        return;
-      }
+    leading.pending_follow_up = Some(sequence_id);
+    if let Err(e) = self.send_socket.send_to(&sync, event) {
+      log::warn!("can't send PTP Sync: {e}");
+    }
+  }
+
+  /// Our Sync `sequence_id` came back at local time `sent`: its Follow_Up.
+  fn send_follow_up(&mut self, sequence_id: u16, sent: i64) {
+    let Some(leading) = self.leading.as_mut().filter(|l| l.pending_follow_up == Some(sequence_id)) else {
+      return;
     };
+    leading.pending_follow_up = None;
+    let sent = leading.overlay.underlying_to_overlay_ns(sent);
     let follow_up = messages::follow_up(self.me, sequence_id, sequence_id, sent);
     let general = SocketAddrV4::new(self.config.group, self.config.general_port);
     if let Err(e) = self.send_socket.send_to(&follow_up, general) {
@@ -410,9 +427,21 @@ impl Follower {
     self.delay_req_sequence = self.delay_req_sequence.wrapping_add(1);
     let packet = messages::delay_req(self.me, self.delay_req_sequence, &grandmaster);
     let destination = SocketAddrV4::new(self.config.group, self.config.event_port);
-    match timed_send(local_now, || self.send_socket.send_to(&packet, destination)) {
-      Ok(sent) => self.pending_delay_req = sent.map(|sent| (self.delay_req_sequence, sent)),
-      Err(e) => log::warn!("can't send PTP Delay_Req: {e}"),
+    // its send time comes with its looped-back copy
+    self.pending_delay_req =
+      Some(PendingDelayReq { sequence_id: self.delay_req_sequence, sent: None, receipt: None });
+    if let Err(e) = self.send_socket.send_to(&packet, destination) {
+      log::warn!("can't send PTP Delay_Req: {e}");
+      self.pending_delay_req = None;
+    }
+  }
+
+  /// A path delay measurement, once the pending Delay_Req has both its send time and the leader's receipt.
+  fn complete_delay_req(&mut self) {
+    if let Some(PendingDelayReq { sent: Some(sent), receipt: Some(receipt), .. }) = self.pending_delay_req
+    {
+      self.pending_delay_req = None;
+      self.servo.add_delay(sent, receipt);
     }
   }
 
@@ -555,38 +584,5 @@ impl ClockSource for Ptpv1ClockSource {
   fn shutdown(&self) -> BoxFuture<'static, ()> {
     self.stop();
     Box::pin(async {})
-  }
-}
-
-#[cfg(test)]
-mod timed_send_tests {
-  use super::*;
-  use std::cell::Cell;
-
-  fn clock(reads: &[i64]) -> impl Fn() -> i64 + '_ {
-    let next = Cell::new(0);
-    move || {
-      let read = reads[next.get()];
-      next.set(next.get() + 1);
-      read
-    }
-  }
-
-  #[test]
-  fn a_send_has_the_time_it_started() {
-    let sent = timed_send(clock(&[1_000, 1_000 + 400_000]), || Ok(4)).unwrap();
-    assert_eq!(sent, Some(1_000));
-  }
-
-  #[test]
-  fn a_send_interrupted_for_long_has_no_time() {
-    let sent = timed_send(clock(&[1_000, 1_000 + MAX_SEND_BRACKET_NS + 1]), || Ok(4)).unwrap();
-    assert_eq!(sent, None);
-  }
-
-  #[test]
-  fn a_failed_send_is_an_error() {
-    let failed = timed_send(clock(&[0, 10]), || Err(std::io::ErrorKind::Other.into()));
-    assert!(failed.is_err());
   }
 }
