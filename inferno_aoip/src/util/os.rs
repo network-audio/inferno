@@ -100,6 +100,29 @@ pub fn set_current_thread_time_constraint(
   }
 }
 
+/// The time-constraint period of the threads moving audio (see [`set_current_thread_audio`]): about a packet's
+/// worth (e.g. 32 frames at 48 kHz) between wake-ups.
+pub const AUDIO_THREAD_PERIOD: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Makes the current thread one that moves audio (the flows threads): real-time with `priority_hint` (see
+/// [`set_current_thread_realtime`]). On macOS a time-constraint thread instead, like Core Audio's I/O threads:
+/// a FIFO thread's sleeps there wake up tens of milliseconds late now and then (seen on CI runners), more than a
+/// flow's latency, while a time-constraint thread's timers aren't coalesced. Its work per wake-up is bounded
+/// (sending or receiving a few packets), as the policy requires. Falls back to FIFO.
+pub fn set_current_thread_audio(priority_hint: u8) -> Result<(), Error> {
+  #[cfg(target_os = "macos")]
+  {
+    let period = AUDIO_THREAD_PERIOD;
+    match set_current_thread_time_constraint(period, period / 2, period) {
+      Ok(()) => return Ok(()),
+      Err(e) => {
+        log::warn!("can't make this audio thread a time-constraint thread (Mach error {e}), using FIFO")
+      }
+    }
+  }
+  set_current_thread_realtime(priority_hint)
+}
+
 /// Fine timer resolution (1 ms, process-wide) while it lives. On Windows, sleeps and timeouts of the audio
 /// threads are otherwise rounded up to the default 15.6 ms tick. Nothing to do elsewhere.
 pub struct TimerResolution(());
@@ -142,5 +165,40 @@ mod tests {
     assert_eq!(fifo_priority(99, 15, 47), 47);
     let p = fifo_priority(80, 15, 47);
     assert!((15..=47).contains(&p) && p > fifo_priority(50, 15, 47), "{p}");
+  }
+
+  /// The flows threads' policy, read back from the system.
+  #[cfg(target_os = "macos")]
+  #[test]
+  fn audio_threads_are_time_constraint_threads_on_macos() {
+    let policy = std::thread::spawn(|| {
+      super::set_current_thread_audio(81).unwrap();
+      let mut policy =
+        libc::thread_time_constraint_policy { period: 0, computation: 0, constraint: 0, preemptible: 0 };
+      let mut count = libc::THREAD_TIME_CONSTRAINT_POLICY_COUNT;
+      let mut get_default = 0;
+      // safety: the policy struct matches the flavor and count; the current thread's port
+      let r = unsafe {
+        libc::thread_policy_get(
+          libc::mach_thread_self(),
+          libc::THREAD_TIME_CONSTRAINT_POLICY as _,
+          &mut policy as *mut _ as libc::thread_policy_t,
+          &mut count,
+          &mut get_default,
+        )
+      };
+      assert_eq!(r, 0);
+      assert_eq!(get_default, 0, "the default policy, not a time constraint");
+      policy
+    })
+    .join()
+    .unwrap();
+    let mut timebase = libc::mach_timebase_info { numer: 0, denom: 0 };
+    unsafe { libc::mach_timebase_info(&mut timebase) };
+    let ns = |abs: u32| abs as u64 * timebase.numer as u64 / timebase.denom as u64;
+    assert_eq!(ns(policy.period), super::AUDIO_THREAD_PERIOD.as_nanos() as u64);
+    assert!(
+      ns(policy.computation) <= ns(policy.constraint) && ns(policy.constraint) <= ns(policy.period)
+    );
   }
 }

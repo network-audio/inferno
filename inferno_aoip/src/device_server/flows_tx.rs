@@ -19,7 +19,7 @@ use super::tx_multicasts::MEDIA_PORT;
 use crate::device_server::TransferNotifier;
 use crate::media_clock::async_clock_receiver_to_realtime;
 use crate::ring_buffer::{ProxyToSamplesBuffer, RBOutput};
-use crate::util::os::set_current_thread_realtime;
+use crate::util::os::set_current_thread_audio;
 use crate::util::real_time_box_channel::RealTimeBoxReceiver;
 use crate::util::thread::run_future_in_new_thread;
 use crate::{
@@ -323,7 +323,7 @@ impl<P: ProxyToSamplesBuffer + 'static> FlowsTransmitterInternal<P> {
     let mut next_process_events = now as Clock;
     drop(now);
 
-    if let Err(e) = set_current_thread_realtime(81) {
+    if let Err(e) = set_current_thread_audio(81) {
       warn!("unable to set realtime priority of flows TX thread ({e:?}), expect dropouts. See README: Audio stability tips");
     }
     loop {

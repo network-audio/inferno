@@ -4,7 +4,7 @@ use crate::device_info::DeviceInfo;
 use crate::device_server::TransferNotifier;
 use crate::net_utils::MTU;
 use crate::ring_buffer::{ProxyToSamplesBuffer, RBInput, RingBufferShared};
-use crate::util::os::set_current_thread_realtime;
+use crate::util::os::set_current_thread_audio;
 use crate::util::real_time_box_channel::RealTimeBoxReceiver;
 use crate::{common::*, media_clock::MediaClock};
 
@@ -338,7 +338,7 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
     let mut may_have_command = false;
     self.publish_latency();
 
-    if let Err(e) = set_current_thread_realtime(80) {
+    if let Err(e) = set_current_thread_audio(80) {
       warn!("unable to set realtime priority of flows RX thread ({e:?}), expect dropouts. See README: Audio stability tips");
     }
     loop {

@@ -375,6 +375,9 @@ If you want to contribute but can't code or don't know where to start because th
 
 # Changelog
 
+## Unreleased
+* macOS: the flows threads (transmitter and receiver) are time-constraint threads, like Core Audio's I/O threads: with FIFO priority alone their sleeps woke up to tens of milliseconds late now and then, more than the network latency (late packets, dropouts; the PTPv1 loopback test failed on most CI runs)
+
 ## 0.9.0
 * macOS sound cards: Core Audio devices on the Dante network, for any application, configured on the settings page like on Windows. A Core Audio HAL plug-in (`inferno_coreaudio`, user space) plays and records through Mach shared memory with the sound card service (a launchd daemon in an unprivileged account), clocked by the Dante media clock: Core Audio runs at the network's rate. No 32-channel limit, nor USB's bandwidth limit at 96 kHz. Installer package built by `packaging/macos/build-pkg.sh`. Tested in CI: the plug-in's I/O loopback on every platform, and on macOS Pipe2inferno -> card -> Core Audio application -> Inferno2pipe, bit-exact
 * macOS sound cards: volume and mute controls for playback and recording (System Settings' sliders, the volume keys), remembered per card; full volume is bit-exact
