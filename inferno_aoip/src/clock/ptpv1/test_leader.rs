@@ -104,11 +104,12 @@ impl TestLeader {
       let mut sequence_id: u16 = 0;
       while !thread_stop.load(Ordering::Relaxed) {
         sequence_id = sequence_id.wrapping_add(1);
-        let approximate = clock.now();
-        let sent = clock.now();
-        let _ =
-          socket.send_to(&messages::sync(me, sequence_id, approximate, true, &grandmaster, -3), event);
-        let _ = socket.send_to(&messages::follow_up(me, sequence_id, sequence_id, sent), general);
+        let sync = messages::sync(me, sequence_id, clock.now(), true, &grandmaster, -3);
+        // like a leading follower: no Follow_Up when the time the Sync went out is uncertain
+        if let Ok(Some(sent)) = super::timed_send(local_now, || socket.send_to(&sync, event)) {
+          let _ =
+            socket.send_to(&messages::follow_up(me, sequence_id, sequence_id, clock.at(sent)), general);
+        }
         std::thread::sleep(config.sync_interval);
       }
     })?;

@@ -98,6 +98,24 @@ fn local_now() -> i64 {
   ClockOverlay::monotonic().now_underlying_ns()
 }
 
+/// How long a send may take for its software timestamp to be used: a thread interrupted around the send (by
+/// milliseconds now and then on CI runners) would otherwise put the interruption into the time the message
+/// reports. Sends themselves take up to a few hundred microseconds (multicast to several local sockets on macOS).
+const MAX_SEND_BRACKET_NS: i64 = 1_000_000;
+
+/// Sends with `send`, timestamped by `now` as it starts, or `None` if it took more than [`MAX_SEND_BRACKET_NS`]
+/// (it was interrupted: the time it went out is uncertain, so don't use it).
+fn timed_send(
+  now: impl Fn() -> i64,
+  send: impl FnOnce() -> std::io::Result<usize>,
+) -> std::io::Result<Option<i64>> {
+  let before = now();
+  send()?;
+  let after = now();
+  let bracket = after.wrapping_sub(before);
+  Ok((0..=MAX_SEND_BRACKET_NS).contains(&bracket).then_some(before))
+}
+
 /// A message, and the local time it was received at.
 struct Received {
   message: Message,
@@ -331,14 +349,18 @@ impl Follower {
     leading.sync_sequence = leading.sync_sequence.wrapping_add(1);
     let sequence_id = leading.sync_sequence;
     let overlay = leading.overlay;
-    // software timestamp: as the Sync is sent, its precise time comes in the Follow_Up
-    let sent = overlay.underlying_to_overlay_ns(local_now());
-    let sync = messages::sync(self.me, sequence_id, sent, true, &mine, LOG_SYNC_INTERVAL);
+    // two-step: the Sync carries an approximate time, the Follow_Up the time it was sent (software timestamp)
+    let approximate = overlay.underlying_to_overlay_ns(local_now());
+    let sync = messages::sync(self.me, sequence_id, approximate, true, &mine, LOG_SYNC_INTERVAL);
     let event = SocketAddrV4::new(self.config.group, self.config.event_port);
-    if let Err(e) = self.send_socket.send_to(&sync, event) {
-      log::warn!("can't send PTP Sync: {e}");
-      return;
-    }
+    let sent = match timed_send(local_now, || self.send_socket.send_to(&sync, event)) {
+      Ok(Some(sent)) => overlay.underlying_to_overlay_ns(sent),
+      Ok(None) => return, // no Follow_Up: followers skip this Sync
+      Err(e) => {
+        log::warn!("can't send PTP Sync: {e}");
+        return;
+      }
+    };
     let follow_up = messages::follow_up(self.me, sequence_id, sequence_id, sent);
     let general = SocketAddrV4::new(self.config.group, self.config.general_port);
     if let Err(e) = self.send_socket.send_to(&follow_up, general) {
@@ -388,9 +410,8 @@ impl Follower {
     self.delay_req_sequence = self.delay_req_sequence.wrapping_add(1);
     let packet = messages::delay_req(self.me, self.delay_req_sequence, &grandmaster);
     let destination = SocketAddrV4::new(self.config.group, self.config.event_port);
-    let sent = local_now();
-    match self.send_socket.send_to(&packet, destination) {
-      Ok(_) => self.pending_delay_req = Some((self.delay_req_sequence, sent)),
+    match timed_send(local_now, || self.send_socket.send_to(&packet, destination)) {
+      Ok(sent) => self.pending_delay_req = sent.map(|sent| (self.delay_req_sequence, sent)),
       Err(e) => log::warn!("can't send PTP Delay_Req: {e}"),
     }
   }
@@ -534,5 +555,38 @@ impl ClockSource for Ptpv1ClockSource {
   fn shutdown(&self) -> BoxFuture<'static, ()> {
     self.stop();
     Box::pin(async {})
+  }
+}
+
+#[cfg(test)]
+mod timed_send_tests {
+  use super::*;
+  use std::cell::Cell;
+
+  fn clock(reads: &[i64]) -> impl Fn() -> i64 + '_ {
+    let next = Cell::new(0);
+    move || {
+      let read = reads[next.get()];
+      next.set(next.get() + 1);
+      read
+    }
+  }
+
+  #[test]
+  fn a_send_has_the_time_it_started() {
+    let sent = timed_send(clock(&[1_000, 1_000 + 400_000]), || Ok(4)).unwrap();
+    assert_eq!(sent, Some(1_000));
+  }
+
+  #[test]
+  fn a_send_interrupted_for_long_has_no_time() {
+    let sent = timed_send(clock(&[1_000, 1_000 + MAX_SEND_BRACKET_NS + 1]), || Ok(4)).unwrap();
+    assert_eq!(sent, None);
+  }
+
+  #[test]
+  fn a_failed_send_is_an_error() {
+    let failed = timed_send(clock(&[0, 10]), || Err(std::io::ErrorKind::Other.into()));
+    assert!(failed.is_err());
   }
 }
