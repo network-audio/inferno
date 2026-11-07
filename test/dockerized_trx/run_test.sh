@@ -13,15 +13,6 @@ fi
 export DEBIAN_PLATFORM
 echo "Debian (jack2) platform: $DEBIAN_PLATFORM"
 
-# PENDING test of two Inferno devices sharing one IP: netaudio 0.4 keys devices by IP ("control address ... is
-# ambiguous across devices"), so it skips their status probes and a pass gets too slow for the time budget.
-# Enable with INFERNO_TEST_SAME_HOST_DEVICES=1.
-if [ "$INFERNO_TEST_SAME_HOST_DEVICES" = 1 ]; then
-    export COMPOSE_PROFILES=same_host
-    echo "Same-host devices test enabled"
-fi
-export INFERNO_TEST_SAME_HOST_DEVICES
-
 # Network latency of every device. Must exceed the host's worst-case scheduling latency (see README: Audio
 # stability tips): Docker Desktop's VM gets paused by the host for up to ~20 ms, hence the 40 ms default
 # (Dante's maximum). On a tuned Linux host, test tight latency with e.g. INFERNO_TEST_LATENCY_NS=10000000.

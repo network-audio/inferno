@@ -124,12 +124,9 @@ services:
       clock_source:
         condition: service_started
 
-  # PENDING: two Inferno devices sharing one IP (aplayrec3p and aplayrec3c, no CAPTURE_IP).
-  # netaudio 0.4 keys devices by IP (see README), so this only runs with INFERNO_TEST_SAME_HOST_DEVICES=1
-  # (run_test.sh then enables the same_host profile).
+  # two Inferno devices sharing one IP (aplayrec3p and aplayrec3c, no CAPTURE_IP)
   aplayrec3:
     build: alpine_aplay_arecord
-    profiles: [same_host]
     env_file: inferno.env
     environment:
       - INFERNO_NAME=aplayrec3
@@ -198,8 +195,6 @@ services:
   control_and_test:
     build: control_and_test
     env_file: inferno.env
-    environment:
-      - INFERNO_TEST_SAME_HOST_DEVICES=${INFERNO_TEST_SAME_HOST_DEVICES:-0}
     networks:
       - audio_net
     volumes:
@@ -215,7 +210,6 @@ services:
         condition: service_started
       aplayrec3:
         condition: service_started
-        required: false # only in the same_host profile
 
 networks:
   audio_net:

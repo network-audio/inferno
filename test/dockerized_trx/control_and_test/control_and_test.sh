@@ -1,30 +1,19 @@
-#!/bin/sh -e
+#!/bin/bash -e
 
 cd /shared
 
 # the devices start together with this controller and run for $DURATION seconds from now
 start=$(date +%s)
 
-# Two Inferno devices on one IP (aplayrec3p + aplayrec3c in one container) need netaudio support for
-# multiple devices per host: netaudio 0.4 lists and subscribes them, but reports their control address as
-# ambiguous and skips their status probes. Enable with INFERNO_TEST_SAME_HOST_DEVICES=1.
-routes="jack2:jack1 jack1:jack2 pipewire1:aplayrec1c aplayrec1p:aplayrec2c aplayrec1p:pipewire1 jack1:i2pipe1"
-aplayrec_devices=4
-aplayrec_sub_lines=6
-subscribed=12
-recorders="jack1 jack2 aplayrec1 aplayrec2 pipewire1 i2pipe1"
-if test "$INFERNO_TEST_SAME_HOST_DEVICES" = 1; then
-    echo '▶ same-host test enabled: two devices on one IP (aplayrec3p -> aplayrec3c)'
-    routes="$routes aplayrec3p:aplayrec3c"
-    aplayrec_devices=6
-    aplayrec_sub_lines=$((aplayrec_sub_lines+2))
-    subscribed=$((subscribed+2))
-    recorders="$recorders aplayrec3"
-else
-    echo '⏸ PENDING: two devices on one IP (needs netaudio multi-device-per-host support)'
-fi
+# aplayrec1 and aplayrec2 run their two devices on two addresses, aplayrec3 its two (aplayrec3p -> aplayrec3c) on
+# one: netaudio tells devices sharing an IP apart since 0.5
+routes="jack2:jack1 jack1:jack2 pipewire1:aplayrec1c aplayrec1p:aplayrec2c aplayrec1p:pipewire1 jack1:i2pipe1 aplayrec3p:aplayrec3c"
+aplayrec_devices=6
+aplayrec_sub_lines=8
+subscribed=14
+recorders="jack1 jack2 aplayrec1 aplayrec2 pipewire1 i2pipe1 aplayrec3"
 
-# wait until all devices are discovered (one netaudio 0.4 pass takes ~15-20 s)
+# wait until all devices are discovered
 discovery_deadline=$((start+DURATION/2))
 until netaudio device list > devlist && \
     test `grep jack < devlist | wc -l` -eq 2 && \
@@ -153,10 +142,7 @@ sox --no-dither -t raw -e signed-integer -b 32 -c 2 -r $INFERNO_SAMPLE_RATE /sha
 rm /shared/rec-i2pipe1.raw
 
 # recorder:source pairs; test them all, then fail if any failed
-pairs="aplayrec1:pipewire1 aplayrec2:aplayrec1 pipewire1:aplayrec1 i2pipe1:jack1 jack1:jack2 jack2:jack1"
-if test "$INFERNO_TEST_SAME_HOST_DEVICES" = 1; then
-    pairs="$pairs aplayrec3:aplayrec3"
-fi
+pairs="aplayrec1:pipewire1 aplayrec2:aplayrec1 pipewire1:aplayrec1 i2pipe1:jack1 jack1:jack2 jack2:jack1 aplayrec3:aplayrec3"
 failed=""
 set +e
 for pair in $pairs; do

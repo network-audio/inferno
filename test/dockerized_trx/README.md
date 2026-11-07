@@ -10,20 +10,14 @@ Run `run_test.sh`, it handles everything including building Docker images. It ex
 set `ARTIFACTS_DIR=<dir>` to keep the recordings and reports.
 
 Each `alpine_aplay_arecord` container runs two Inferno devices on one host (aplay and arecord, separated by
-`PROCESS_ID` and `ALT_PORT`). The capture device binds to a second address (`CAPTURE_IP`) on the same interface,
-because netaudio 0.4 keys devices by IP. `audio_net` therefore uses a fixed subnet,
-`10.213.77.0/24` by default; set `AUDIO_NET_PREFIX` (e.g. `AUDIO_NET_PREFIX=10.99.1`) if it clashes with
-a local network.
+`PROCESS_ID` and `ALT_PORT`). In `aplayrec1` and `aplayrec2` the capture device binds to a second address
+(`CAPTURE_IP`) on the same interface; in `aplayrec3` both devices share one IP (routed `aplayrec3p` ->
+`aplayrec3c`), which netaudio tells apart since 0.5. `audio_net` uses a fixed subnet for the second addresses,
+`10.213.77.0/24` by default; set `AUDIO_NET_PREFIX` (e.g. `AUDIO_NET_PREFIX=10.99.1`) if it clashes with a local
+network.
 
-**PENDING:** two devices on the *same* IP (`aplayrec3`, routed `aplayrec3p` -> `aplayrec3c`) are tested only with
-`INFERNO_TEST_SAME_HOST_DEVICES=1 ./run_test.sh`. netaudio 0.4.2 lists and subscribes them, but reports
-"control address ... is ambiguous across devices", skips their status probes, and the slower discovery
-makes the run fail with "wasted too much time". Enable this by default once netaudio supports multiple
-devices per host.
-
-Timing: netaudio 0.4 waits for several probes Inferno doesn't answer, so one `netaudio device list` pass takes
-20-30 s, and a device that starts late may need a second pass. Hence `DURATION=120` in `inferno.env`: discovery
-gets `DURATION/2`, and the minimal signal duration counts from the controller's start, discovery included.
+Timing: devices run for `DURATION` seconds (`inferno.env`). Discovery gets `DURATION/2`, and the minimal signal
+duration counts from the controller's start, discovery included.
 
 Inferno containers get `CAP_SYS_NICE` and `rtprio`, so its audio threads run with realtime priority (Inferno logs
 "unable to set realtime priority" otherwise).
