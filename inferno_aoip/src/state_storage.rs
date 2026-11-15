@@ -83,7 +83,7 @@ mod tests {
   #[test]
   fn save_and_load_roundtrip() {
     let storage = temp_state_storage();
-    let config = TestConfig { name: "test".to_string(), count: 42 };
+    let config = TestConfig { name: "long document ".repeat(10_000), count: 42 };
     storage.save("config", &config).unwrap();
     let loaded: TestConfig = storage.load("config").unwrap();
     assert_eq!(config, loaded);
