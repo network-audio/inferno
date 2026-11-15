@@ -35,6 +35,7 @@ struct Multicaster<'s> {
   seqnum: u16,
   vendor: [u8; 8],
   firmware_version_bytes: [u8; 4],
+  software_version_bytes: [u8; 4],
   product_version_bytes: [u8; 4],
   device_info_destination: SocketAddr,
   heartbeat_destination: SocketAddr,
@@ -56,18 +57,23 @@ impl<'s> Multicaster<'s> {
     get_peaks: PeaksCallback,
   ) -> Multicaster {
     let patch_version = env!("CARGO_PKG_VERSION_PATCH").parse::<u16>().unwrap();
+    let crate_version = [
+      env!("CARGO_PKG_VERSION_MAJOR").parse::<u8>().unwrap(),
+      env!("CARGO_PKG_VERSION_MINOR").parse::<u8>().unwrap(),
+      H(patch_version),
+      L(patch_version),
+    ];
     let mut r = Multicaster {
       self_info,
       server,
       seqnum: 1,
       vendor: [32; 8],
       firmware_version_bytes: [4, 1, 6, 2],
-      product_version_bytes: [
-        env!("CARGO_PKG_VERSION_MAJOR").parse::<u8>().unwrap(),
-        env!("CARGO_PKG_VERSION_MINOR").parse::<u8>().unwrap(),
-        H(patch_version),
-        L(patch_version),
-      ],
+      software_version_bytes: crate_version,
+      product_version_bytes: match self_info.product_version {
+        Some((major, minor, patch)) => [major, minor, H(patch), L(patch)],
+        None => crate_version,
+      },
       device_info_destination: SocketAddr::new(
         IpAddr::V4(Ipv4Addr::new(224, 0, 0, 231)),
         DST_PORT_DEVICE_INFO,
@@ -149,11 +155,12 @@ impl<'s> Multicaster<'s> {
     write_str_to_buffer(&mut content, 8, 8, &self.self_info.board_name);
     write_str_to_buffer(&mut content, 0x2c, 16, &self.self_info.manufacturer);
     write_str_to_buffer(&mut content, 0xac, 16, &self.self_info.model_name);
-    // product version:
-    //content[0x12c..0x130].copy_from_slice(&self.product_version_bytes);
+    // product version (controllers show it as "Product Version"; a hardware
+    // interface carries e.g. 01 01 00 03 = 1.1.3 here):
+    content[0x12c..0x130].copy_from_slice(&self.product_version_bytes);
 
     // firmware version:
-    content[0x1c..0x20].copy_from_slice(&self.product_version_bytes);
+    content[0x1c..0x20].copy_from_slice(&self.software_version_bytes);
 
     // 0x18..0x1b - software version
     // 0x24..0x26 - software patch version, u32
