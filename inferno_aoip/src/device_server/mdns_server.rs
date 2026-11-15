@@ -268,3 +268,33 @@ impl DeviceMDNSResponder {
       .log_and_forget();
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::device_server::Settings;
+
+  #[tokio::test]
+  async fn channel_and_bundle_advertise_tx_latency() {
+    let config = BTreeMap::from([
+      ("RX_LATENCY_NS".into(), "10000000".into()),
+      ("TX_LATENCY_NS".into(), "1000000".into()),
+      ("PROCESS_ID".into(), "31001".into()),
+    ]);
+    let mut settings = Settings::new("latency_test", "test", Some(Ipv4Addr::LOCALHOST), &config).unwrap();
+    settings.make_tx_channels(1);
+    let info = Arc::new(settings.self_info);
+    let responder = DeviceMDNSResponder::start(
+      info.clone(), settings.tx_latency_ns, Arc::new(RwLock::new(BTreeMap::new())),
+    );
+    responder.add_tx_channel(0);
+    responder.add_multicast_bundle(1, 1, 16, Ipv4Addr::new(239, 69, 1, 1), 5004);
+    let client = MdnsClient::new(info.clone());
+    let channel = client.query_chan(&info.friendly_hostname, &info.tx_channels[0].factory_name).await;
+    let bundle = client.query_bund(&format!("1@{}", info.friendly_hostname)).await;
+    responder.shutdown_and_join();
+    assert_eq!(channel.unwrap().min_rx_latency_ns, 1_000_000);
+    assert_eq!(bundle.unwrap().min_rx_latency_ns, 1_000_000);
+    assert_eq!(info.latency_ns, 10_000_000);
+  }
+}
