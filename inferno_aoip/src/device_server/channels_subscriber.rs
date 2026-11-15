@@ -1302,3 +1302,23 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
     }
   }
 }
+
+#[cfg(test)]
+mod unsubscribe_readback_tests {
+  use super::*;
+  #[tokio::test]
+  async fn clears_readback_before_worker_processes_removal() {
+    let (tx, mut rx) = mpsc::channel(1);
+    let subscriber = ChannelsSubscriber {
+      commands_sender: tx,
+      subscriptions_info: Arc::new(RwLock::new(vec![Some(SubscriptionInfo {
+        tx_channel_name: "TX 1".into(), tx_hostname: "source".into(),
+        status: SubscriptionStatus::Unresolved,
+      })])),
+      flows_info: Arc::new(RwLock::new(vec![])),
+    };
+    subscriber.unsubscribe(0).await;
+    assert!(subscriber.subscriptions_info.read().unwrap()[0].is_none());
+    assert!(matches!(rx.try_recv().unwrap(), Command::Unsubscribe { local_channel_index: 0 }));
+  }
+}
