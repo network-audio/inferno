@@ -499,6 +499,7 @@ mod tests {
       cmc_port: 8800,
       flows_control_port: 4455,
       info_request_port: 8700,
+      state_dir: None,
     };
     let desc = CommonChannelsDescriptor::new(&device);
     assert_eq!(desc.sample_rate, 48000);
