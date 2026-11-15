@@ -281,7 +281,7 @@ mod tests {
       ("TX_LATENCY_NS".into(), "1000000".into()),
       ("PROCESS_ID".into(), "31001".into()),
     ]);
-    let mut settings = Settings::new("latency_test", "test", Some(Ipv4Addr::LOCALHOST), &config).unwrap();
+    let mut settings = Settings::new("latency_test", "test", Some(Ipv4Addr::LOCALHOST), &config);
     settings.make_tx_channels(1);
     let info = Arc::new(settings.self_info);
     let responder = DeviceMDNSResponder::start(
