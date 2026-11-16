@@ -404,11 +404,15 @@ impl<'a, T: BinarySerde> Iterator for ItemsInPacketIterator<'a, T> {
   }
 }
 
+/// Iterates the items of a request payload laid out as `u8, u8 count, count x T`.
+/// The count comes from the network: it is clamped to the items actually present,
+/// and a payload shorter than its 2-byte header yields no items.
 pub fn deserialize_items<'a, T: BinarySerde>(payload: &'a [u8]) -> ItemsInPacketIterator<'a, T> {
+  let items_bytes = payload.get(2..).unwrap_or(&[]);
   let num_items: usize = (*payload.get(1).unwrap_or(&0)).into();
-  let num_items = num_items.min(payload.len() / T::SERIALIZED_SIZE);
+  let num_items = num_items.min(items_bytes.len() / T::SERIALIZED_SIZE);
   ItemsInPacketIterator::<'a, T> {
-    items_bytes: &payload[2..][..num_items * T::SERIALIZED_SIZE],
+    items_bytes: &items_bytes[..num_items * T::SERIALIZED_SIZE],
     item_start: 0,
     _t: Default::default(),
   }
@@ -642,5 +646,45 @@ mod tests {
   fn deserialize_items_empty() {
     let items: Vec<get_receive_channels::ChannelDescriptor> = deserialize_items(&[0, 0]).collect();
     assert!(items.is_empty());
+  }
+
+  #[test]
+  fn deserialize_items_shorter_than_header() {
+    for payload in [&[][..], &[0][..], &[0, 5][..]] {
+      let items: Vec<u16> = deserialize_items(payload).collect();
+      assert!(items.is_empty(), "payload {payload:?}");
+    }
+  }
+
+  #[test]
+  fn deserialize_items_count_larger_than_payload() {
+    // count says 5 items of 6 bytes, but only 5 bytes follow the header:
+    // the old code took the count from the whole payload (7 / 6 = 1) and sliced past the end
+    let payload = [0, 5, 1, 2, 3, 4, 5];
+    let items: Vec<set_channels_subscriptions::SingleChannelSubscriptionRequest> =
+      deserialize_items(&payload).collect();
+    assert!(items.is_empty());
+  }
+
+  #[test]
+  fn deserialize_items_clamps_to_present_items() {
+    let payload = [0, 200, 0, 1, 0, 2, 0, 3];
+    let items: Vec<u16> = deserialize_items(&payload).collect();
+    assert_eq!(items, vec![1, 2, 3]);
+  }
+
+  #[test]
+  fn deserialize_items_never_panics_on_short_payloads() {
+    for len in 0..64 {
+      for count in [0u8, 1, 2, 7, 255] {
+        let mut payload = vec![0xAAu8; len];
+        if len > 1 {
+          payload[1] = count;
+        }
+        let _: Vec<set_channels_subscriptions::SingleChannelSubscriptionRequest> =
+          deserialize_items(&payload).collect();
+        let _: Vec<u16> = deserialize_items(&payload).collect();
+      }
+    }
   }
 }
