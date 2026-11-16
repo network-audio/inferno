@@ -501,6 +501,57 @@ struct FlowData {
   cookie: u16,
   remote: SocketAddr,
   expired: Arc<AtomicBool>,
+  // the TX thread's packet layout, needed to validate later channel changes
+  fpp: usize,
+  bytes_per_sample: usize,
+}
+
+/// Media packet header (type byte, seconds, subsecond samples) before the samples.
+const MEDIA_HEADER_BYTES: usize = 9;
+
+/// Why a flow (requested over the network, or created for multicast) cannot be sent.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum FlowLayoutError {
+  #[error("unsupported bytes per sample: {0}")]
+  BytesPerSample(usize),
+  #[error("frames per packet {0} outside {FPP_MIN}..={FPP_MAX}")]
+  FramesPerPacket(usize),
+  #[error("channel index {index} but only {channels} TX channels")]
+  ChannelIndex { index: usize, channels: usize },
+  #[error("packet of {0} bytes does not fit the {MTU}-byte buffer")]
+  PacketTooLarge(usize),
+}
+
+/// Checks a flow before it reaches the TX thread, which slices its MTU-sized
+/// packet buffer with `channels * bytes_per_sample * fpp`, indexes its channel
+/// sources with the channel indices and advances each flow by `fpp` frames per
+/// packet (0 would never advance): all of these come from network requests.
+/// The channel count itself is bounded only by the packet size.
+pub fn validate_flow_layout(
+  channel_indices: &[Option<usize>],
+  fpp: usize,
+  bytes_per_sample: usize,
+  num_channels: usize,
+) -> Result<(), FlowLayoutError> {
+  if !(2..=4).contains(&bytes_per_sample) {
+    return Err(FlowLayoutError::BytesPerSample(bytes_per_sample));
+  }
+  if !(FPP_MIN as usize..=FPP_MAX as usize).contains(&fpp) {
+    return Err(FlowLayoutError::FramesPerPacket(fpp));
+  }
+  if let Some(&index) = channel_indices.iter().flatten().find(|&&i| i >= num_channels) {
+    return Err(FlowLayoutError::ChannelIndex { index, channels: num_channels });
+  }
+  let packet_bytes = MEDIA_HEADER_BYTES + channel_indices.len() * bytes_per_sample * fpp;
+  if packet_bytes > MTU {
+    return Err(FlowLayoutError::PacketTooLarge(packet_bytes));
+  }
+  Ok(())
+}
+
+fn invalid_input(e: FlowLayoutError) -> std::io::Error {
+  error!("rejecting flow: {e}");
+  std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
 }
 
 #[derive(Debug)]
@@ -547,6 +598,8 @@ pub struct FlowsTransmitter {
   ip_port_to_id: BTreeMap<SocketAddr, u32>,
   commands_sender: mpsc::Sender<Command>,
   flows_info: Vec<Option<FlowInfo>>,
+  // number of channel sources the TX thread reads from
+  num_channels: usize,
 }
 
 fn split_handle(h: FlowHandle) -> (u32, u16) {
@@ -601,6 +654,7 @@ impl FlowsTransmitter {
     let (tx, rx) = mpsc::channel(100);
     let tx1 = tx.clone();
     let srate = self_info.sample_rate;
+    let num_channels = channels_outputs.len();
     // TODO dehardcode latency_ns
     let thread_join = run_future_in_new_thread("flows TX", move || {
       Self::run(
@@ -626,6 +680,7 @@ impl FlowsTransmitter {
         flows: BTreeMap::new(),
         ip_port_to_id: BTreeMap::new(),
         flows_info: (0..MAX_FLOWS).map(|_| None).collect_vec(),
+        num_channels,
       },
       thread_join,
     );
@@ -647,9 +702,17 @@ impl FlowsTransmitter {
     is_multicast: bool,
   ) -> Result<(usize, FlowHandle), std::io::Error> {
     let channel_indices = flow_info.local_channel_indices.clone();
+    if let Some(index) = requested_flow_index {
+      if index >= MAX_FLOWS {
+        error!("requested flow index out of range: {index}");
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+      }
+    }
     let dst_addr = SocketAddr::new(IpAddr::V4(flow_info.dst_addr), flow_info.dst_port);
     let (flow_index, cookie) = match self.ip_port_to_id.get(&dst_addr) {
       None => {
+        validate_flow_layout(&channel_indices, fpp, bytes_per_sample, self.num_channels)
+          .map_err(invalid_input)?;
         self.scan_expired().await;
         let mut counter = 0;
         let flow_index = loop {
@@ -678,6 +741,8 @@ impl FlowsTransmitter {
           remote: dst_addr.clone(),
           // we're adding multicast flow as 'expired' to give it grace period for multicast address collission detection
           expired: Arc::new(AtomicBool::new(is_multicast)),
+          fpp,
+          bytes_per_sample,
         };
 
         let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(self.self_info.ip_address), 0))?;
@@ -706,6 +771,16 @@ impl FlowsTransmitter {
       Some(&flow_index) => {
         warn!("got add flow request for already existing flow, setting channels instead");
         // TODO FIXME what if fpp or bytes_per_sample change?
+        // the TX thread keeps the existing flow's layout, so validate against that
+        let existing = self.flows.get(&flow_index).ok_or(std::io::ErrorKind::NotFound)?;
+        validate_flow_layout(
+          &channel_indices,
+          existing.fpp,
+          existing.bytes_per_sample,
+          self.num_channels,
+        )
+        .map_err(invalid_input)?;
+        let cookie = existing.cookie;
         self
           .commands_sender
           .send(Command::SetChannels {
@@ -713,8 +788,8 @@ impl FlowsTransmitter {
             channel_indices: channel_indices.clone(),
           })
           .await
-          .unwrap();
-        (flow_index, self.flows.get(&flow_index).unwrap().cookie)
+          .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+        (flow_index, cookie)
       }
     };
 
@@ -728,9 +803,16 @@ impl FlowsTransmitter {
 
     Ok((flow_index as usize, flow_handle))
   }
-  pub fn activate_multicast_flow(&mut self, flow_index: u32) {
-    // this is called for multicast flows after grace period
-    self.flows.get(&flow_index).as_ref().unwrap().expired.store(false, Ordering::Release);
+  /// Called for multicast flows after the grace period. Returns false when the
+  /// flow no longer exists (it was deleted during the grace period).
+  pub fn activate_multicast_flow(&mut self, flow_index: u32) -> bool {
+    match self.flows.get(&flow_index) {
+      Some(flow) => {
+        flow.expired.store(false, Ordering::Release);
+        true
+      }
+      None => false,
+    }
   }
   pub fn random_multicast_destination(&self) -> (Ipv4Addr, u16) {
     loop {
@@ -779,13 +861,15 @@ impl FlowsTransmitter {
     handle: FlowHandle,
     channel_indices: impl IntoIterator<Item = Option<usize>>,
   ) -> Result<usize, std::io::Error> {
-    if let Some((index, _)) = self.get_flow(handle) {
+    if let Some((index, flow)) = self.get_flow(handle) {
       let channel_indices = channel_indices.into_iter().collect_vec();
+      validate_flow_layout(&channel_indices, flow.fpp, flow.bytes_per_sample, self.num_channels)
+        .map_err(invalid_input)?;
       self
         .commands_sender
         .send(Command::SetChannels { index: index as usize, channel_indices: channel_indices.clone() })
         .await
-        .unwrap();
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
 
       self.flows_info[index as usize].as_mut().unwrap().local_channel_indices = channel_indices;
       Ok(index as usize)
@@ -854,5 +938,42 @@ mod tests {
     // just before the position counter wraps around: long after the start
     assert_eq!(samples_before_start(usize::MAX / 2 + 7, 32, 480), 0);
     assert_eq!(samples_before_start(0usize.wrapping_sub(10_000), 32, 480), 0);
+  }
+}
+
+#[cfg(test)]
+mod layout_tests {
+  use super::*;
+
+  #[test]
+  fn accepts_typical_flows() {
+    assert_eq!(validate_flow_layout(&[Some(0), Some(1)], 16, 3, 2), Ok(()));
+    assert_eq!(validate_flow_layout(&[Some(7), None, Some(0)], 32, 4, 8), Ok(()));
+    // multicast: 15 channels of 24-bit at 32 fpp still fit one packet
+    assert_eq!(validate_flow_layout(&vec![Some(0); 15], 32, 3, 1), Ok(()));
+  }
+
+  #[test]
+  fn rejects_what_would_panic_or_stall_the_tx_thread() {
+    use FlowLayoutError::*;
+    assert_eq!(validate_flow_layout(&[Some(0)], 16, 0, 1), Err(BytesPerSample(0)));
+    assert_eq!(validate_flow_layout(&[Some(0)], 16, 536870911, 1), Err(BytesPerSample(536870911)));
+    assert_eq!(validate_flow_layout(&[Some(0)], 0, 3, 1), Err(FramesPerPacket(0)));
+    assert_eq!(validate_flow_layout(&[Some(0)], FPP_MAX as usize + 1, 3, 1), Err(FramesPerPacket(257)));
+    assert_eq!(validate_flow_layout(&[Some(2)], 16, 3, 2), Err(ChannelIndex { index: 2, channels: 2 }));
+    assert_eq!(
+      validate_flow_layout(&[None, Some(usize::MAX)], 16, 3, 2),
+      Err(ChannelIndex { index: usize::MAX, channels: 2 })
+    );
+    // 8 channels of 24-bit at FPP_MAX: within the old fpp check, but 6153 bytes
+    assert_eq!(validate_flow_layout(&vec![Some(0); 8], 256, 3, 1), Err(PacketTooLarge(6153)));
+    assert_eq!(validate_flow_layout(&vec![None; 700], 2, 4, 1), Err(PacketTooLarge(5609)));
+  }
+
+  #[test]
+  fn packet_size_limit_is_exact() {
+    // 9 + n * 4 * 2 <= MTU  =>  n = 186 fits, 187 does not
+    assert_eq!(validate_flow_layout(&vec![None; 186], 2, 4, 1), Ok(()));
+    assert!(validate_flow_layout(&vec![None; 187], 2, 4, 1).is_err());
   }
 }
