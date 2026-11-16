@@ -97,6 +97,10 @@ impl Connection {
     opcode2: u16,
     content: &[u8],
   ) {
+    if content.len() > self.send_buff.len() - HEADER_LENGTH {
+      error!("dropping oversized response to opcode {opcode1:#06x}: {} bytes", content.len());
+      return;
+    }
     let pkt = make_packet(&mut self.send_buff, start_code, seqnum, opcode1, opcode2, content);
     self.server.send(&dst, pkt).await;
   }
@@ -114,5 +118,24 @@ impl Connection {
         payload.binary_serialize_to_array(binary_serde::Endianness::Big).as_slice(),
       )
       .await;
+  }
+}
+
+#[cfg(test)]
+mod response_size_tests {
+  use super::*;
+  #[tokio::test]
+  async fn drops_oversized_response_and_sends_next_valid_packet() {
+    let (_shutdown, rx) = tokio::sync::broadcast::channel(1);
+    let server = UdpSocketWrapper::bind(Some(std::net::Ipv4Addr::LOCALHOST), 0, rx).await.unwrap();
+    let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dst = receiver.local_addr().unwrap();
+    let mut conn = Connection::new(server);
+    conn.send(dst, 0x27ff, 1, 1, 1, &vec![0; SEND_BUFFER_SIZE - HEADER_LENGTH + 1]).await;
+    conn.send(dst, 0x27ff, 2, 1, 1, &vec![0; SEND_BUFFER_SIZE - HEADER_LENGTH]).await;
+    let mut buf = [0; SEND_BUFFER_SIZE + 1];
+    let len = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv(&mut buf)).await.unwrap().unwrap();
+    assert_eq!(len, SEND_BUFFER_SIZE);
+    assert_eq!(req_resp_packet::View::new(&buf[..len]).seqnum().read(), 2);
   }
 }
