@@ -19,6 +19,9 @@ pub struct StateStorage {
 
 /// Where the device's state (subscriptions, channel names, multicast flows) is saved.
 pub fn state_dir(self_info: &DeviceInfo) -> String {
+  if let Some(path) = self_info.state_dir.as_ref().filter(|p| !p.as_os_str().is_empty()) {
+    return path.to_string_lossy().into_owned();
+  }
   AppDirs::new(Some("inferno_aoip"), false).unwrap().state_dir.to_str().unwrap().to_owned()
     + MAIN_SEPARATOR_STR
     + &hex::encode(self_info.factory_device_id)
@@ -128,5 +131,18 @@ mod tests {
     std::fs::write(&path, "not valid toml [[[").unwrap();
     let result: Result<TestConfig, Box<dyn Error>> = storage.load("bad");
     assert!(result.is_err());
+  }
+}
+
+#[cfg(test)]
+mod pinned_directory_tests {
+  use super::*;
+  #[test]
+  fn explicit_directory_does_not_follow_device_identity() {
+    let mut info = crate::device_info::tests::dummy_device_info(0, 48000);
+    info.state_dir = Some(std::path::PathBuf::from("chosen-state"));
+    assert_eq!(state_dir(&info), "chosen-state");
+    info.factory_device_id = [42; 8];
+    assert_eq!(state_dir(&info), "chosen-state");
   }
 }
