@@ -75,3 +75,13 @@ async fn receive_channels_listed_without_running_receiver() {
 
   server.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tx_flow_labels_returns_an_empty_page() {
+  let settings = make_settings("arc_labels", 31, 19300, 0, 0);
+  let port = settings.self_info.arc_port;
+  let server = DeviceServer::start(settings).await;
+  let content = tokio::task::spawn_blocking(move || arc_request_first_page(port, 0x2204)).await.unwrap();
+  server.shutdown().await;
+  assert_eq!(content, [2, 0]);
+}
