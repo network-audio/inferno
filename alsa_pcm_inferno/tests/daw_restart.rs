@@ -65,12 +65,14 @@ fn state_home() -> PathBuf {
 }
 
 fn plugin_path() -> PathBuf {
-    // tests run from target/<profile>/deps/, the plugin is built into target/<profile>/
+    // Cargo places tests in either <profile>/deps/ or <profile>/build/<crate>/<hash>/out/.
+    // The plugin stays in <profile>/, including with a custom target directory.
     let exe = std::env::current_exe().unwrap();
-    let dir = exe.parent().unwrap().parent().unwrap();
-    let path = dir.join("libasound_module_pcm_inferno.so");
-    assert!(path.exists(), "plugin not built at {path:?}");
-    path
+    exe.ancestors()
+        .skip(1)
+        .map(|dir| dir.join("libasound_module_pcm_inferno.so"))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("plugin not built in a parent directory of {exe:?}"))
 }
 
 fn init_test_env() {
