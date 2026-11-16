@@ -18,6 +18,7 @@ use crate::protocol::proto_cmc::PORT as CMC_PORT;
 /// Settings keys (in upper case) understood by `Settings`, as config keys or `INFERNO_` environment variables.
 pub const KEYS: &[&str] = &[
   "NAME",
+  "STATE_DIR",
   "DEVICE_ID",
   "PROCESS_ID",
   "BIND_IP",
@@ -274,6 +275,7 @@ fn create_self_info(
     cmc_port: CMC_PORT,
     flows_control_port: FLOWS_CONTROL_PORT,
     info_request_port: INFO_REQUEST_PORT,
+    state_dir: settings.get("STATE_DIR").map(PathBuf::from),
   };
 
   // the device listens on 4 consecutive ports starting at ALT_PORT
@@ -656,5 +658,16 @@ mod tests {
     let unknown = Settings::unknown_keys(&merged, &["TYPE"]);
     assert!(unknown.contains(&"SAMPLERATE"), "{unknown:?}");
     assert!(!unknown.contains(&"SAMPLE_RATE") && !unknown.contains(&"TYPE"), "{unknown:?}");
+  }
+}
+
+#[cfg(test)]
+mod state_directory_setting_tests {
+  use super::*;
+  #[test]
+  fn an_empty_directory_uses_the_default() {
+    let config = BTreeMap::from([("STATE_DIR".into(), String::new())]);
+    let settings = Settings::try_new("state-test", "test", Some(Ipv4Addr::LOCALHOST), &config).unwrap();
+    assert!(settings.self_info.state_dir.is_none());
   }
 }
