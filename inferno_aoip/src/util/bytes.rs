@@ -17,8 +17,10 @@ pub fn make_u16(h: u8, l: u8) -> u16 {
 }
 
 pub fn write_str_to_buffer(buffer: &mut [u8], offset: usize, max_len: usize, s: &str) {
-  let len = min(max_len, s.len());
-  buffer[offset..offset + len].clone_from_slice(&s.as_bytes()[0..len]);
+  let len = min(max_len, s.len()).min(buffer.len().saturating_sub(offset));
+  if len > 0 {
+    buffer[offset..offset + len].copy_from_slice(&s.as_bytes()[..len]);
+  }
 }
 
 pub fn write_0term_str_to_bytebuffer(bytes: &mut ByteBuffer, s: &str) -> u16 {
@@ -181,5 +183,20 @@ mod tests {
   fn test_read_0term_str_from_buffer_offset_past_end() {
     let buf = b"hi";
     assert!(read_0term_str_from_buffer(buf, 5).is_err());
+  }
+}
+
+#[cfg(test)]
+mod fixed_buffer_tests {
+  use super::*;
+  #[test]
+  fn short_buffer_and_out_of_range_offsets() {
+    let mut dst = [0; 3];
+    write_str_to_buffer(&mut dst, 1, 20, "abc");
+    assert_eq!(dst, [0, b'a', b'b']);
+    for offset in [3, 4, usize::MAX] {
+      write_str_to_buffer(&mut dst, offset, usize::MAX, "abc");
+      assert_eq!(dst, [0, b'a', b'b']);
+    }
   }
 }
