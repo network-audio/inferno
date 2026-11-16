@@ -126,14 +126,7 @@ impl MdnsClient {
   ) -> Result<bool, Box<dyn Error>> {
     let fqdn = Name::from_labels(fqdn_parts.iter().map(|&s| s.as_bytes())).map_err(|e| Box::new(e))?;
     match self.do_single_query(&[RecordType::A], &fqdn, timeout).await {
-      Ok(response) => {
-        for record in response.answers() {
-          if record.name().to_lowercase() == fqdn.to_lowercase() {
-            return Ok(true);
-          }
-        }
-        Ok(true)
-      }
+      Ok(response) => Ok(has_answer_for_name(response.answers(), &fqdn)),
       Err(_e) => Ok(false), // TODO: sometimes error may be other than timeout, handle that
     }
   }
@@ -308,5 +301,23 @@ impl MdnsClient {
       min_rx_latency_ns: parse_int("latency_ns")?,
       media_addr,
     });
+  }
+}
+
+fn has_answer_for_name(records: &[searchfire::dns::rr::Record], fqdn: &Name) -> bool {
+  records.iter().any(|record| record.name().to_lowercase() == fqdn.to_lowercase())
+}
+
+#[cfg(test)]
+mod address_answer_tests {
+  use super::*;
+  #[test]
+  fn unrelated_answers_do_not_reserve_an_address() {
+    let queried = Name::from_ascii("wanted.local.").unwrap();
+    let other = searchfire::dns::rr::Record::with(Name::from_ascii("other.local.").unwrap(), RecordType::A, 60);
+    let matching = searchfire::dns::rr::Record::with(Name::from_ascii("WANTED.local.").unwrap(), RecordType::A, 60);
+    assert!(!has_answer_for_name(&[], &queried));
+    assert!(!has_answer_for_name(&[other], &queried));
+    assert!(has_answer_for_name(&[matching], &queried));
   }
 }
