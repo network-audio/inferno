@@ -48,7 +48,7 @@ pub struct DeviceInfo {
 
 impl DeviceInfo {
   pub fn latency_samples(&self) -> usize {
-    self.latency_ns * (self.sample_rate as usize) / 1_000_000_000
+    ((self.latency_ns as u128 * self.sample_rate as u128) / 1_000_000_000) as usize
   }
 }
 
@@ -121,5 +121,15 @@ pub(crate) mod tests {
     let device = dummy_device_info(1_000_000_000, 44100 * 1024);
     let result = device.latency_samples();
     assert!(result <= usize::MAX);
+  }
+}
+
+#[cfg(test)]
+mod latency_overflow_tests {
+  #[test]
+  fn intermediate_product_can_exceed_usize() {
+    let info = super::tests::dummy_device_info(usize::MAX / 2, 192_000);
+    let expected = ((info.latency_ns as u128 * 192_000) / 1_000_000_000) as usize;
+    assert_eq!(info.latency_samples(), expected);
   }
 }
