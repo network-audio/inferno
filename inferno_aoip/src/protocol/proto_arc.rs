@@ -234,6 +234,42 @@ pub mod delete_multicast_tx_flow {
   pub const OPCODE: u16 = 0x2202;
 }
 
+pub mod remove_rx_subscriptions {
+  pub const OPCODE: u16 = 0x3014;
+
+  /// Receive channel ids: `u16 count, count x u32 channel id`. None if the content is
+  /// shorter than its header; a count larger than the ids present is clamped.
+  pub fn parse_channel_ids(content: &[u8]) -> Option<Vec<u32>> {
+    if content.len() < 2 {
+      return None;
+    }
+    let count = u16::from_be_bytes([content[0], content[1]]) as usize;
+    Some(
+      content[2..]
+        .chunks_exact(4)
+        .take(count)
+        .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+        .collect(),
+    )
+  }
+
+  /// Splits the requested channel ids (1-based) into local channel indices to
+  /// unsubscribe and ids that name no receive channel. A bulk remove names
+  /// every channel; acting on the first id only left the rest subscribed (U1).
+  pub fn local_channel_indices(ids: &[u32], rx_channels: usize) -> (Vec<usize>, Vec<u32>) {
+    let mut valid = Vec::with_capacity(ids.len());
+    let mut invalid = Vec::new();
+    for &id in ids {
+      if id == 0 || id as usize > rx_channels {
+        invalid.push(id);
+      } else {
+        valid.push((id - 1) as usize);
+      }
+    }
+    (valid, invalid)
+  }
+}
+
 pub mod query_rx_flows {
   pub const OPCODE: u16 = 0x3200;
 
@@ -687,4 +723,23 @@ mod tests {
       }
     }
   }
+}
+
+#[cfg(test)]
+mod unsubscribe_tests {
+  use super::*;
+  #[test]
+  fn remove_rx_subscriptions_parse() {
+    use remove_rx_subscriptions::parse_channel_ids;
+    // netaudio, two channels: u16 count, then u32 ids
+    assert_eq!(parse_channel_ids(&[0, 2, 0, 0, 0, 1, 0, 0, 0, 2]), Some(vec![1, 2]));
+    // the single-channel example from the original handler's comment
+    assert_eq!(parse_channel_ids(&[0, 1, 0, 0, 0, 2]), Some(vec![2]));
+    assert_eq!(parse_channel_ids(&[]), None);
+    assert_eq!(parse_channel_ids(&[0]), None);
+    // count larger than the ids present (the old handler read content[4..6] unchecked)
+    assert_eq!(parse_channel_ids(&[0xff, 0xff, 0, 0]), Some(vec![]));
+    assert_eq!(parse_channel_ids(&[0, 3, 0, 0, 0, 7, 0]), Some(vec![7]));
+  }
+
 }
