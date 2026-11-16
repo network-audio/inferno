@@ -139,6 +139,14 @@ impl ChannelsSubscriber {
       .log_and_forget();
   }
   pub async fn unsubscribe(&self, local_channel_index: usize) {
+    // Same reason as subscribe: a controller reads the rx subscriptions list
+    // right after the response. The flow teardown happens later on the
+    // subscriber task; clearing the entry only there made netaudio's
+    // readback after a remove still list the channel and report the remove
+    // as failed. (The task clears it again; that is a no-op.)
+    if let Some(slot) = self.subscriptions_info.write().unwrap().get_mut(local_channel_index) {
+      *slot = None;
+    }
     self.commands_sender.send(Command::Unsubscribe { local_channel_index }).await.log_and_forget();
   }
   pub async fn save_state(&self) {
@@ -1292,5 +1300,25 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
       //*self.self_info.rx_channels[lci].friendly_name.write().unwrap() = chst.local_channel_name;
       self.subscribe(lci, &chst.tx_channel_name, &chst.tx_hostname).await;
     }
+  }
+}
+
+#[cfg(test)]
+mod unsubscribe_readback_tests {
+  use super::*;
+  #[tokio::test]
+  async fn clears_readback_before_worker_processes_removal() {
+    let (tx, mut rx) = mpsc::channel(1);
+    let subscriber = ChannelsSubscriber {
+      commands_sender: tx,
+      subscriptions_info: Arc::new(RwLock::new(vec![Some(SubscriptionInfo {
+        tx_channel_name: "TX 1".into(), tx_hostname: "source".into(),
+        status: SubscriptionStatus::Unresolved,
+      })])),
+      flows_info: Arc::new(RwLock::new(vec![])),
+    };
+    subscriber.unsubscribe(0).await;
+    assert!(subscriber.subscriptions_info.read().unwrap()[0].is_none());
+    assert!(matches!(rx.try_recv().unwrap(), Command::Unsubscribe { local_channel_index: 0 }));
   }
 }
