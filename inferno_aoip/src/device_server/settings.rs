@@ -19,6 +19,7 @@ use crate::protocol::proto_cmc::PORT as CMC_PORT;
 pub const KEYS: &[&str] = &[
   "NAME",
   "STATE_DIR",
+  "PRODUCT_VERSION",
   "DEVICE_ID",
   "PROCESS_ID",
   "BIND_IP",
@@ -276,6 +277,14 @@ fn create_self_info(
     flows_control_port: FLOWS_CONTROL_PORT,
     info_request_port: INFO_REQUEST_PORT,
     state_dir: settings.get("STATE_DIR").map(PathBuf::from),
+    product_version: settings
+      .get("PRODUCT_VERSION")
+      .map(|v| {
+        parse_product_version(v).ok_or_else(|| {
+          invalid("PRODUCT_VERSION", v, "expected major.minor[.patch] with u8 major/minor and u16 patch")
+        })
+      })
+      .transpose()?,
   };
 
   // the device listens on 4 consecutive ports starting at ALT_PORT
@@ -669,5 +678,48 @@ mod state_directory_setting_tests {
     let config = BTreeMap::from([("STATE_DIR".into(), String::new())]);
     let settings = Settings::try_new("state-test", "test", Some(Ipv4Addr::LOCALHOST), &config).unwrap();
     assert!(settings.self_info.state_dir.is_none());
+  }
+}
+
+pub fn parse_product_version(v: &str) -> Option<(u8, u8, u16)> {
+  let mut parts = v.trim().split('.');
+  let parsed = (|| {
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = match parts.next() {
+      Some(p) => p.parse().ok()?,
+      None => 0,
+    };
+    parts.next().is_none().then_some((major, minor, patch))
+  })();
+  parsed
+}
+
+#[cfg(test)]
+mod product_version_tests {
+  use super::parse_product_version;
+
+  #[test]
+  fn parses_dotted_versions() {
+    assert_eq!(parse_product_version("1.20.0"), Some((1, 20, 0)));
+    assert_eq!(parse_product_version(" 2.3 "), Some((2, 3, 0)));
+    assert_eq!(parse_product_version("1.1.300"), Some((1, 1, 300)));
+    for bad in ["", "1", "1.x", "1.2.3.4", "256.0.0", "1.256", "1.2.65536", "1.2.", "v1.2.3"] {
+      assert_eq!(parse_product_version(bad), None, "{bad:?}");
+    }
+  }
+
+  #[test]
+  fn product_version_and_state_directory_can_be_configured_together() {
+    use super::*;
+    let mut config = BTreeMap::from([
+      ("PRODUCT_VERSION".into(), "12.34.300".into()),
+      ("STATE_DIR".into(), "chosen-state".into()),
+    ]);
+    let settings = Settings::try_new("product-test", "test", Some(Ipv4Addr::LOCALHOST), &config).unwrap();
+    assert_eq!(settings.self_info.product_version, Some((12, 34, 300)));
+    assert_eq!(settings.self_info.state_dir, Some(PathBuf::from("chosen-state")));
+    config.insert("PRODUCT_VERSION".into(), "1.2.65536".into());
+    assert!(Settings::try_new("product-test", "test", Some(Ipv4Addr::LOCALHOST), &config).is_err());
   }
 }

@@ -45,6 +45,7 @@ pub struct DeviceInfo {
   pub flows_control_port: u16,
   pub info_request_port: u16,
   pub state_dir: Option<std::path::PathBuf>,
+  pub product_version: Option<(u8, u8, u16)>,
 }
 
 impl DeviceInfo {
@@ -85,6 +86,7 @@ pub(crate) mod tests {
       flows_control_port: 0,
       info_request_port: 0,
       state_dir: None,
+      product_version: None,
     }
   }
 

@@ -362,6 +362,7 @@ mod tests {
       flows_control_port: 0,
       info_request_port: 0,
       state_dir: None,
+      product_version: None,
     }
   }
 

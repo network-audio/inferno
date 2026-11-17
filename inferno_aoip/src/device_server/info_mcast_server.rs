@@ -35,6 +35,7 @@ struct Multicaster<'s> {
   seqnum: u16,
   vendor: [u8; 8],
   firmware_version_bytes: [u8; 4],
+  crate_version_bytes: [u8; 4],
   product_version_bytes: [u8; 4],
   device_info_destination: SocketAddr,
   heartbeat_destination: SocketAddr,
@@ -56,18 +57,23 @@ impl<'s> Multicaster<'s> {
     get_peaks: PeaksCallback,
   ) -> Multicaster {
     let patch_version = env!("CARGO_PKG_VERSION_PATCH").parse::<u16>().unwrap();
+    let crate_version = [
+      env!("CARGO_PKG_VERSION_MAJOR").parse::<u8>().unwrap(),
+      env!("CARGO_PKG_VERSION_MINOR").parse::<u8>().unwrap(),
+      H(patch_version),
+      L(patch_version),
+    ];
     let mut r = Multicaster {
       self_info,
       server,
       seqnum: 1,
       vendor: [32; 8],
       firmware_version_bytes: [4, 1, 6, 2],
-      product_version_bytes: [
-        env!("CARGO_PKG_VERSION_MAJOR").parse::<u8>().unwrap(),
-        env!("CARGO_PKG_VERSION_MINOR").parse::<u8>().unwrap(),
-        H(patch_version),
-        L(patch_version),
-      ],
+      crate_version_bytes: crate_version,
+      product_version_bytes: match self_info.product_version {
+        Some((major, minor, patch)) => [major, minor, H(patch), L(patch)],
+        None => crate_version,
+      },
       device_info_destination: SocketAddr::new(
         IpAddr::V4(Ipv4Addr::new(224, 0, 0, 231)),
         DST_PORT_DEVICE_INFO,
@@ -149,11 +155,12 @@ impl<'s> Multicaster<'s> {
     write_str_to_buffer(&mut content, 8, 8, &self.self_info.board_name);
     write_str_to_buffer(&mut content, 0x2c, 16, &self.self_info.manufacturer);
     write_str_to_buffer(&mut content, 0xac, 16, &self.self_info.model_name);
-    // product version:
-    //content[0x12c..0x130].copy_from_slice(&self.product_version_bytes);
+    // product version (controllers show it as "Product Version"; a hardware
+    // interface carries e.g. 01 01 00 03 = 1.1.3 here):
+    content[0x12c..0x130].copy_from_slice(&self.product_version_bytes);
 
-    // firmware version:
-    content[0x1c..0x20].copy_from_slice(&self.product_version_bytes);
+    // Preserve the existing crate-valued firmware field independently of PRODUCT_VERSION.
+    content[0x1c..0x20].copy_from_slice(&self.crate_version_bytes);
 
     // 0x18..0x1b - software version
     // 0x24..0x26 - software patch version, u32
@@ -708,6 +715,54 @@ pub async fn run_server(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  async fn product_info_packet(version: Option<&str>) -> Vec<u8> {
+    let config = version
+      .map(|v| std::collections::BTreeMap::from([("PRODUCT_VERSION".into(), v.into())]))
+      .unwrap_or_default();
+    let settings =
+      crate::device_server::Settings::try_new("product-test", "test", Some(Ipv4Addr::LOCALHOST), &config)
+        .unwrap();
+    let (_shutdown, rx) = tokio::sync::broadcast::channel(1);
+    let sender = UdpSocketWrapper::bind(Some(Ipv4Addr::LOCALHOST), 0, rx).await.unwrap();
+    let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut multicaster = Multicaster::new(
+      &settings.self_info,
+      sender,
+      Arc::new(RwLock::new(MediaClock::new(false))),
+      Box::new(|| (vec![], vec![])),
+    );
+    multicaster.device_info_destination = receiver.local_addr().unwrap();
+    multicaster.send_product_info().await;
+    let mut packet = [0; SEND_BUFFER_SIZE];
+    let len =
+      tokio::time::timeout(Duration::from_secs(1), receiver.recv(&mut packet)).await.unwrap().unwrap();
+    packet[..len].to_vec()
+  }
+
+  #[tokio::test]
+  async fn product_version_override_preserves_other_product_info_fields() {
+    use crate::protocol::mcast::{mcast_packet, HEADER_LENGTH};
+    let default = product_info_packet(None).await;
+    let mut overridden = product_info_packet(Some("12.34.300")).await;
+    let patch: u16 = env!("CARGO_PKG_VERSION_PATCH").parse().unwrap();
+    let crate_version = [
+      env!("CARGO_PKG_VERSION_MAJOR").parse::<u8>().unwrap(),
+      env!("CARGO_PKG_VERSION_MINOR").parse::<u8>().unwrap(),
+      H(patch),
+      L(patch),
+    ];
+    assert_eq!(default.len(), HEADER_LENGTH + 336);
+    let view = mcast_packet::View::new(default.as_slice());
+    assert_eq!(view.total_length().read() as usize, default.len());
+    assert_eq!(view.opcode(), &[0x07, 0x2a, 0, 0xc0, 0, 0, 0, 0]);
+    assert_eq!(&view.content()[0x12c..0x130], &crate_version);
+    assert_eq!(&view.content()[0x1c..0x20], &crate_version, "existing firmware field");
+    assert_eq!(&view.content()[0x18..0x1c], &[0; 4], "software field remains unchanged");
+    assert_eq!(&overridden[HEADER_LENGTH + 0x12c..HEADER_LENGTH + 0x130], &[12, 34, 1, 44]);
+    overridden[HEADER_LENGTH + 0x12c..HEADER_LENGTH + 0x130].copy_from_slice(&crate_version);
+    assert_eq!(overridden, default, "only the product version may differ");
+  }
 
   const MAC: [u8; 6] = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
 
